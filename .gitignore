@@ -1,0 +1,39 @@
+# =====================================================================
+# Alapértelmezetten MINDEN kizárása a Git verziókezelésből
+# (A repo csak a notebookot és a html-t tartalmazza Pages-ként)
+# =====================================================================
+/*
+
+# =====================================================================
+# Kizárt belső mappák és archívumok
+# =====================================================================
+archive/
+tables/
+figures/
+tdk_build/
+scratch/
+
+# =====================================================================
+# Engedélyezett állományok: HTML Pages, Notebookok és CI/CD
+# =====================================================================
+!/.gitignore
+!/.nojekyll
+!/README.md
+!/index.html
+!/Számítások.ipynb
+!/Vizualizacio.ipynb
+!/.github/
+!/.github/workflows/
+!/.github/workflows/deploy-pages.yml
+
+# =====================================================================
+# Biztonsági szabályok (operációs rendszer és környezeti változók)
+# =====================================================================
+.env
+.env.*
+desktop.ini
+Thumbs.db
+.DS_Store
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
