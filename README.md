@@ -7,9 +7,9 @@
 
 ### 🌐 Élő Kutatási Dashboard (GitHub Pages)
 
-A teljes interaktív kutatási eredménytár közvetlenül elérhető böngészőből GitHub Pages-en keresztül:
+A teljes interaktív kutatási eredménytár közvetlenül elérhető böngészőből:
 
-👉 **[Kutatási Dashboard Megnyitása (`index.html`)](index.html)**
+👉 **[https://oliwerbig.github.io/kobanya-ingatlan-tdk/](https://oliwerbig.github.io/kobanya-ingatlan-tdk/)**
 
 * **MapLibre GL 3D vektoros térkép:** Budapest X. Kőbánya ($N = 269$) és Bécs II. Leopoldstadt ($N = 378$) geokódolt tranzakciós pontjai.
 * **Valós idejű gyalogos útvonaltervezés:** OSRM útvonalkereső az állomási bejáratokig.
@@ -29,14 +29,3 @@ Ez a repository a kutatás reprodukálható számítási motorját és az intera
 | **[`Vizualizacio.ipynb`](Vizualizacio.ipynb)** | Jupyter Notebook | **Master térinformatikai és vizualizációs motor:** 25 cella, a 24 db Plotly ábra és a webes dashboard generálása. |
 | **`.nojekyll`** | Konfiguráció | Jekyll feldolgozás mellőzése a statikus GitHub Pages azonnali kiszolgálásához. |
 | **`.github/workflows/deploy-pages.yml`** | CI/CD | Automatikus GitHub Pages publikálás push eseménykor. |
-
----
-
-### 🚀 GitHub Pages Beállítás
-
-1. Menj a GitHub repository felületén: **Settings** → **Pages**
-2. **Build and deployment** résznél válaszd:
-   * **Source:** `Deploy from a branch`
-   * **Branch:** `main` (vagy `master`) / `/ (root)`
-   * Kattints a **Save** gombra.
-3. 1 percen belül az oldal elérhető a `https://<felhasznalonev>.github.io/<repo-nev>/` címen.
