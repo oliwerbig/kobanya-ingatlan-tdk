@@ -109,6 +109,8 @@ def fit_ols_core(
     max_hat = float(np.max(hat)) if n > 0 else 0.0
     actual_cov = cov_type
     cov_warnings: List[str] = []
+    df_infer = df_resid
+    g_count: Optional[int] = None
 
     if cov_type == "cluster" and cluster_ids is not None:
         uniq_g, inv_idx = np.unique(cluster_ids, return_inverse=True)
@@ -117,6 +119,7 @@ def fit_ols_core(
             actual_cov = "HC3"
             cov_warnings.append("Cluster SE fallback to HC3: only 1 cluster found.")
         else:
+            df_infer = max(1, g_count - 1)
             scores = X * resid[:, None]
             g_scores = np.zeros((g_count, k), dtype=np.float64)
             np.add.at(g_scores, inv_idx, scores)
@@ -124,7 +127,9 @@ def fit_ols_core(
             cr1_scale = (g_count / (g_count - 1.0)) * ((n - 1.0) / df_resid)
             vcov = cr1_scale * (xtx_inv @ meat @ xtx_inv)
             if g_count < 30:
-                cov_warnings.append(f"Small cluster count (G={g_count} < 30); cluster SEs may under-reject.")
+                cov_warnings.append(
+                    f"Small cluster count (G={g_count} < 30); cluster-robust inference may over-reject (anti-conservative; interpret p-values cautiously)."
+                )
     elif cov_type in ("HC3", "HC2", "HC1"):
         if cov_type == "HC3" and (max_hat > leverage_warn or np.any(1.0 - hat < 1e-6)):
             # Guard #1 high-leverage protection: switch to HC2 if 1 - h_ii is safe, else HC1
@@ -154,22 +159,29 @@ def fit_ols_core(
 
     se = np.sqrt(np.maximum(0.0, np.diag(vcov)))
     t_vals = np.divide(beta, se, out=np.zeros_like(beta), where=se > 1e-15)
-    p_vals = 2.0 * stats.t.sf(np.abs(t_vals), df=df_resid)
-    t_crit = float(stats.t.ppf(0.975, df=df_resid))
+    p_vals = 2.0 * stats.t.sf(np.abs(t_vals), df=df_infer)
+    t_crit = float(stats.t.ppf(0.975, df=df_infer))
     ci_lo = beta - t_crit * se
     ci_hi = beta + t_crit * se
 
     # Omnibus F-test (excluding intercept col 0)
     if k > 1:
-        r_mat = np.eye(k)[1:]
-        b_sub = beta[1:]
-        v_sub = vcov[1:, 1:]
-        try:
-            wald = float(b_sub.T @ np.linalg.solve(v_sub, b_sub))
-            f_stat = wald / (k - 1)
-            f_pval = float(stats.f.sf(f_stat, k - 1, df_resid))
-        except np.linalg.LinAlgError:
+        if actual_cov == "cluster" and g_count is not None and (g_count - 1) < (k - 1):
             f_stat, f_pval = float("nan"), float("nan")
+            cov_warnings.append(
+                f"Cluster count (G={g_count}) <= K parameters ({k}); omnibus F-test omitted due to rank-deficient cluster covariance."
+            )
+        else:
+            b_sub = beta[1:]
+            v_sub = vcov[1:, 1:]
+            try:
+                if np.linalg.cond(v_sub) > 1e12:
+                    raise np.linalg.LinAlgError("Ill-conditioned covariance submatrix.")
+                wald = float(b_sub.T @ np.linalg.solve(v_sub, b_sub))
+                f_stat = wald / (k - 1)
+                f_pval = float(stats.f.sf(f_stat, k - 1, df_infer))
+            except np.linalg.LinAlgError:
+                f_stat, f_pval = float("nan"), float("nan")
     else:
         f_stat, f_pval = float("nan"), float("nan")
 
@@ -193,6 +205,7 @@ def fit_ols_core(
         "n": n,
         "k": k,
         "df_resid": df_resid,
+        "df_infer": df_infer,
         "rss": rss,
         "sigma2": sigma2,
         "r2": r2,
@@ -296,24 +309,65 @@ def run_guard1_diagnostics(
     fitted = ols_res["fitted"]
     df_resid = ols_res["df_resid"]
 
-    # 1. VIF per non-intercept column
+    # 1. VIF per non-intercept column (using inv(corr) if well-conditioned, else auxiliary OLS R^2)
     vifs: List[Dict[str, Any]] = []
+    collinear_cols: List[str] = []
     max_vif = 1.0
     X_no_int = X[:, 1:]
-    if X_no_int.shape[1] >= 1 and n > X_no_int.shape[1] + 1:
+    p_no_int = X_no_int.shape[1]
+    if p_no_int == 1:
+        cname = col_meta[1]["name"]
+        is_col = float(np.std(X_no_int[:, 0])) <= 1e-12
+        vj = 1e6 if is_col else 1.0
+        if is_col:
+            collinear_cols.append(cname)
+        max_vif = vj
+        vifs.append({"name": cname, "vif": round(vj, 3), "collinear": is_col})
+    elif p_no_int >= 2:
         Xc = X_no_int - np.mean(X_no_int, axis=0)
         stds = np.std(Xc, axis=0)
-        Xs = Xc / np.where(stds > 1e-12, stds, 1.0)
-        corr = (Xs.T @ Xs) / n
-        try:
-            inv_corr = np.linalg.pinv(corr)
-            vif_diag = np.diag(inv_corr)
-        except np.linalg.LinAlgError:
-            vif_diag = np.ones(X_no_int.shape[1])
-        for j, val in enumerate(vif_diag):
-            vj = float(max(1.0, val))
-            max_vif = max(max_vif, vj)
-            vifs.append({"name": col_meta[j + 1]["name"], "vif": round(vj, 3)})
+        used_inv = False
+        if np.all(stds > 1e-12) and n > p_no_int + 1:
+            Xs = Xc / stds
+            corr = (Xs.T @ Xs) / n
+            try:
+                eigs = np.linalg.eigvalsh(corr)
+                if float(np.min(eigs)) > 1e-8:
+                    vif_diag = np.diag(np.linalg.inv(corr))
+                    for j, val in enumerate(vif_diag):
+                        vj = float(max(1.0, val))
+                        is_col = vj >= 1e6
+                        if is_col:
+                            collinear_cols.append(col_meta[j + 1]["name"])
+                        max_vif = max(max_vif, vj)
+                        vifs.append({"name": col_meta[j + 1]["name"], "vif": round(vj, 3), "collinear": is_col})
+                    used_inv = True
+            except np.linalg.LinAlgError:
+                used_inv = False
+
+        if not used_inv:
+            for j in range(p_no_int):
+                cname = col_meta[j + 1]["name"]
+                yj = Xc[:, j]
+                tss_j = float(yj @ yj)
+                if tss_j <= 1e-12:
+                    vj = 1e6
+                    is_col = True
+                else:
+                    other = np.delete(Xc, j, axis=1)
+                    b_j, _, _, _ = np.linalg.lstsq(other, yj, rcond=None)
+                    res_j = yj - other @ b_j
+                    one_minus_r2 = float(res_j @ res_j) / tss_j
+                    if one_minus_r2 <= 1e-6:
+                        vj = 1e6
+                        is_col = True
+                    else:
+                        vj = float(max(1.0, 1.0 / one_minus_r2))
+                        is_col = False
+                if is_col:
+                    collinear_cols.append(cname)
+                max_vif = max(max_vif, vj)
+                vifs.append({"name": cname, "vif": round(vj, 3), "collinear": is_col})
 
     # 2. Belsley-Kuh-Welsch Condition Number kappa(X_scaled)
     col_norms = np.linalg.norm(X, axis=0)
@@ -412,13 +466,14 @@ def run_guard1_diagnostics(
                     })
 
     status = "pass"
-    if max_vif >= 10.0 or kappa >= 30.0 or len(proxy_alerts) > 0 or (math.isfinite(reset_p) and reset_p < 0.05):
+    if max_vif >= 10.0 or len(collinear_cols) > 0 or kappa >= 30.0 or len(proxy_alerts) > 0 or (math.isfinite(reset_p) and reset_p < 0.05):
         status = "warn"
 
     return {
         "status": status,
         "max_vif": round(max_vif, 3),
         "vifs": vifs,
+        "collinear_cols": collinear_cols,
         "condition_number_kappa": round(kappa, 2),
         "bp_lm": round(bp_lm, 3),
         "bp_p": round(bp_p, 5),
@@ -453,8 +508,11 @@ def scan_andersson_day_profile(
     returning AICc(c), LL(c), beta(c), 95% CI, and 95% profile-likelihood CI for c*.
     """
     spatial_terms = model_spec.get("spatial_terms", [])
-    if target_term_idx >= len(spatial_terms):
-        return {"ok": False, "reason": "No Andersson-Day spatial term found."}
+    if target_term_idx >= len(spatial_terms) or spatial_terms[target_term_idx].get("transform") != "andersson_day":
+        return {"ok": False, "reason": "No Andersson-Day spatial term found at requested index."}
+
+    want_tid = spatial_terms[target_term_idx].get("target_id")
+    want_metric = spatial_terms[target_term_idx].get("metric", "eucl")
 
     spec_copy = {
         **model_spec,
@@ -473,10 +531,15 @@ def scan_andersson_day_profile(
     for c_val in cutoffs:
         spec_copy["spatial_terms"][target_term_idx]["cutoff_m"] = float(c_val)
         d = build_model_design(columns, dist_dict, spec_copy, y_info, base_valid_mask, sparse_min_cell, scan_mask)
-        # Find the AD column index
+        # Match exact target_id & metric of the scanned AD term (multi-target safe)
         ad_col_idx = None
         for idx_c, meta in enumerate(d["col_meta"]):
-            if meta["kind"] == "spatial_ad":
+            m_info = meta.get("meta", {})
+            if (
+                meta.get("kind") == "spatial_ad"
+                and m_info.get("target_id") == want_tid
+                and m_info.get("metric") == want_metric
+            ):
                 ad_col_idx = idx_c
                 break
         if ad_col_idx is None:
@@ -730,24 +793,41 @@ def run_heckman_two_step(
     z_names: List[str] = ["const"]
     z_cols: List[np.ndarray] = [np.ones(n_total, dtype=np.float64)]
     all_probit_vars = list(dict.fromkeys(list(first_stage_covs) + list(exclusion_cols)))
+    skipped_non_numeric: List[str] = []
 
     for col in all_probit_vars:
         if col in columns:
             arr = parse_numeric_array(columns[col])
-            if np.sum(np.isfinite(arr)) > 20 and np.nanstd(arr) > 1e-12:
+            n_fin = int(np.sum(np.isfinite(arr)))
+            if n_fin > 20 and float(np.nanstd(arr)) > 1e-12:
                 z_names.append(col)
                 z_cols.append(arr)
+            elif n_fin <= 20:
+                skipped_non_numeric.append(col)
+
+    if len(z_cols) < 2:
+        return {
+            "activated": False,
+            "reason": "No valid non-constant numeric Stage-1 covariates available for Heckman Probit.",
+            "skipped_non_numeric": skipped_non_numeric,
+        }
 
     Z_raw = np.column_stack(z_cols)
     z_valid_mask = np.all(np.isfinite(Z_raw), axis=1)
     # Require all analytic rows to have valid Z; otherwise subset Stage 2 strictly by row_id
-    analytic_set = set(analytic_indices.tolist())
     s2_keep_mask = np.array([z_valid_mask[idx] for idx in analytic_indices], dtype=bool)
     if int(np.sum(s2_keep_mask)) < 25:
         return {"activated": False, "reason": "Insufficient non-missing Stage-1 covariates on analytic sample."}
 
     Z_fit = Z_raw[z_valid_mask]
     s_fit = selection_indicator[z_valid_mask]
+    n_sel_fit = int(np.sum(s_fit >= 0.5))
+    n_excl_fit = int(np.sum(s_fit < 0.5))
+    if n_excl_fit < 5 or n_sel_fit < 15:
+        return {
+            "activated": False,
+            "reason": f"Empty/degenerate selection pool after Stage-1 missingness filter (selected={n_sel_fit}, excluded={n_excl_fit}).",
+        }
     fit_global_indices = np.where(z_valid_mask)[0]
 
     # Standardize non-constant columns of Z_fit for numerically stable Probit optimization
@@ -817,8 +897,23 @@ def run_heckman_two_step(
     eta2 = eta_hat[aligned_pos]
     imr2 = imr_all[aligned_pos]
 
+    # Check IMR multicollinearity against Stage-2 regressors (Puhani 2000)
+    imr_c = imr2 - float(np.mean(imr2))
+    imr_tss = float(imr_c @ imr_c)
+    if imr_tss <= 1e-12:
+        return {"activated": False, "reason": "Inverse Mills Ratio has zero variance on analytic sample."}
+    if X2.shape[1] >= 1:
+        b_imr, _, _, _ = np.linalg.lstsq(X2, imr2, rcond=None)
+        res_imr = imr2 - X2 @ b_imr
+        one_minus_r2_imr = float(res_imr @ res_imr) / imr_tss
+        imr_vif = 1e6 if one_minus_r2_imr <= 1e-6 else float(1.0 / one_minus_r2_imr)
+    else:
+        imr_vif = 1.0
+
     X_heck = np.column_stack([X2, imr2])
     n2, k2 = X_heck.shape
+    if n2 <= k2 + 1:
+        return {"activated": False, "reason": f"Insufficient Stage-2 degrees of freedom for Heckman (N={n2}, K={k2})."}
     beta_heck, _, _, _ = np.linalg.lstsq(X_heck, y2, rcond=None)
     e_heck = y2 - X_heck @ beta_heck
     theta_imr = float(beta_heck[-1])
@@ -830,7 +925,11 @@ def run_heckman_two_step(
     sigma2_hat = max(sigma2_hat, 1e-12)
     rho2 = min(0.99, (theta_imr ** 2) / sigma2_hat)
 
-    xtx_inv_h = np.linalg.pinv(X_heck.T @ X_heck)
+    xtx_h = X_heck.T @ X_heck
+    try:
+        xtx_inv_h = np.linalg.inv(xtx_h) if np.linalg.cond(xtx_h) < 1e12 else np.linalg.pinv(xtx_h)
+    except np.linalg.LinAlgError:
+        xtx_inv_h = np.linalg.pinv(xtx_h)
     # Correction matrix: I - rho^2 * diag(delta_i) + rho^2 * (X' D Z) V_gamma (Z' D X)
     xdx_adj = (X_heck * (1.0 - rho2 * delta_i)[:, None]).T @ X_heck
     xdz = (X_heck * delta_i[:, None]).T @ Z2
@@ -867,8 +966,16 @@ def run_heckman_two_step(
 
     has_excl = len([c for c in exclusion_cols if c in z_names]) > 0
     warnings = []
+    if skipped_non_numeric:
+        warnings.append(
+            f"Skipped non-numeric or mostly missing Stage-1 variables: {', '.join(skipped_non_numeric)}."
+        )
     if not has_excl:
         warnings.append("Heckman Probit has no explicit exclusion restriction (Z_excl); identified via Probit nonlinearity only.")
+    if imr_vif >= 20.0:
+        warnings.append(
+            f"High IMR collinearity (VIF={imr_vif:.1f} >= 20): Stage-2 identification is weak without an exclusion restriction Z_excl."
+        )
     if used_penalized:
         warnings.append("Stage-1 Probit encountered quasi-separation and used L2 stabilization (1e-3).")
 
@@ -881,6 +988,7 @@ def run_heckman_two_step(
         "imr_beta": round(theta_imr, 4),
         "imr_se": round(float(se_heck[-1]), 4),
         "imr_p": round(float(p_heck[-1]), 5),
+        "imr_vif": round(imr_vif, 2),
         "selection_bias_detected": bool(float(p_heck[-1]) < 0.05),
         "rho_selection_est": round(math.sqrt(rho2) * (1.0 if theta_imr >= 0 else -1.0), 4),
         "sigma_est": round(math.sqrt(sigma2_hat), 4),

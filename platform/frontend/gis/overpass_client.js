@@ -3,6 +3,7 @@
  */
 import { getCachedOSM, setCachedOSM } from "./osm_idb_cache.js";
 
+const BACKEND_CACHE_VERSION = "v2";
 const POSTPASS_URL = "https://postpass.geofabrik.de/api/interpreter";
 
 const OVERPASS_MIRRORS = [
@@ -130,7 +131,7 @@ export function buildTargetOverpassQL(target, paddedBbox) {
       clauses.push(`  ${et}${relFilter}${filterExpr}(${b});`);
     }
   }
-  const outMode = target.geometry_handling === "point" ? "out center;" : `out geom(${b});`;
+  const outMode = target.geometry_handling === "point" ? "out center;" : "out geom;";
   return `[out:json][timeout:30];\n(\n${clauses.join("\n")}\n);\n${outMode}`;
 }
 
@@ -153,18 +154,23 @@ function sqlLit(s) {
 export function buildTargetPostpassSQL(target, paddedBbox) {
   const env = `st_makeenvelope(${paddedBbox.west.toFixed(6)}, ${paddedBbox.south.toFixed(6)}, ${paddedBbox.east.toFixed(6)}, ${paddedBbox.north.toFixed(6)}, 4326)`;
   const types = target.element_types && target.element_types.length ? target.element_types : ["node", "way", "relation"];
+  const osmTypes = [];
+  if (types.includes("node")) osmTypes.push("'N'");
+  if (types.includes("way")) osmTypes.push("'W'");
+  if (types.includes("relation")) osmTypes.push("'R'");
+  const typeClause = osmTypes.length ? `osm_type IN (${osmTypes.join(",")})` : "FALSE";
+
   let table;
-  let geomExpr;
-  if (target.geometry_handling === "point") {
-    table = "postpass_pointpolygon";
-    geomExpr = "ST_Centroid(geom) AS geom";
-  } else if (target.geometry_handling === "line_segment") {
-    table = "postpass_line";
-    geomExpr = `ST_Intersection(geom, ${env}) AS geom`;
+  if (types.length === 1 && types[0] === "node") {
+    table = "postpass_point";
+  } else if (types.includes("node")) {
+    table = "postpass_pointlinepolygon";
   } else {
-    table = types.includes("node") ? "postpass_pointlinepolygon" : "postpass_linepolygon";
-    geomExpr = `ST_Intersection(geom, ${env}) AS geom`;
+    table = "postpass_linepolygon";
   }
+
+  // Never clip target polygons with ST_Intersection(geom, env): avoids bbox-edge boundary artifacts & shifted centroids
+  const geomExpr = target.geometry_handling === "point" ? "ST_Centroid(geom) AS geom" : "geom AS geom";
 
   const orClauses = [];
   for (const clause of target.osm_filter || []) {
@@ -184,17 +190,36 @@ export function buildTargetPostpassSQL(target, paddedBbox) {
     }
   }
   const whereExpr = orClauses.length ? orClauses.join(" OR ") : "FALSE";
-  return `SELECT osm_type, osm_id, tags, ${geomExpr} FROM ${table} WHERE geom && ${env} AND (${whereExpr})`;
+  return `SELECT osm_type, osm_id, tags, ${geomExpr} FROM ${table} WHERE geom && ${env} AND ${typeClause} AND (${whereExpr})`;
 }
 
 export function postpassToOverpassTarget(fc) {
   const elements = [];
   const feats = fc?.features || [];
+  const toGeomPts = (ring, closeRing = false) => {
+    const pts = (ring || [])
+      .filter((c) => Array.isArray(c) && c.length >= 2)
+      .map((c) => ({ lon: Number(c[0]), lat: Number(c[1]) }));
+    if (closeRing && pts.length >= 3) {
+      const f = pts[0];
+      const l = pts[pts.length - 1];
+      if (Math.abs(f.lon - l.lon) > 1e-9 || Math.abs(f.lat - l.lat) > 1e-9) {
+        pts.push({ lon: f.lon, lat: f.lat });
+      }
+    }
+    return pts;
+  };
+
   for (let idx = 0; idx < feats.length; idx++) {
     const feat = feats[idx];
     const props = feat?.properties || {};
     const rawType = props.osm_type;
-    const elType = rawType === "N" ? "node" : rawType === "R" ? "relation" : "way";
+    const elType =
+      rawType === "N" || rawType === "node"
+        ? "node"
+        : rawType === "R" || rawType === "relation"
+          ? "relation"
+          : "way";
     const osmId = props.osm_id ?? idx + 1;
     const tags = props.tags || {};
     let subIdx = 0;
@@ -220,57 +245,75 @@ export function postpassToOverpassTarget(fc) {
           }
         }
       } else if (g.type === "LineString") {
-        const pts = (g.coordinates || []).filter((c) => Array.isArray(c) && c.length >= 2);
+        const pts = toGeomPts(g.coordinates, false);
         if (pts.length >= 2) {
-          elements.push({
-            type: "way",
-            id: nextId(),
-            tags,
-            geometry: pts.map((c) => ({ lon: Number(c[0]), lat: Number(c[1]) })),
-          });
-        }
-      } else if (g.type === "MultiLineString") {
-        for (const line of g.coordinates || []) {
-          const pts = (line || []).filter((c) => Array.isArray(c) && c.length >= 2);
-          if (pts.length >= 2) {
+          if (elType === "relation") {
             elements.push({
-              type: "way",
+              type: "relation",
               id: nextId(),
               tags,
-              geometry: pts.map((c) => ({ lon: Number(c[0]), lat: Number(c[1]) })),
+              members: [{ type: "way", role: "outer", geometry: pts }],
             });
+          } else {
+            elements.push({ type: "way", id: nextId(), tags, geometry: pts });
+          }
+        }
+      } else if (g.type === "MultiLineString") {
+        if (elType === "relation") {
+          const members = (g.coordinates || [])
+            .map((line) => toGeomPts(line, false))
+            .filter((pts) => pts.length >= 2)
+            .map((pts) => ({ type: "way", role: "outer", geometry: pts }));
+          if (members.length) {
+            elements.push({ type: "relation", id: nextId(), tags, members });
+          }
+        } else {
+          for (const line of g.coordinates || []) {
+            const pts = toGeomPts(line, false);
+            if (pts.length >= 2) {
+              elements.push({ type: "way", id: nextId(), tags, geometry: pts });
+            }
           }
         }
       } else if (g.type === "Polygon") {
         const rings = g.coordinates || [];
-        const members = [];
-        rings.forEach((ring, rIdx) => {
-          if (ring && ring.length >= 3) {
-            members.push({
-              type: "way",
-              role: rIdx === 0 ? "outer" : "inner",
-              geometry: ring.map((c) => ({ lon: Number(c[0]), lat: Number(c[1]) })),
-            });
+        if (elType === "way" && rings.length === 1) {
+          const pts = toGeomPts(rings[0], true);
+          if (pts.length >= 4) {
+            elements.push({ type: "way", id: nextId(), tags, geometry: pts });
           }
-        });
-        if (members.length) {
-          elements.push({ type: "relation", id: nextId(), tags: { ...tags, type: "multipolygon" }, members });
+        } else {
+          const members = [];
+          rings.forEach((ring, rIdx) => {
+            const pts = toGeomPts(ring, true);
+            if (pts.length >= 4) {
+              members.push({
+                type: "way",
+                role: rIdx === 0 ? "outer" : "inner",
+                geometry: pts,
+              });
+            }
+          });
+          if (members.length) {
+            elements.push({ type: "relation", id: nextId(), tags: { ...tags, type: tags.type || "multipolygon" }, members });
+          }
         }
       } else if (g.type === "MultiPolygon") {
         const members = [];
         for (const poly of g.coordinates || []) {
           (poly || []).forEach((ring, rIdx) => {
-            if (ring && ring.length >= 3) {
+            const pts = toGeomPts(ring, true);
+            if (pts.length >= 4) {
               members.push({
                 type: "way",
                 role: rIdx === 0 ? "outer" : "inner",
-                geometry: ring.map((c) => ({ lon: Number(c[0]), lat: Number(c[1]) })),
+                geometry: pts,
               });
             }
           });
         }
         if (members.length) {
-          elements.push({ type: "relation", id: nextId(), tags: { ...tags, type: "multipolygon" }, members });
+          elements.push({ type: "relation", id: nextId(), tags: { ...tags, type: tags.type || "multipolygon" }, members });
         }
       }
     };
@@ -395,15 +438,23 @@ async function fetchOverpassSingle(ql, signal) {
   throw lastErr || new Error("All Overpass mirrors failed.");
 }
 
+export function buildTargetCacheKey(target, paddedBbox) {
+  const ql = buildTargetOverpassQL(target, paddedBbox);
+  const sql = buildTargetPostpassSQL(target, paddedBbox);
+  const typesKey = JSON.stringify(target.element_types || ["node", "way", "relation"]);
+  const geomKey = target.geometry_handling || "point";
+  return `target::${BACKEND_CACHE_VERSION}::${target.id}::${geomKey}::${typesKey}::${ql}::${sql}`;
+}
+
 export async function fetchTargetOSM(target, rawBbox, { forceRefresh = false, signal } = {}) {
   const padded = padBbox(rawBbox, target.bbox_buffer_m ?? 800);
   const ql = buildTargetOverpassQL(target, padded);
-  const cacheKey = `target::${target.id}::${ql}`;
+  const sql = buildTargetPostpassSQL(target, padded);
+  const cacheKey = buildTargetCacheKey(target, padded);
   if (!forceRefresh) {
     const cached = await getCachedOSM(cacheKey);
     if (cached) return { data: cached, fromCache: true };
   }
-  const sql = buildTargetPostpassSQL(target, padded);
   try {
     const fc = await fetchPostpassSingle(sql, signal);
     const data = postpassToOverpassTarget(fc);
@@ -418,10 +469,10 @@ export async function fetchTargetOSM(target, rawBbox, { forceRefresh = false, si
   }
 }
 
-export async function fetchStreetGraphOSM(rawBbox, bufferM = 600, profile = "walk", { forceRefresh = false, signal } = {}) {
+export async function fetchStreetGraphOSM(rawBbox, bufferM = 800, profile = "walk", { forceRefresh = false, signal } = {}) {
   const padded = padBbox(rawBbox, bufferM);
   const ql = buildStreetGraphOverpassQL(padded, profile);
-  const cacheKey = `graph::${profile}::${padded.south.toFixed(4)},${padded.west.toFixed(4)},${padded.north.toFixed(4)},${padded.east.toFixed(4)}`;
+  const cacheKey = `graph::${BACKEND_CACHE_VERSION}::${profile}::${padded.south.toFixed(4)},${padded.west.toFixed(4)},${padded.north.toFixed(4)},${padded.east.toFixed(4)}`;
 
   if (!forceRefresh) {
     const cached = await getCachedOSM(cacheKey);

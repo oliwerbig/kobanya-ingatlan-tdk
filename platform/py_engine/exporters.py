@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 import zipfile
 from typing import Any, Dict, List, Optional
 
@@ -72,6 +73,7 @@ def generate_multi_model_latex(
                 seen.add(name)
                 var_order.append(name)
 
+    safe_label = re.sub(r"[^A-Za-z0-9:._-]", "_", str(label))
     n_cols = len(ols_models)
     col_spec = "l" + "c" * n_cols
     headers = " & ".join(_latex_escape(m.get("model_name", m["model_id"])) for m in ols_models)
@@ -83,7 +85,7 @@ def generate_multi_model_latex(
         "\\centering",
         "\\begin{threeparttable}",
         f"\\caption{{{_latex_escape(caption)}}}",
-        f"\\label{{{label}}}",
+        f"\\label{{{safe_label}}}",
         f"\\begin{{tabular}}{{{col_spec}}}",
         "\\toprule",
         f"Variable & {headers} \\\\",
@@ -120,7 +122,12 @@ def generate_multi_model_latex(
             if v is None:
                 diag = m.get("diagnostics", {})
                 v = diag.get(key)
-            vals.append(fmt.format(v) if isinstance(v, (int, float)) else (str(v) if v is not None else "---"))
+            if isinstance(v, (int, float)):
+                vals.append(fmt.format(v))
+            elif v is not None:
+                vals.append(_latex_escape(str(v)))
+            else:
+                vals.append("---")
         return f"{title} & " + " & ".join(vals) + " \\\\"
 
     lines.append(_footer_row("$N$", "n_obs", "{:d}"))
@@ -134,11 +141,14 @@ def generate_multi_model_latex(
 
     # Collect Guard footnotes
     notes: List[str] = ["Standard errors in parentheses. $^{***}p<0.01$, $^{**}p<0.05$, $^{*}p<0.10$."]
+    if len({m.get("n_obs") for m in ols_models if m.get("n_obs") is not None}) > 1:
+        notes.append("Note: Models have different sample sizes $N$ (common-sample lock disabled); AIC values are not directly comparable across differing samples.")
     if any(m.get("is_log_scale") for m in ols_models):
         notes.append("Semi-log dummy impacts computed via Halvorsen--Palmquist and Kennedy (1981) variance-corrected transformations.")
     for m in ols_models:
+        mid_esc = _latex_escape(str(m.get("model_id", "")))
         for fn in m.get("footnotes", []):
-            notes.append(f"[{m['model_id']}] {_latex_escape(fn)}")
+            notes.append(f"[{mid_esc}] {_latex_escape(fn)}")
 
     lines.append("\\begin{tablenotes}[flushleft]")
     lines.append("\\small")
@@ -150,16 +160,27 @@ def generate_multi_model_latex(
     return "\n".join(lines)
 
 
+def _csv_safe_cell(val: Any) -> Any:
+    """Neutralize CSV formula injection (OWASP) on string values without altering numeric scalars."""
+    if not isinstance(val, str) or not val:
+        return val
+    stripped = val.lstrip(" \t\r\n")
+    if val[0] in ("=", "+", "-", "@", "\t", "\r") or (stripped and stripped[0] in ("=", "+", "-", "@")):
+        return "'" + val
+    return val
+
+
 def dict_rows_to_csv(rows: List[Dict[str, Any]]) -> str:
-    """Serialize list of uniform dicts to UTF-8 CSV string."""
+    """Serialize list of uniform dicts to UTF-8 CSV string with formula-injection neutralization."""
     if not rows:
         return ""
     buf = io.StringIO()
-    headers = list(rows[0].keys())
-    writer = csv.DictWriter(buf, fieldnames=headers)
-    writer.writeheader()
+    raw_headers = list(rows[0].keys())
+    safe_headers = [_csv_safe_cell(str(h)) for h in raw_headers]
+    writer = csv.writer(buf)
+    writer.writerow(safe_headers)
     for r in rows:
-        writer.writerow(r)
+        writer.writerow([_csv_safe_cell(r.get(h)) for h in raw_headers])
     return buf.getvalue()
 
 
@@ -250,6 +271,7 @@ def build_zip_bundle(
     geojson_data: Dict[str, Any],
     recipe: Dict[str, Any],
     manifest: Dict[str, Any],
+    osm_bundle: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Build complete reproducible scientific archive ZIP in memory."""
     buf = io.BytesIO()
@@ -265,6 +287,8 @@ def build_zip_bundle(
             zf.writestr(f"latex/{name}.tex", tex.encode("utf-8"))
 
         zf.writestr("spatial/enriched_observations.geojson", json.dumps(geojson_data, ensure_ascii=False).encode("utf-8"))
+        if osm_bundle:
+            zf.writestr("spatial/osm_bundle.json", json.dumps(osm_bundle, ensure_ascii=False).encode("utf-8"))
         zf.writestr("experiment_recipe.json", json.dumps(recipe, indent=2, ensure_ascii=False).encode("utf-8"))
         zf.writestr("reproducibility_manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8"))
 

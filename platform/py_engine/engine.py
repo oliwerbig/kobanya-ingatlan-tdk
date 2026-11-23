@@ -9,6 +9,7 @@ into a clean JSON-RPC session callable from Pyodide Web Worker or native Python.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import math
 from typing import Any, Callable, Dict, List, Optional
 
@@ -16,6 +17,7 @@ import numpy as np
 
 from .dag_cache import DAGCache, hash_payload
 from .design_matrix import (
+    _boxcox_profile_mle,
     build_dependent_variable,
     build_model_design,
     compute_common_sample_mask,
@@ -40,7 +42,13 @@ from .ols_kernel import (
     run_stepwise_and_gelbach,
     scan_andersson_day_profile,
 )
-from .projection import LocalMetricProjection
+from .projection import LocalMetricProjection, diagnose_coordinate_issues
+
+
+def _array_sha256(arr: np.ndarray) -> str:
+    """Fast collision-free SHA-256 hash of any NumPy array's exact values."""
+    arr_c = np.ascontiguousarray(arr, dtype=np.float64)
+    return hashlib.sha256(arr_c.tobytes()).hexdigest()
 from .spatial_gis import (
     build_street_graph,
     compute_single_route,
@@ -91,6 +99,8 @@ class GeoSpecSession:
         """Load tabular dataset columns and initialize universal metric projection."""
         self.cache.clear_all()
         self.columns = columns
+        self.proj = None
+        self.obs_xy = np.empty((0, 2), dtype=np.float64)
         self.target_features.clear()
         self.street_graphs.clear()
         self.dist_results.clear()
@@ -102,6 +112,7 @@ class GeoSpecSession:
         self.n_rows = len(columns[lat_col])
         self.lat = parse_numeric_array(columns[lat_col])
         self.lon = parse_numeric_array(columns[lon_col])
+        coord_diag = diagnose_coordinate_issues(self.lat, self.lon)
         self.valid_coord_mask = (
             np.isfinite(self.lat)
             & np.isfinite(self.lon)
@@ -114,7 +125,8 @@ class GeoSpecSession:
 
         n_geo = int(np.sum(self.valid_coord_mask))
         if n_geo < 5:
-            raise ValueError(f"At least 5 valid geographic coordinates required (found {n_geo}).")
+            hint_txt = (" " + " ".join(coord_diag["hints"])) if coord_diag["hints"] else ""
+            raise ValueError(f"At least 5 valid geographic coordinates required (found {n_geo}).{hint_txt}")
 
         self.proj = LocalMetricProjection.from_points(
             self.lat[self.valid_coord_mask],
@@ -135,12 +147,17 @@ class GeoSpecSession:
             "east": float(np.max(lon_v)),
         }
 
+        proj_meta = self.proj.metadata()
+        all_warnings = list(coord_diag["hints"]) + list(proj_meta.get("warnings", []))
+
         return {
             "ok": True,
             "n_rows": self.n_rows,
             "n_geocoded": n_geo,
             "n_non_geocoded": self.n_rows - n_geo,
-            "projection": self.proj.metadata(),
+            "projection": proj_meta,
+            "coord_diagnostics": coord_diag,
+            "warnings": all_warnings,
             "bbox": bbox,
             "columns": list(columns.keys()),
         }
@@ -292,7 +309,7 @@ class GeoSpecSession:
         }
 
     def run_stage_2_descriptives_and_composition(self, recipe: Dict[str, Any], run_id: int = 1) -> Dict[str, Any]:
-        """Stage 2: Descriptive stats, normality, and dynamic Step 0..K + Gelbach OVB decomposition."""
+        """Stage 2: Descriptive stats, sample-drop waterfall, normality, and Step 0..K + Gelbach OVB decomposition."""
         self.cache.start_run(run_id)
         prep = self._prepare_y_and_masks(recipe)
         y_info = prep["y_info"]
@@ -316,6 +333,58 @@ class GeoSpecSession:
                     seen_cov.add(c["col"])
                     cov_union.append(c)
 
+        # Sample-drop waterfall & per-variable missingness audit on geocoded non-excluded rows
+        y_valid_base = analytic_base & y_info["valid_mask"]
+        n_y_base = int(np.sum(y_valid_base))
+        sample_waterfall = {
+            "n_total": int(self.n_rows),
+            "n_geocoded": int(np.sum(self.valid_coord_mask)),
+            "dropped_non_geocoded": int(self.n_rows - np.sum(self.valid_coord_mask)),
+            "n_after_excl_flag": int(np.sum(analytic_base)),
+            "dropped_excl_flag": int(np.sum(self.valid_coord_mask) - np.sum(analytic_base)),
+            "n_after_y_valid": n_y_base,
+            "dropped_y_missing_or_nonpos": int(np.sum(analytic_base) - n_y_base),
+            "n_common_analytic": int(np.sum(common_mask)),
+            "dropped_covs_or_dist": int(n_y_base - np.sum(common_mask)),
+        }
+        per_variable_missing: List[Dict[str, Any]] = []
+        if n_y_base > 0:
+            for c in cov_union:
+                cname = c.get("col", "")
+                if cname not in self.columns:
+                    per_variable_missing.append({"variable": cname, "n_missing": n_y_base, "pct_missing": 100.0})
+                    continue
+                if c.get("type", "numeric") == "categorical":
+                    raw_c = self.columns[cname]
+                    miss_cnt = sum(
+                        1 for idx in np.where(y_valid_base)[0]
+                        if raw_c[idx] is None or str(raw_c[idx]).strip() == ""
+                    )
+                else:
+                    arr_c = parse_numeric_array(self.columns[cname])[y_valid_base]
+                    miss_cnt = int(np.sum(~np.isfinite(arr_c)))
+                per_variable_missing.append({
+                    "variable": cname,
+                    "n_missing": int(miss_cnt),
+                    "pct_missing": round(miss_cnt / n_y_base * 100.0, 2),
+                })
+            for tid, tres in self.dist_results.items():
+                eucl_miss = int(np.sum(~np.isfinite(tres["dist_eucl"][y_valid_base])))
+                if eucl_miss > 0:
+                    per_variable_missing.append({
+                        "variable": f"dist_eucl_{tid}",
+                        "n_missing": eucl_miss,
+                        "pct_missing": round(eucl_miss / n_y_base * 100.0, 2),
+                    })
+                if np.any(np.isfinite(tres["dist_net"])):
+                    net_miss = int(np.sum(~np.isfinite(tres["dist_net"][y_valid_base])))
+                    if net_miss > 0:
+                        per_variable_missing.append({
+                            "variable": f"dist_net_{tid}",
+                            "n_missing": net_miss,
+                            "pct_missing": round(net_miss / n_y_base * 100.0, 2),
+                        })
+
         desc = compute_descriptive_and_normality(self.columns, self.dist_results, y_info, common_mask, cov_union)
 
         chain_cfg = recipe.get("composition_chain", {})
@@ -328,7 +397,13 @@ class GeoSpecSession:
                 self.columns, self.dist_results, ref_spec, chain_cfg, y_info, analytic_base, tau, common_mask
             )
 
-        res = {"ok": True, "descriptives": desc, "composition": stepwise}
+        res = {
+            "ok": True,
+            "descriptives": desc,
+            "composition": stepwise,
+            "sample_waterfall": sample_waterfall,
+            "per_variable_missing": per_variable_missing,
+        }
         self.last_outputs["stage2"] = res
         return res
 
@@ -361,6 +436,15 @@ class GeoSpecSession:
                 self.columns, self.dist_results, active_specs, y_info, analytic_base, tau
             )
 
+        y_sig = _array_sha256(np.where(np.isfinite(y_info["y"]), y_info["y"], -999999.0)) + ":" + str(y_info.get("transform", "raw"))
+        mask_arr = common_mask if common_mask is not None else analytic_base
+        mask_sig = _array_sha256(mask_arr.astype(np.float64))
+        dist_sig = hash_payload({
+            tid: _array_sha256(np.where(np.isfinite(d["dist_eucl"]), d["dist_eucl"], -1.0))
+            + ":" + _array_sha256(np.where(np.isfinite(d["dist_net"]), d["dist_net"], -1.0))
+            for tid, d in sorted(self.dist_results.items())
+        })
+
         # Build spatial proxy vectors for Guard #1 confounding alert
         proxy_cols_raw: Dict[str, np.ndarray] = {}
         for pcol in ds.get("spatial_proxy_cols", []) or []:
@@ -373,117 +457,189 @@ class GeoSpecSession:
 
         for m_spec in active_specs:
             self.cache.check_cancelled(run_id)
-            design = build_model_design(
-                self.columns, self.dist_results, m_spec, y_info, analytic_base, tau, common_mask
-            )
-            if design["n_obs"] <= design["k_params"] + 2:
-                models_out.append({
-                    "model_id": m_spec["id"],
-                    "model_name": m_spec.get("name", m_spec["id"]),
-                    "error": f"Insufficient observations (N={design['n_obs']}) for K={design['k_params']}.",
-                })
-                continue
-
-            cluster_ids = None
-            cluster_meta = {"method": "none"}
-            if cov_type == "cluster":
-                cluster_ids, cluster_meta = build_cluster_ids(
-                    self.columns, self.obs_xy, design["valid_indices"], ds.get("cluster_spec", {})
-                )
-
-            ols = fit_ols_core(
-                design["X"],
-                design["y"],
-                cov_type=cov_type,
-                cluster_ids=cluster_ids,
-                leverage_warn=lev_warn,
-            )
-
-            # Match spatial proxy columns to valid sample & grab focal distance if present
-            proxy_sub = {k: v[design["valid_mask"]] for k, v in proxy_cols_raw.items()}
-            focal_dist = None
-            if recipe.get("spatial_targets"):
-                ftgt = recipe["spatial_targets"][0]["id"]
-                if ftgt in self.dist_results:
-                    focal_dist = (ftgt, self.dist_results[ftgt]["dist_eucl"][design["valid_mask"]])
-
-            diag = run_guard1_diagnostics(design["X"], design["y"], ols, design["col_meta"], proxy_sub, focal_dist)
-
-            params_rows = []
-            for j, meta in enumerate(design["col_meta"]):
-                b_j = float(ols["beta"][j])
-                se_j = float(ols["se"][j])
-                p_j = float(ols["p"][j])
-                pcts = compute_semi_log_effects(b_j, se_j, meta["is_binary"], design["is_log_scale"])
-                params_rows.append({
-                    "name": meta["name"],
-                    "label": meta["label"],
-                    "kind": meta["kind"],
-                    "is_binary": meta["is_binary"],
-                    "beta": round(b_j, 4),
-                    "se": round(se_j, 4),
-                    "t": round(float(ols["t"][j]), 3),
-                    "p": round(p_j, 5),
-                    "sig": _sig_stars(p_j),
-                    "ci_lo": round(float(ols["ci_lo"][j]), 4),
-                    "ci_hi": round(float(ols["ci_hi"][j]), 4),
-                    "hp_pct": pcts["hp_pct"],
-                    "kennedy_pct": pcts["kennedy_pct"],
-                })
-
-            models_out.append({
-                "model_id": m_spec["id"],
-                "model_name": m_spec.get("name", m_spec["id"]),
-                "n_obs": design["n_obs"],
-                "k_params": design["k_params"],
-                "is_log_scale": design["is_log_scale"],
-                "y_label": design["y_label"],
-                "r2": round(float(ols["r2"]), 4),
-                "adj_r2": round(float(ols["adj_r2"]), 4),
-                "aic": round(float(ols["aic"]), 2),
-                "aicc": round(float(ols["aicc"]), 2),
-                "bic": round(float(ols["bic"]), 2),
-                "llf": round(float(ols["llf"]), 2),
-                "f_stat": round(float(ols["f_stat"]), 2) if math.isfinite(ols["f_stat"]) else None,
-                "f_pval": round(float(ols["f_pval"]), 5) if math.isfinite(ols["f_pval"]) else None,
-                "cov_type_used": ols["cov_type_used"],
-                "cluster_meta": cluster_meta,
-                "params": params_rows,
-                "diagnostics": diag,
-                "guard2_events": design["guard2_events"],
-                "footnotes": design["footnotes"],
-                "fitted": np.round(ols["fitted"], 5).tolist(),
-                "resid": np.round(ols["resid"], 5).tolist(),
-                "cooks_d": np.round(ols["cooks_d"], 5).tolist(),
-                "valid_indices": design["valid_indices"].tolist(),
+            m_key = hash_payload({
+                "kind": "ols_model",
+                "spec": m_spec,
+                "cov_type": cov_type,
+                "cluster": ds.get("cluster_spec", {}),
+                "proxies": ds.get("spatial_proxy_cols", []) or [],
+                "y": y_sig,
+                "mask": mask_sig,
+                "dist": dist_sig,
+                "tau": tau,
+                "lev": lev_warn,
             })
 
-            # Scan AD cutoff profile for any AD spatial term in this spec
-            for st_idx, st in enumerate(m_spec.get("spatial_terms", [])):
-                if st.get("transform") == "andersson_day":
-                    rng_cfg = st.get("cutoff_range_m", [100.0, 600.0, 25.0])
-                    prof_res = scan_andersson_day_profile(
-                        self.columns,
-                        self.dist_results,
-                        m_spec,
-                        y_info,
-                        analytic_base,
-                        target_term_idx=st_idx,
-                        c_min=float(rng_cfg[0]),
-                        c_max=float(rng_cfg[1]),
-                        step=float(rng_cfg[2]),
-                        sparse_min_cell=tau,
-                        override_valid_mask=common_mask,
-                    )
-                    ad_profiles[f"{m_spec['id']}::{st.get('target_id')}"] = prof_res
+            def _compute_single_model(spec_cur: Dict[str, Any] = m_spec) -> Dict[str, Any]:
+                design = build_model_design(
+                    self.columns, self.dist_results, spec_cur, y_info, analytic_base, tau, common_mask
+                )
+                if design["n_obs"] <= design["k_params"] + 2:
+                    return {
+                        "model_id": spec_cur["id"],
+                        "model_name": spec_cur.get("name", spec_cur["id"]),
+                        "error": f"Insufficient observations (N={design['n_obs']}) for K={design['k_params']}.",
+                    }
 
-        # Guard #4 Heckman 2-Step Selection Check on reference active model
+                cluster_ids = None
+                cluster_meta = {"method": "none"}
+                if cov_type == "cluster":
+                    cluster_ids, cluster_meta = build_cluster_ids(
+                        self.columns, self.obs_xy, design["valid_indices"], ds.get("cluster_spec", {})
+                    )
+
+                ols = fit_ols_core(
+                    design["X"],
+                    design["y"],
+                    cov_type=cov_type,
+                    cluster_ids=cluster_ids,
+                    leverage_warn=lev_warn,
+                )
+
+                proxy_sub = {k: v[design["valid_mask"]] for k, v in proxy_cols_raw.items()}
+                focal_dist = None
+                if recipe.get("spatial_targets"):
+                    ftgt = recipe["spatial_targets"][0]["id"]
+                    if ftgt in self.dist_results:
+                        focal_dist = (ftgt, self.dist_results[ftgt]["dist_eucl"][design["valid_mask"]])
+
+                diag = run_guard1_diagnostics(design["X"], design["y"], ols, design["col_meta"], proxy_sub, focal_dist)
+
+                params_rows = []
+                for j, meta in enumerate(design["col_meta"]):
+                    b_j = float(ols["beta"][j])
+                    se_j = float(ols["se"][j])
+                    p_j = float(ols["p"][j])
+                    pcts = compute_semi_log_effects(b_j, se_j, meta["is_binary"], design["is_log_scale"])
+                    params_rows.append({
+                        "name": meta["name"],
+                        "label": meta["label"],
+                        "kind": meta["kind"],
+                        "is_binary": meta["is_binary"],
+                        "beta": round(b_j, 4),
+                        "se": round(se_j, 4),
+                        "t": round(float(ols["t"][j]), 3),
+                        "p": round(p_j, 5),
+                        "sig": _sig_stars(p_j),
+                        "ci_lo": round(float(ols["ci_lo"][j]), 4),
+                        "ci_hi": round(float(ols["ci_hi"][j]), 4),
+                        "hp_pct": pcts["hp_pct"],
+                        "kennedy_pct": pcts["kennedy_pct"],
+                    })
+
+                llf_y_scale = float(ols["llf"]) + float(design.get("jacobian_log_sum", 0.0))
+                aic_y_scale = 2.0 * design["k_params"] - 2.0 * llf_y_scale
+
+                return {
+                    "model_id": spec_cur["id"],
+                    "model_name": spec_cur.get("name", spec_cur["id"]),
+                    "n_obs": design["n_obs"],
+                    "k_params": design["k_params"],
+                    "is_log_scale": design["is_log_scale"],
+                    "y_label": design["y_label"],
+                    "y_transform": design.get("y_transform", "raw"),
+                    "r2": round(float(ols["r2"]), 4),
+                    "adj_r2": round(float(ols["adj_r2"]), 4),
+                    "aic": round(float(ols["aic"]), 2),
+                    "aicc": round(float(ols["aicc"]), 2),
+                    "bic": round(float(ols["bic"]), 2),
+                    "llf": round(float(ols["llf"]), 2),
+                    "aic_y_scale": round(aic_y_scale, 2),
+                    "llf_y_scale": round(llf_y_scale, 2),
+                    "f_stat": round(float(ols["f_stat"]), 2) if math.isfinite(ols["f_stat"]) else None,
+                    "f_pval": round(float(ols["f_pval"]), 5) if math.isfinite(ols["f_pval"]) else None,
+                    "cov_type_used": ols["cov_type_used"],
+                    "df_infer": ols.get("df_infer", ols["df_resid"]),
+                    "cluster_meta": cluster_meta,
+                    "params": params_rows,
+                    "diagnostics": diag,
+                    "guard2_events": design["guard2_events"],
+                    "footnotes": design["footnotes"],
+                    "fitted": np.round(ols["fitted"], 5).tolist(),
+                    "resid": np.round(ols["resid"], 5).tolist(),
+                    "cooks_d": np.round(ols["cooks_d"], 5).tolist(),
+                    "valid_indices": design["valid_indices"].tolist(),
+                }
+
+            model_entry = self.cache.get_or_compute("ols", m_key, _compute_single_model, run_id=run_id)
+            models_out.append(model_entry)
+            if "error" in model_entry:
+                continue
+
+            # Scan AD cutoff profile for any AD spatial term in this spec (cached independent of slider cutoff_m)
+            sp_terms = m_spec.get("spatial_terms", [])
+            ad_tids = [s.get("target_id") for s in sp_terms if s.get("transform") == "andersson_day"]
+            for st_idx, st in enumerate(sp_terms):
+                if st.get("transform") == "andersson_day":
+                    rng_cfg = st.get("cutoff_range_m") or [100.0, 600.0, 25.0]
+                    c_min_v = float(rng_cfg[0]) if len(rng_cfg) >= 1 else 100.0
+                    c_max_v = float(rng_cfg[1]) if len(rng_cfg) >= 2 else max(c_min_v + 50.0, 600.0)
+                    step_v = max(1.0, float(rng_cfg[2])) if len(rng_cfg) >= 3 else 25.0
+                    if c_max_v < c_min_v:
+                        c_max_v = c_min_v + step_v
+                    rng_norm = [c_min_v, c_max_v, step_v]
+                    spec_no_cutoff = {
+                        **m_spec,
+                        "spatial_terms": [
+                            {k: v for k, v in s.items() if k != "cutoff_m"} if i == st_idx else s
+                            for i, s in enumerate(sp_terms)
+                        ],
+                    }
+                    ad_key = hash_payload({
+                        "kind": "ad_profile",
+                        "spec": spec_no_cutoff,
+                        "st_idx": st_idx,
+                        "rng": rng_norm,
+                        "y": y_sig,
+                        "mask": mask_sig,
+                        "dist": dist_sig,
+                        "tau": tau,
+                    })
+                    prof_res = self.cache.get_or_compute(
+                        "ols",
+                        ad_key,
+                        lambda sp=m_spec, idx=st_idx, c0=c_min_v, c1=c_max_v, stp=step_v: scan_andersson_day_profile(
+                            self.columns,
+                            self.dist_results,
+                            sp,
+                            y_info,
+                            analytic_base,
+                            target_term_idx=idx,
+                            c_min=c0,
+                            c_max=c1,
+                            step=stp,
+                            sparse_min_cell=tau,
+                            override_valid_mask=common_mask,
+                        ),
+                        run_id=run_id,
+                    )
+                    tid = st.get("target_id")
+                    pkey = f"{m_spec['id']}::{tid}::{st.get('metric', 'eucl')}" if ad_tids.count(tid) > 1 else f"{m_spec['id']}::{tid}"
+                    ad_profiles[pkey] = prof_res
+
+        # Guard #4 Heckman 2-Step Selection Check & Conditional Box-Cox on reference active model
         sel_cfg = ds.get("selection_spec", {})
         sp_mid = recipe.get("spatial_engine", {}).get("active_model_id")
         ref_spec = next((m for m in active_specs if m["id"] == sp_mid), active_specs[-1])
         ref_design = build_model_design(
             self.columns, self.dist_results, ref_spec, y_info, analytic_base, tau, common_mask
         )
+
+        cond_boxcox: Optional[Dict[str, Any]] = None
+        if ref_design["n_obs"] > ref_design["k_params"] + 5 and np.all(ref_design["y_raw"] > 0.0):
+            try:
+                lam_c, ll_c, p_log_c, p_lin_c = _boxcox_profile_mle(ref_design["y_raw"], ref_design["X"])
+                cond_boxcox = {
+                    "mode": "conditional_on_X",
+                    "model_id": ref_spec["id"],
+                    "lambda_mle": round(lam_c, 4),
+                    "ll_mle": round(ll_c, 3),
+                    "p_vs_log": round(p_log_c, 5),
+                    "p_vs_linear": round(p_lin_c, 5),
+                }
+            except Exception:
+                cond_boxcox = None
+
         sel_indicator = analytic_base.astype(np.float64)
         n_excl = int(np.sum(sel_indicator == 0.0))
         if (
@@ -494,15 +650,30 @@ class GeoSpecSession:
             cov_cols = [c["col"] for c in ref_spec.get("covariates", []) if c.get("type", "numeric") != "categorical"]
             fs_covs = sel_cfg.get("first_stage_covariates") or cov_cols
             excl_cols = sel_cfg.get("exclusion_restriction_cols") or []
-            heckman_out = run_heckman_two_step(
-                self.columns,
-                sel_indicator,
-                ref_design["valid_indices"],
-                ref_design["X"],
-                ref_design["y"],
-                ref_design["col_meta"],
-                fs_covs,
-                excl_cols,
+            heck_key = hash_payload({
+                "kind": "heckman",
+                "fs_covs": fs_covs,
+                "excl": excl_cols,
+                "ref_cols": [m["name"] for m in ref_design["col_meta"]],
+                "y": y_sig,
+                "mask": _array_sha256(ref_design["valid_mask"].astype(np.float64)),
+                "excl_mask": _array_sha256(sel_indicator),
+                "x_sha": _array_sha256(ref_design["X"]),
+            })
+            heckman_out = self.cache.get_or_compute(
+                "ols",
+                heck_key,
+                lambda: run_heckman_two_step(
+                    self.columns,
+                    sel_indicator,
+                    ref_design["valid_indices"],
+                    ref_design["X"],
+                    ref_design["y"],
+                    ref_design["col_meta"],
+                    fs_covs,
+                    excl_cols,
+                ),
+                run_id=run_id,
             )
         else:
             heckman_out = {
@@ -516,6 +687,7 @@ class GeoSpecSession:
             "models": models_out,
             "ad_profiles": ad_profiles,
             "heckman": heckman_out,
+            "conditional_boxcox": cond_boxcox,
         }
         self.last_outputs["stage3"] = res
         return res
@@ -553,17 +725,20 @@ class GeoSpecSession:
             {"id": "idw_auto", "type": "idw", "power": 1.0, "cutoff_mode": "auto_connectivity"},
         ]
 
+        col_names = [m["name"] for m in design["col_meta"]]
         sp_key = hash_payload({
             "mid": ref_spec["id"],
             "n": design["n_obs"],
             "k": design["k_params"],
+            "cols": col_names,
             "w": w_configs,
             "kr": int(sp_cfg.get("krinsky_robb_draws", 1000)),
             "fdr": bool(sp_cfg.get("lisa_fdr", True)),
-            "x_hash": hash_payload(design["X"][:10].tolist()),
+            "x_sha": _array_sha256(design["X"]),
+            "y_sha": _array_sha256(design["y"]),
+            "xy_sha": _array_sha256(coords_v),
         })
 
-        col_names = [m["name"] for m in design["col_meta"]]
         res = self.cache.get_or_compute(
             "spatial",
             sp_key,
@@ -639,7 +814,11 @@ class GeoSpecSession:
         """Expose 1-click editable M1-M4 generator."""
         return generate_m1_m4_specs(covariates, spatial_targets, default_rings, default_cutoff_m)
 
-    def export_publication_bundle(self, recipe: Dict[str, Any]) -> Dict[str, Any]:
+    def export_publication_bundle(
+        self,
+        recipe: Dict[str, Any],
+        osm_bundle: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Generate LaTeX, CSV, QGIS GeoJSON, Reproducibility Manifest, and ZIP bytes."""
         prep = self._prepare_y_and_masks(recipe)
         y_info = prep["y_info"]
@@ -690,6 +869,7 @@ class GeoSpecSession:
                     "r2": m["r2"],
                     "adj_r2": m["adj_r2"],
                     "aic": m["aic"],
+                    "aic_y_scale": m.get("aic_y_scale"),
                     **{k: v for k, v in m["diagnostics"].items() if isinstance(v, (int, float, str, type(None)))},
                 }
                 for m in ols_models
@@ -699,16 +879,18 @@ class GeoSpecSession:
         if s4.get("ok"):
             tables["spatial_model_comparison"] = s4.get("model_comparison", [])
             tables["weights_robustness"] = s4.get("weights_robustness", [])
-            tables["lesage_pace_sar"] = [
-                {
-                    "variable": r["variable"],
-                    "direct": r["direct"]["est"], "direct_se": r["direct"]["se"], "direct_p": r["direct"]["p"],
-                    "indirect": r["indirect"]["est"], "indirect_se": r["indirect"]["se"], "indirect_p": r["indirect"]["p"],
-                    "total": r["total"]["est"], "total_se": r["total"]["se"], "total_p": r["total"]["p"],
-                    "spillover_pct": r["spillover_share_pct"],
-                }
-                for r in s4.get("impacts_sar", [])
-            ]
+            for imp_key, tbl_name in [("impacts_sar", "lesage_pace_sar"), ("impacts_sdm", "lesage_pace_sdm")]:
+                if s4.get(imp_key):
+                    tables[tbl_name] = [
+                        {
+                            "variable": r["variable"],
+                            "direct": r["direct"]["est"], "direct_se": r["direct"]["se"], "direct_p": r["direct"]["p"],
+                            "indirect": r["indirect"]["est"], "indirect_se": r["indirect"]["se"], "indirect_p": r["indirect"]["p"],
+                            "total": r["total"]["est"], "total_se": r["total"]["se"], "total_p": r["total"]["p"],
+                            "spillover_pct": r["spillover_share_pct"],
+                        }
+                        for r in s4.get(imp_key, [])
+                    ]
         if s5.get("ok"):
             tables["gwr_parameter_summary"] = s5.get("param_summaries", [])
 
@@ -719,16 +901,32 @@ class GeoSpecSession:
 
         manifest = {
             "tool": "GeoSpec Parametric Spatial Econometric Workbench",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "exported_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "n_rows_total": self.n_rows,
             "n_geocoded": int(np.sum(self.valid_coord_mask)),
             "projection": self.proj.metadata() if self.proj else {},
             "stage1_summary": self.last_outputs.get("stage1", {}).get("summary", []),
             "boxcox_info": y_info.get("boxcox_info"),
+            "conditional_boxcox": s3.get("conditional_boxcox"),
         }
 
-        zip_bytes = build_zip_bundle(tables, latex_tables, geojson, recipe, manifest)
+        if osm_bundle is None and self.target_features:
+            tgt_cfg_map = {t.get("id"): dict(t) for t in recipe.get("spatial_targets", []) if t.get("id")}
+            osm_bundle = {
+                "schema": "geospec.osm_bundle.v1",
+                "exported_utc": manifest["exported_utc"],
+                "targets": {
+                    tid: {
+                        "target_cfg": tgt_cfg_map.get(tid, {"id": tid, "name": tid, "source": "geojson"}),
+                        "source_kind": "geojson",
+                        "payload": features_to_preview_geojson(feats),
+                    }
+                    for tid, feats in self.target_features.items()
+                },
+            }
+
+        zip_bytes = build_zip_bundle(tables, latex_tables, geojson, recipe, manifest, osm_bundle=osm_bundle)
         return {
             "ok": True,
             "latex_main": latex_tables.get("regression_comparison", ""),

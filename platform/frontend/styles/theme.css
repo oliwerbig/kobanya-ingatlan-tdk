@@ -274,10 +274,86 @@ html, body {
   flex-wrap: wrap;
 }
 
+.map-canvas-wrap {
+  flex: 1;
+  min-height: 280px;
+  position: relative;
+  display: flex;
+}
+
 #mapContainer {
   flex: 1;
   min-height: 280px;
   position: relative;
+}
+
+.map-legend {
+  position: absolute;
+  bottom: 28px;
+  right: 10px;
+  z-index: 5;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 11px;
+  box-shadow: var(--shadow-sm);
+  max-width: 240px;
+  pointer-events: auto;
+  opacity: 0.94;
+}
+
+.legend-ramp {
+  height: 10px;
+  border-radius: 3px;
+  margin: 4px 0 3px 0;
+  border: 1px solid var(--border);
+}
+
+.legend-ticks {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.legend-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.legend-swatch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+}
+
+.legend-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+  border: 1px solid rgba(255,255,255,0.6);
+}
+
+.tab-strip-sm {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.osm-search-bar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 5px;
+  flex-wrap: wrap;
 }
 
 .inspector-drawer {

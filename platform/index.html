@@ -3,11 +3,15 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval' https://unpkg.com https://cdn.plot.ly https://cdn.jsdelivr.net blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com https://tiles.openfreemap.org; img-src 'self' data: blob: https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://tiles.openfreemap.org; connect-src 'self' data: blob: https://cdn.jsdelivr.net https://unpkg.com https://cdn.plot.ly https://postpass.geofabrik.de https://overpass-api.de https://lz4.overpass-api.de https://overpass.private.coffee https://maps.mail.ru https://tiles.openfreemap.org https://tile.openstreetmap.org https://*.tile.openstreetmap.org; object-src 'none'; base-uri 'self';"
+  />
   <title>GeoSpec — Parametrikus Térökonometriai &amp; OSM Kutatói Munkaállomás</title>
-  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" crossorigin="anonymous" referrerpolicy="no-referrer" />
   <link rel="stylesheet" href="./frontend/styles/theme.css" />
-  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 </head>
 <body>
   <div class="app-shell">
@@ -29,7 +33,6 @@
         <button class="btn btn-sm" id="btnTopRecipeExport">🧪 Recept (.json)</button>
         <button class="btn btn-sm" id="btnTopZipExport">📦 .ZIP Export</button>
         <button class="btn btn-sm" id="btnThemeToggle" title="Világos / Sötét nézet váltása">🌗</button>
-        <a href="../index.html" class="btn btn-sm" style="text-decoration:none;">← TDK 2026 Riport</a>
       </div>
     </header>
 
@@ -59,16 +62,20 @@
 
       <aside class="map-pane">
         <div class="map-toolbar">
-          <div style="display:flex;align-items:center;gap:6px;">
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
             <strong style="font-size:12px;">Térképi réteg:</strong>
             <select id="selMapLayer">
               <option value="y_raw">Megfigyelt célváltozó (y)</option>
-              <option value="ols_resid">OLS Reziduumok</option>
+              <option value="ols_resid">OLS Reziduumok (aktív modell)</option>
               <option value="lisa">LISA Klaszterek (HH/LL/HL/LH)</option>
-              <option value="gwr_beta">GWR Lokális β̂ᵢ (|t|&lt;1.96 halványított)</option>
+              <option value="gwr_beta">GWR Lokális β̂ᵢ (halványított nem-szign.)</option>
               <option value="gwr_r2">GWR Lokális R²</option>
             </select>
             <select id="selGwrVarLayer" style="display:none;"></select>
+            <select id="selGwrMaskMode" style="display:none;" title="GWR szignifikancia-maszkolás módja">
+              <option value="fdr">BY-FDR (p_adj &lt; 0.05)</option>
+              <option value="nominal">Nominális (|t| ≥ t_crit)</option>
+            </select>
           </div>
           <div style="display:flex;align-items:center;gap:6px;">
             <span class="card-subtitle">Útvonal célpont:</span>
@@ -76,7 +83,10 @@
           </div>
         </div>
 
-        <div id="mapContainer"></div>
+        <div class="map-canvas-wrap">
+          <div id="mapContainer"></div>
+          <div id="mapLegend" class="map-legend"></div>
+        </div>
         <div class="inspector-drawer" id="pointInspector"></div>
       </aside>
     </main>

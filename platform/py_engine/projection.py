@@ -4,14 +4,15 @@ Universal Metric Projection (Pure NumPy, zero pyproj)
 Projects geographic WGS84 coordinates (lat, lon) onto a local conformal
 Krüger 4th-order Transverse Mercator plane centered on the study area's circular
 centroid (0, 0) m, eliminating UTM zone splits and 7-digit floating-point
-cancellation. Falls back to ellipsoidal Local Tangent Plane (ENU) at high
-latitudes (|lat0| > 80 deg) or wide longitudinal spans (> 6 deg).
+cancellation. Falls back to Conformal-Sphere Oblique Azimuthal Equidistant (AEQD)
+at high latitudes (|lat0| > 80 deg) or wide longitudinal spans (> 6 deg), and
+provides CRS/swapped-lat-lon diagnostics.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -76,6 +77,54 @@ def compute_circular_centroid(lat_deg: np.ndarray, lon_deg: np.ndarray) -> Tuple
     return lat0_deg, lon0_deg, lon_span_deg
 
 
+def diagnose_coordinate_issues(lat_deg: np.ndarray, lon_deg: np.ndarray) -> Dict[str, Any]:
+    """
+    Detect common CRS mistakes (projected meters like UTM/EOV/WebMercator or swapped lat/lon).
+    """
+    lat = np.asarray(lat_deg, dtype=np.float64)
+    lon = np.asarray(lon_deg, dtype=np.float64)
+    fin = np.isfinite(lat) & np.isfinite(lon)
+    hints: List[str] = []
+    looks_projected_crs = False
+    suggested_swap = False
+
+    if not np.any(fin):
+        return {"looks_projected_crs": False, "suggested_swap": False, "hints": ["No finite numeric coordinates found."]}
+
+    la = lat[fin]
+    lo = lon[fin]
+    max_abs = float(max(np.max(np.abs(la)), np.max(np.abs(lo))))
+    if max_abs > 180.0:
+        looks_projected_crs = True
+        hints.append(
+            f"Coordinates exceed [-180, 180] (max |coord|={max_abs:.1f}): values appear to be projected meters "
+            "(e.g. UTM, EOV EPSG:23700, or Web Mercator) rather than WGS84 decimal degrees (EPSG:4326)."
+        )
+    else:
+        lat_out = (np.abs(la) > 90.0) & (np.abs(la) <= 180.0)
+        lon_in_lat = np.abs(lo) <= 90.0
+        if np.any(lat_out & lon_in_lat):
+            suggested_swap = True
+            hints.append(
+                "Some 'lat' values exceed [-90, 90] while 'lon' falls within [-90, 90]: "
+                "latitude and longitude columns appear to be swapped."
+            )
+
+    return {
+        "looks_projected_crs": looks_projected_crs,
+        "suggested_swap": suggested_swap,
+        "hints": hints,
+    }
+
+
+def _conformal_lat(phi_rad: np.ndarray) -> np.ndarray:
+    """Compute WGS84 conformal latitude chi(phi)."""
+    phi_c = np.clip(phi_rad, -1.5707963, 1.5707963)
+    sin_p = np.sin(phi_c)
+    q = np.arcsinh(np.tan(phi_c)) - _SQRT_N_TERM * np.arctanh(_SQRT_N_TERM * sin_p)
+    return np.arctan(np.sinh(q))
+
+
 def _meridian_arc_tmerc(phi_rad: float) -> float:
     """Compute conformal-rectified northing M(phi) for scale factor k0=1.0."""
     sin_p = math.sin(phi_rad)
@@ -88,7 +137,7 @@ def _meridian_arc_tmerc(phi_rad: float) -> float:
 
 
 class LocalMetricProjection:
-    """Local origin-centered conformal Transverse Mercator (or ENU fallback) projection."""
+    """Local origin-centered conformal Transverse Mercator (or Oblique AEQD fallback) projection."""
 
     def __init__(self, lat0_deg: float, lon0_deg: float, lon_span_deg: float = 0.0) -> None:
         self.lat0_deg = float(lat0_deg)
@@ -97,8 +146,14 @@ class LocalMetricProjection:
         self.lat0_rad = math.radians(self.lat0_deg)
         self.lon0_rad = math.radians(self.lon0_deg)
 
+        self.warnings: List[str] = []
         if abs(self.lat0_deg) > 80.0 or self.lon_span_deg > 6.0:
-            self.mode = "enu"
+            self.mode = "aeqd"
+            if self.lon_span_deg > 12.0:
+                self.warnings.append(
+                    f"Wide longitudinal span ({self.lon_span_deg:.2f} deg > 12 deg): using Conformal-Sphere Oblique AEQD "
+                    "metric plane; verify planar distance distortion if spanning continental scales."
+                )
         else:
             self.mode = "tmerc"
 
@@ -109,13 +164,27 @@ class LocalMetricProjection:
         self._rm0 = _WGS84_A * (1.0 - _WGS84_E2) / (denom ** 1.5)
         self._cos_lat0 = math.cos(self.lat0_rad)
 
+        self._chi0 = float(_conformal_lat(np.array([self.lat0_rad]))[0])
+        self._sin_chi0 = math.sin(self._chi0)
+        self._cos_chi0 = math.cos(self._chi0)
+        if abs(self.lat0_deg) > 89.0 or self._cos_chi0 < 1e-6:
+            self._r_conf = math.sqrt(self._rn0 * self._rm0)
+        else:
+            self._r_conf = self._rn0 * (self._cos_lat0 / self._cos_chi0)
+
         # Nearest standard UTM zone provenance
         zone = int((self.lon0_deg + 180.0) / 6.0) % 60 + 1
         self.nearest_utm_epsg = f"EPSG:{32600 + zone if self.lat0_deg >= 0 else 32700 + zone}"
-        self.proj4_string = (
-            f"+proj=tmerc +lat_0={self.lat0_deg:.6f} +lon_0={self.lon0_deg:.6f} "
-            f"+k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
-        )
+        if self.mode == "aeqd":
+            self.proj4_string = (
+                f"+proj=aeqd +lat_0={self.lat0_deg:.6f} +lon_0={self.lon0_deg:.6f} "
+                f"+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+            )
+        else:
+            self.proj4_string = (
+                f"+proj=tmerc +lat_0={self.lat0_deg:.6f} +lon_0={self.lon0_deg:.6f} "
+                f"+k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+            )
 
     @classmethod
     def from_points(cls, lat_deg: np.ndarray, lon_deg: np.ndarray) -> "LocalMetricProjection":
@@ -136,9 +205,21 @@ class LocalMetricProjection:
         # Antimeridian-safe delta lambda in [-pi, pi]
         dlam = np.arctan2(np.sin(lam - self.lon0_rad), np.cos(lam - self.lon0_rad))
 
-        if self.mode == "enu":
-            x = self._rn0 * self._cos_lat0 * dlam
-            y = self._rm0 * (phi - self.lat0_rad)
+        if self.mode in ("aeqd", "enu"):
+            chi = _conformal_lat(phi)
+            dchi = chi - self._chi0
+            sin_chi = np.sin(chi)
+            cos_chi = np.cos(chi)
+            sin_half_c2 = np.sin(0.5 * dchi) ** 2 + self._cos_chi0 * cos_chi * (np.sin(0.5 * dlam) ** 2)
+            c = 2.0 * np.arcsin(np.minimum(1.0, np.sqrt(np.maximum(0.0, sin_half_c2))))
+            c = np.minimum(c, math.pi - 1e-7)
+            k_prime = np.where(
+                c < 1e-5,
+                1.0 + (c * c) / 6.0 + (7.0 * (c ** 4)) / 360.0,
+                c / np.sin(np.maximum(c, 1e-12)),
+            )
+            x = self._r_conf * k_prime * cos_chi * np.sin(dlam)
+            y = self._r_conf * k_prime * (self._cos_chi0 * sin_chi - self._sin_chi0 * cos_chi * np.cos(dlam))
         else:
             sin_p = np.sin(phi)
             q = np.arcsinh(np.tan(phi)) - _SQRT_N_TERM * np.arctanh(_SQRT_N_TERM * sin_p)
@@ -167,9 +248,25 @@ class LocalMetricProjection:
         x_1d = np.atleast_1d(x)
         y_1d = np.atleast_1d(y)
 
-        if self.mode == "enu":
-            phi = self.lat0_rad + y_1d / self._rm0
-            dlam = x_1d / max(1e-6, self._rn0 * self._cos_lat0)
+        if self.mode in ("aeqd", "enu"):
+            rho = np.hypot(x_1d, y_1d)
+            c = np.minimum(math.pi - 1e-9, rho / self._r_conf)
+            sin_c = np.sin(c)
+            cos_c = np.cos(c)
+            safe_rho = np.maximum(rho, 1e-12)
+            chi = np.where(
+                rho < 1e-10,
+                self._chi0,
+                np.arcsin(np.clip(cos_c * self._sin_chi0 + (y_1d * sin_c * self._cos_chi0) / safe_rho, -1.0, 1.0)),
+            )
+            dlam = np.where(
+                rho < 1e-10,
+                0.0,
+                np.arctan2(x_1d * sin_c, rho * self._cos_chi0 * cos_c - y_1d * self._sin_chi0 * sin_c),
+            )
+            phi = chi.copy()
+            for j, d_j in enumerate(_DELTA, start=1):
+                phi += d_j * np.sin(2.0 * j * chi)
         else:
             xi = (y_1d + self._m0) / _A_RECT
             eta = x_1d / _A_RECT
@@ -194,7 +291,7 @@ class LocalMetricProjection:
             return float(lat_out[0]), float(lon_out[0])
         return lat_out.reshape(x.shape), lon_out.reshape(y.shape)
 
-    def metadata(self) -> Dict[str, object]:
+    def metadata(self) -> Dict[str, Any]:
         """Return projection provenance dictionary for reproducibility manifests."""
         return {
             "mode": self.mode,
@@ -203,4 +300,5 @@ class LocalMetricProjection:
             "lon_span_deg": round(self.lon_span_deg, 4),
             "nearest_utm_epsg": self.nearest_utm_epsg,
             "proj4_string": self.proj4_string,
+            "warnings": list(self.warnings),
         }

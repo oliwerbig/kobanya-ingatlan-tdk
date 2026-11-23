@@ -20,8 +20,24 @@ import numpy as np
 from scipy import optimize, stats
 
 
+def _normalize_numeric_str(s: str) -> str:
+    """Normalize international/EU/HU thousand and decimal separators safely."""
+    s = s.replace("\xa0", "").replace(" ", "")
+    if "," in s and "." in s:
+        if s.rfind(".") > s.rfind(","):
+            return s.replace(",", "")
+        return s.replace(".", "").replace(",", ".")
+    if s.count(",") > 1:
+        return s.replace(",", "")
+    if s.count(".") > 1:
+        return s.replace(".", "")
+    if "," in s:
+        return s.replace(",", ".")
+    return s
+
+
 def parse_numeric_array(raw_values: List[Any]) -> np.ndarray:
-    """Parse arbitrary string/number list (including EU/HU commas and spaces) to float64 array."""
+    """Parse arbitrary string/number list (including EU/HU commas, spaces, and thousands) to float64 array."""
     out = np.full(len(raw_values), np.nan, dtype=np.float64)
     for i, val in enumerate(raw_values):
         if val is None or isinstance(val, bool):
@@ -34,7 +50,7 @@ def parse_numeric_array(raw_values: List[Any]) -> np.ndarray:
         s = str(val).strip()
         if not s or s.lower() in ("na", "nan", "null", "none", "n/a", "-"):
             continue
-        s = s.replace("\xa0", "").replace(" ", "").replace(",", ".")
+        s = _normalize_numeric_str(s)
         try:
             fval = float(s)
             if math.isfinite(fval):
@@ -62,7 +78,7 @@ def parse_binary_flag(raw_values: List[Any]) -> np.ndarray:
             out[i] = 1.0
         else:
             try:
-                if float(s.replace(",", ".")) >= 1.0:
+                if float(_normalize_numeric_str(s)) >= 1.0:
                     out[i] = 1.0
             except ValueError:
                 pass
@@ -76,17 +92,22 @@ def _boxcox_transform(y: np.ndarray, lam: float) -> np.ndarray:
     return (np.power(y, lam) - 1.0) / lam
 
 
-def _boxcox_profile_mle(y: np.ndarray) -> Tuple[float, float, float, float]:
+def _boxcox_profile_mle(y: np.ndarray, X: Optional[np.ndarray] = None) -> Tuple[float, float, float, float]:
     """
-    Estimate profile-MLE Box-Cox lambda on strictly positive y (intercept-only Jacobian LL),
-    returning (lambda_hat, ll_hat, p_vs_log, p_vs_linear).
+    Estimate profile-MLE Box-Cox lambda on strictly positive y (conditional on X if provided,
+    otherwise intercept-only unconditional Jacobian LL), returning (lambda_hat, ll_hat, p_vs_log, p_vs_linear).
     """
     n = len(y)
     sum_log_y = float(np.sum(np.log(y)))
 
     def _neg_ll(lam: float) -> float:
         yt = _boxcox_transform(y, lam)
-        var = float(np.mean((yt - np.mean(yt)) ** 2))
+        if X is not None and len(X) == n and X.shape[1] >= 1 and n > X.shape[1]:
+            beta, _, _, _ = np.linalg.lstsq(X, yt, rcond=None)
+            resid = yt - X @ beta
+            var = float(np.mean(resid * resid))
+        else:
+            var = float(np.mean((yt - np.mean(yt)) ** 2))
         var = max(var, 1e-18)
         ll = -0.5 * n * math.log(var) + (lam - 1.0) * sum_log_y
         return -ll
@@ -108,7 +129,7 @@ def build_dependent_variable(
     columns: Dict[str, List[Any]],
     y_spec: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Construct target vector y, raw y, validity mask, and Box-Cox diagnostics."""
+    """Construct target vector y, raw y, validity mask, per-obs Jacobian log|g'(y)|, and Box-Cox diagnostics."""
     mode = y_spec.get("mode", "column")
     num_col = y_spec.get("num_col")
     den_col = y_spec.get("den_col")
@@ -135,6 +156,7 @@ def build_dependent_variable(
         base_label = str(num_col)
 
     y_trans = np.full(n, np.nan, dtype=np.float64)
+    jacobian_log = np.zeros(n, dtype=np.float64)
     dropped_nonpos = 0
     boxcox_info: Optional[Dict[str, Any]] = None
 
@@ -147,12 +169,14 @@ def build_dependent_variable(
         dropped_nonpos = int(np.sum(nonpos_mask))
         valid_y = valid_raw & (y_raw > 0.0)
         y_trans[valid_y] = np.log(y_raw[valid_y])
+        jacobian_log[valid_y] = -np.log(y_raw[valid_y])
         label = f"ln({base_label})"
     elif transform == "log1p":
         nonpos_mask = valid_raw & ((y_raw + shift) <= 0.0)
         dropped_nonpos = int(np.sum(nonpos_mask))
         valid_y = valid_raw & ((y_raw + shift) > 0.0)
         y_trans[valid_y] = np.log(y_raw[valid_y] + shift)
+        jacobian_log[valid_y] = -np.log(y_raw[valid_y] + shift)
         label = f"ln({base_label} + {shift:g})"
     elif transform == "boxcox":
         nonpos_mask = valid_raw & (y_raw <= 0.0)
@@ -164,8 +188,10 @@ def build_dependent_variable(
         lam_mle, ll_mle, p_log, p_lin = _boxcox_profile_mle(yv)
         lam_use = float(fixed_lam) if fixed_lam is not None else lam_mle
         y_trans[valid_y] = _boxcox_transform(yv, lam_use)
+        jacobian_log[valid_y] = (lam_use - 1.0) * np.log(yv)
         label = f"BoxCox({base_label}, λ={lam_use:.3f})"
         boxcox_info = {
+            "mode": "unconditional_intercept_only",
             "lambda_used": round(lam_use, 4),
             "lambda_mle": round(lam_mle, 4),
             "ll_mle": round(ll_mle, 3),
@@ -179,6 +205,7 @@ def build_dependent_variable(
         "y": y_trans,
         "y_raw": y_raw,
         "valid_mask": valid_y,
+        "jacobian_log": jacobian_log,
         "transform": transform,
         "is_log_scale": transform in ("log", "log1p"),
         "label": label,
@@ -216,8 +243,11 @@ def _evaluate_spatial_term(
             "circuity_delta": "circuity_delta",
             "circuity_ratio": "circuity_ratio",
         }
-        arr_key = key_map.get(metric, "dist_eucl")
-        d_raw = t_res.get(arr_key, np.full(n_rows, np.nan))
+        if transform in ("circuity_delta", "circuity_ratio"):
+            arr_key = transform
+        else:
+            arr_key = key_map.get(metric, "dist_eucl")
+        d_raw = np.asarray(t_res.get(arr_key, np.full(n_rows, np.nan)), dtype=np.float64)
 
     term_key_base = f"{target_id}::{metric}::{transform}"
     cols_out: List[Dict[str, Any]] = []
@@ -294,30 +324,36 @@ def _evaluate_spatial_term(
         ref_lo = raw_breaks[-1]
         ref_count = int(np.sum(valid_mask & (d_raw > ref_lo)))
 
-        # Guard #2: Greedy merge of ordered rings with 0 < N_k < sparse_min_cell (and drop N_k == 0)
-        original_desc = [f"{r['lo']:g}-{r['hi']:g}m(N={r['counts']})" for r in ring_items]
+        # Drop empty rings (N=0) with audit event
+        empty_rings = [r for r in ring_items if r["counts"] == 0]
+        for r in empty_rings:
+            guard2_events.append({
+                "term": target_id,
+                "type": "ring_empty_dropped",
+                "detail": f"Empty ring [{r['lo']:g}, {r['hi']:g}]m (N=0) omitted.",
+            })
         ring_items = [r for r in ring_items if r["counts"] > 0]
 
-        merged = True
-        while merged and len(ring_items) > 0:
-            merged = False
+        # Guard #2: Enforce N_k >= sparse_min_cell on all rings AND reference zone (prevents dummy trap when ref_count==0!)
+        changed = True
+        while changed and len(ring_items) > 0:
+            changed = False
+            # 1) Merge any ring with N_k < sparse_min_cell
             for idx, r in enumerate(ring_items):
                 if r["counts"] < sparse_min_cell:
                     if len(ring_items) == 1:
-                        # Merge into reference zone
                         guard2_events.append({
                             "term": target_id,
                             "type": "ring_merged_to_ref",
                             "detail": f"Ring [{r['lo']:g}, {r['hi']:g}]m (N={r['counts']} < {sparse_min_cell}) merged into reference >{ref_lo:g}m.",
                         })
+                        ref_count += r["counts"]
                         ring_items.pop(idx)
-                        merged = True
+                        changed = True
                         break
-                    # Choose smaller adjacent ring (or merge into next/prev)
                     if idx == 0:
                         nbr_idx = 1
                     elif idx == len(ring_items) - 1:
-                        # Compare merging with prev ring vs reference
                         if ref_count <= ring_items[idx - 1]["counts"]:
                             guard2_events.append({
                                 "term": target_id,
@@ -327,7 +363,7 @@ def _evaluate_spatial_term(
                             ref_lo = r["lo"]
                             ref_count += r["counts"]
                             ring_items.pop(idx)
-                            merged = True
+                            changed = True
                             break
                         nbr_idx = idx - 1
                     else:
@@ -346,8 +382,27 @@ def _evaluate_spatial_term(
                     })
                     ring_items[nbr_idx] = {"lo": lo_new, "hi": hi_new, "counts": cnt_new}
                     ring_items.pop(idx)
-                    merged = True
+                    changed = True
                     break
+
+            if changed:
+                continue
+
+            # 2) Check reference zone: if ref_count < sparse_min_cell (e.g. ref_count == 0 -> dummy trap!), merge outermost ring into ref
+            if ref_count < sparse_min_cell and len(ring_items) > 0:
+                outer_r = ring_items.pop(-1)
+                old_ref_count = ref_count
+                ref_count += outer_r["counts"]
+                ref_lo = outer_r["lo"]
+                guard2_events.append({
+                    "term": target_id,
+                    "type": "ref_zone_merged",
+                    "detail": (
+                        f"Reference zone (N={old_ref_count} < {sparse_min_cell}) absorbed outermost ring "
+                        f"({outer_r['lo']:g}, {outer_r['hi']:g}]m (N={outer_r['counts']}) -> new reference >{ref_lo:g}m (N={ref_count}) to prevent dummy trap."
+                    ),
+                })
+                changed = True
 
         if guard2_events:
             footnotes.append(
@@ -637,6 +692,9 @@ def build_model_design(
         {k: v for k, v in c.items() if k != "values"} for c in final_cols
     ]
 
+    jac_vec = y_info.get("jacobian_log")
+    jac_sum = float(np.sum(jac_vec[valid_mask])) if jac_vec is not None else 0.0
+
     return {
         "model_id": model_spec.get("id", "spec"),
         "model_name": model_spec.get("name", "Specification"),
@@ -652,6 +710,8 @@ def build_model_design(
         "footnotes": footnotes,
         "is_log_scale": y_info["is_log_scale"],
         "y_label": y_info["label"],
+        "y_transform": y_info.get("transform", "raw"),
+        "jacobian_log_sum": jac_sum,
     }
 
 

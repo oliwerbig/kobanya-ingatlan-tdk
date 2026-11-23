@@ -102,19 +102,24 @@ def fit_adaptive_gwr(
     # Global OLS reference on native X_use, y
     ols_global = fit_ols_core(X_use, y, cov_type="HC3")
 
-    # 4. Pre-sort all neighbors once via cKDTree
-    dists_sorted, idx_sorted = cKDTree(coords_jit).query(coords_jit, k=n)
+    # 4. Build cKDTree once; pre-sort all neighbors only for N <= 1200 (avoid O(N^2) allocation in WASM)
+    nbr_tree = cKDTree(coords_jit)
+    if n <= 1200:
+        dists_sorted, idx_sorted = nbr_tree.query(coords_jit, k=n)
+    else:
+        dists_sorted, idx_sorted = None, None
+
+    # Exact linear map from Z-score beta_z to native intercept: b0_nat = y_mean + a_int^T beta_z
+    a_int = np.empty(p, dtype=np.float64)
+    a_int[0] = y_std_val
+    if p > 1:
+        a_int[1:] = -y_std_val * (x_means[1:] / x_stds[1:])
 
     def _eval_bandwidth(bw_int: int, return_full: bool = False) -> Dict[str, Any]:
         bw = int(max(p + 5, min(n - 1, bw_int)))
-        nbr_idx = idx_sorted[:, :bw]  # (N, bw)
-        nbr_dist = dists_sorted[:, :bw]  # (N, bw)
-        bw_radii = np.maximum(1e-6, dists_sorted[:, bw])  # distance to (bw+1)-th neighbor (strictly > all bw)
-        u = nbr_dist / bw_radii[:, None]
-        w_loc = np.square(np.maximum(0.0, 1.0 - np.square(u)))  # Adaptive bisquare (N, bw)
-
         betas_z = np.zeros((n, p), dtype=np.float64)
         se_z = np.zeros((n, p), dtype=np.float64)
+        se_int_fac = np.zeros(n, dtype=np.float64)
         s_diag = np.zeros(n, dtype=np.float64)
         s_row_sq = np.zeros(n, dtype=np.float64)
         local_r2 = np.zeros(n, dtype=np.float64)
@@ -128,8 +133,18 @@ def fit_adaptive_gwr(
         for start in range(0, n, batch_size):
             end = min(n, start + batch_size)
             b_len = end - start
-            b_idx = nbr_idx[start:end]  # (B, bw)
-            b_w = w_loc[start:end]      # (B, bw)
+            if idx_sorted is not None and dists_sorted is not None:
+                b_idx = idx_sorted[start:end, :bw]
+                b_dist = dists_sorted[start:end, :bw]
+                bw_radii = np.maximum(1e-6, dists_sorted[start:end, bw])
+            else:
+                d_b, i_b = nbr_tree.query(coords_jit[start:end], k=bw + 1)
+                b_idx = i_b[:, :bw]
+                b_dist = d_b[:, :bw]
+                bw_radii = np.maximum(1e-6, d_b[:, bw])
+
+            u = b_dist / bw_radii[:, None]
+            b_w = np.square(np.maximum(0.0, 1.0 - np.square(u)))  # Adaptive bisquare (B, bw)
 
             X_loc = X_z[b_idx]          # (B, bw, p)
             y_loc = y_z[b_idx]          # (B, bw)
@@ -171,9 +186,11 @@ def fit_adaptive_gwr(
                 s_row_sq[gi] = float(c_i @ A2_batch[bi] @ c_i)
 
                 if return_full:
-                    # Store variance factor diag(A_inv @ A2_i @ A_inv)
+                    # Exact variance-covariance factor A_inv @ A2_i @ A_inv
                     cov_fac = A_inv @ A2_batch[bi] @ A_inv
                     se_z[gi] = np.sqrt(np.maximum(0.0, np.diag(cov_fac)))
+                    # Intercept SE includes slope variances and intercept-slope cross-covariances
+                    se_int_fac[gi] = math.sqrt(max(0.0, float(a_int @ cov_fac @ a_int)))
                     # Local weighted R^2
                     yhat_loc = X_loc[bi] @ beta_i
                     w_i = b_w[bi]
@@ -190,21 +207,20 @@ def fit_adaptive_gwr(
         eff_df = max(2.0, n - 2.0 * tr_s + tr_sts)
         sigma2_z = rss_z / eff_df
 
-        # Standard Fotheringham et al. GWR AICc
+        # Standard Fotheringham et al. GWR AICc (kept separate from Ridge search penalty)
         denom_aicc = n - 2.0 - tr_s
         if denom_aicc <= 1.0:
-            aicc = 1e12
+            raw_aicc = 1e12
         else:
-            aicc = n * math.log(max(1e-18, rss_z / n)) + n * math.log(2.0 * math.pi) + n * ((n + tr_s) / denom_aicc)
+            raw_aicc = n * math.log(max(1e-18, rss_z / n)) + n * math.log(2.0 * math.pi) + n * ((n + tr_s) / denom_aicc)
 
-        # Penalize bandwidths during search if >20% locations require Ridge regularization
         reg_share = n_regularized / n
-        if not return_full and reg_share > 0.20:
-            aicc += 1e6 * (reg_share - 0.20)
+        obj_score = float(raw_aicc) + (1e6 * (reg_share - 0.20) if reg_share > 0.20 else 0.0)
 
         out = {
             "bw": bw,
-            "aicc": float(aicc),
+            "aicc": float(raw_aicc),
+            "obj_score": float(obj_score),
             "tr_s": tr_s,
             "tr_sts": tr_sts,
             "eff_df": eff_df,
@@ -214,7 +230,8 @@ def fit_adaptive_gwr(
             "pct_regularized": round(reg_share * 100.0, 2),
         }
         if return_full:
-            se_z_scaled = se_z * math.sqrt(sigma2_z)
+            sqrt_s2z = math.sqrt(sigma2_z)
+            se_z_scaled = se_z * sqrt_s2z
             # Back-transform Z-score estimates & SEs to native units!
             betas_native = np.zeros_like(betas_z)
             se_native = np.zeros_like(se_z_scaled)
@@ -224,7 +241,7 @@ def fit_adaptive_gwr(
                 se_native[:, j] = se_z_scaled[:, j] * scale_j
             # Intercept back-transformation: b0_nat = y_mean + y_std * b0_z - sum_{j>=1} b_j_nat * x_mean_j
             betas_native[:, 0] = y_mean + y_std_val * betas_z[:, 0] - np.sum(betas_native[:, 1:] * x_means[None, 1:], axis=1)
-            se_native[:, 0] = y_std_val * se_z_scaled[:, 0]
+            se_native[:, 0] = se_int_fac * sqrt_s2z
 
             t_vals = np.divide(betas_native, se_native, out=np.zeros_like(betas_native), where=se_native > 1e-15)
             resid_native = y - np.sum(X_use * betas_native, axis=1)
@@ -251,36 +268,40 @@ def fit_adaptive_gwr(
             })
         return out
 
-    # 5. Bounded Golden-Section + Coarse Grid Bandwidth Search
-    b_min = min(n - 2, max(p + b_min_floor, int(math.ceil(0.15 * n))))
+    # 5. Bounded Golden-Section + Coarse Grid Bandwidth Search (no 0.15*N oversmoothing floor)
+    b_min = min(n - 2, max(p + b_min_floor, 2 * p + 5))
     b_max = n - 1
-    eval_history: Dict[int, float] = {}
+    eval_history: Dict[int, Dict[str, Any]] = {}
 
     def _obj(bw_float: float) -> float:
         bw_i = int(round(bw_float))
         if bw_i not in eval_history:
             res_b = _eval_bandwidth(bw_i, return_full=False)
-            eval_history[bw_i] = res_b["aicc"]
-        return eval_history[bw_i]
+            eval_history[bw_i] = {
+                "aicc": res_b["aicc"],
+                "obj_score": res_b["obj_score"],
+                "pct_regularized": res_b["pct_regularized"],
+            }
+        return eval_history[bw_i]["obj_score"]
 
     if b_max <= b_min + 2:
         opt_bw = b_min
         _obj(opt_bw)
     else:
-        # Coarse scan first (6 points) to prevent local minima, then Golden-Section around best bracket
+        # Coarse scan first (7 points) to prevent local minima, then Golden-Section around best bracket
         grid_pts = sorted({int(round(v)) for v in np.linspace(b_min, b_max, 7)})
         for idx_g, g_bw in enumerate(grid_pts):
             _obj(g_bw)
             if progress_cb:
                 progress_cb(0.1 + 0.4 * ((idx_g + 1) / len(grid_pts)), f"GWR bandwidth scan b={g_bw}...")
 
-        best_grid_bw = min(grid_pts, key=lambda b: eval_history[b])
+        best_grid_bw = min(grid_pts, key=lambda b: eval_history[b]["obj_score"])
         g_pos = grid_pts.index(best_grid_bw)
         lo_br = grid_pts[max(0, g_pos - 1)]
         hi_br = grid_pts[min(len(grid_pts) - 1, g_pos + 1)]
         if hi_br > lo_br + 1:
             optimize.minimize_scalar(_obj, bounds=(lo_br, hi_br), method="bounded", options={"xatol": 1.0, "maxiter": 12})
-        opt_bw = min(eval_history.keys(), key=lambda b: eval_history[b])
+        opt_bw = min(eval_history.keys(), key=lambda b: eval_history[b]["obj_score"])
 
     if progress_cb:
         progress_cb(0.75, f"Fitting final GWR at optimal b={opt_bw}...")
@@ -293,18 +314,44 @@ def fit_adaptive_gwr(
             f"locations with local κ > {kappa_thresh:g}."
         )
 
-    # 6. Five-Number Summary & Spatial Non-Stationarity Test (IQR vs 2*SE_OLS)
+    # 6. Five-Number Summary, Multiple-Testing Adjusted Local Significance (BY-FDR & da Silva-Fotheringham) & FBC IQR Test
     param_summaries: List[Dict[str, Any]] = []
     betas_nat = final_res["betas_native"]
     t_mat = final_res["t_vals"]
+    eff_df = float(final_res["eff_df"])
+    tr_s_final = float(final_res["tr_s"])
+    p_mat = 2.0 * stats.t.sf(np.abs(t_mat), df=eff_df)
+    t_crit_nom = float(stats.t.ppf(0.975, df=eff_df))
+    alpha_sdf = 0.05 / max(1.0, tr_s_final / max(1, p))
+    t_crit_sdf = float(stats.t.ppf(1.0 - 0.5 * alpha_sdf, df=eff_df))
+    c_harmonic = float(np.sum(1.0 / np.arange(1, n + 1, dtype=np.float64)))
+    by_sig_mat = np.zeros((n, p), dtype=bool)
+
     for j, meta in enumerate(meta_use):
         vals = betas_nat[:, j]
         t_j = t_mat[:, j]
+        p_j = p_mat[:, j]
         q1, med, q3 = np.percentile(vals, [25, 50, 75])
         iqr = float(q3 - q1)
         ols_se_j = float(ols_global["se"][j])
         non_stat = iqr > 2.0 * ols_se_j
-        pct_sig = float(np.mean(np.abs(t_j) >= 1.96) * 100.0)
+
+        pct_sig_nom = float(np.mean(np.abs(t_j) >= t_crit_nom) * 100.0)
+        pct_sig_sdf = float(np.mean(np.abs(t_j) >= t_crit_sdf) * 100.0)
+
+        # Benjamini-Yekutieli (2001) FDR valid under arbitrary spatial correlation across local tests
+        order = np.argsort(p_j)
+        ranks = np.arange(1, n + 1, dtype=np.float64)
+        by_thresh = (ranks / (n * c_harmonic)) * 0.05
+        passed = np.where(p_j[order] <= by_thresh)[0]
+        if len(passed) > 0:
+            cutoff_p = float(p_j[order[np.max(passed)]])
+            by_mask = p_j <= cutoff_p
+        else:
+            by_mask = np.zeros(n, dtype=bool)
+        by_sig_mat[:, j] = by_mask
+        pct_sig_fdr = float(np.mean(by_mask) * 100.0)
+
         param_summaries.append({
             "name": meta["name"],
             "label": meta["label"],
@@ -316,12 +363,17 @@ def fit_adaptive_gwr(
             "q3": round(float(q3), 4),
             "max": round(float(np.max(vals)), 4),
             "iqr": round(iqr, 4),
-            "pct_sig_95": round(pct_sig, 1),
+            "pct_sig_95": round(pct_sig_nom, 1),
+            "pct_sig_fdr": round(pct_sig_fdr, 1),
+            "pct_sig_sdf": round(pct_sig_sdf, 1),
             "non_stationary": non_stat,
-            "stationarity_verdict": "Non-stationary (IQR > 2·SE_OLS)" if non_stat else "Stationary (IQR <= 2·SE_OLS)",
+            "stationarity_verdict": "Non-stationary (FBC IQR > 2·SE_OLS)" if non_stat else "Stationary (FBC IQR <= 2·SE_OLS)",
         })
 
-    bw_curve = [{"bw": b, "aicc": round(val, 2)} for b, val in sorted(eval_history.items())]
+    bw_curve = [
+        {"bw": b, "aicc": round(v["aicc"], 2), "pct_regularized": v["pct_regularized"]}
+        for b, v in sorted(eval_history.items())
+    ]
 
     return {
         "ok": True,
@@ -340,13 +392,17 @@ def fit_adaptive_gwr(
         "gwr_aic": round(float(final_res["aic"]), 2),
         "gwr_aicc": round(float(final_res["aicc"]), 2),
         "gwr_bic": round(float(final_res["bic"]), 2),
-        "tr_s": round(float(final_res["tr_s"]), 2),
+        "tr_s": round(tr_s_final, 2),
+        "eff_df": round(eff_df, 2),
+        "t_crit_nom": round(t_crit_nom, 3),
+        "t_crit_sdf": round(t_crit_sdf, 3),
         "bw_curve": bw_curve,
         "param_summaries": param_summaries,
         "col_names": [m["name"] for m in meta_use],
         "betas_native": np.round(betas_nat, 5).tolist(),
         "se_native": np.round(final_res["se_native"], 5).tolist(),
         "t_vals": np.round(t_mat, 3).tolist(),
+        "fdr_sig_mask": by_sig_mat.tolist(),
         "local_r2": np.round(final_res["local_r2"], 4).tolist(),
         "local_kappas": np.round(final_res["local_kappas"], 1).tolist(),
         "resid_native": np.round(final_res["resid_native"], 5).tolist(),

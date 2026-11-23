@@ -1,16 +1,45 @@
-/* Stage 1: BYO CSV/GeoJSON Upload, Schema Role Mapping, Parametric OSM Targets & Interactive Feature Filter */
-import {
-  OSM_TARGET_PRESETS,
-  fetchStreetGraphOSM,
-  fetchTargetOSM,
-  parseTagShorthand,
-} from "../gis/overpass_client.js";
+/* Stage 1: BYO CSV/GeoJSON Upload, 1-Click Sandbox, Schema Mapping, Parametric OSM/Bundle & Non-Scrolling Feature Filter */
+import { clearAllCachedOSM, parseOsmBundle } from "../gis/osm_idb_cache.js";
+import { OSM_TARGET_PRESETS, parseTagShorthand } from "../gis/overpass_client.js";
 import {
   generateEmptyCSVTemplate,
+  generateSampleStudy,
   inferColumnProfile,
   parseCSVText,
   parseGeoJSONDataset,
 } from "../state/recipe_store.js";
+import { escapeHtml } from "../utils/sanitize.js";
+
+function renderFeatureListHtml(t, previewInfo, filterQuery) {
+  const exclSet = new Set(t.excluded_osm_ids || []);
+  const featList = previewInfo?.feature_index || [];
+  const q = (filterQuery || "").trim().toLowerCase();
+  const matched = q
+    ? featList.filter(
+        (f) => String(f.name || "").toLowerCase().includes(q) || String(f.uid || "").toLowerCase().includes(q)
+      )
+    : featList;
+  const shown = matched.slice(0, 350);
+
+  if (!shown.length) {
+    return `<div class="card-subtitle" style="padding:6px;">Nincs a szűrőnek megfelelő elem (${featList.length} elemből).</div>`;
+  }
+
+  return (
+    shown
+      .map((f) => {
+        const isExcl = exclSet.has(f.uid);
+        return `<div class="osm-feature-item ${isExcl ? "excluded" : ""}" data-uid="${escapeHtml(f.uid)}">
+          <span>${isExcl ? "☐" : "☑"} <strong>${escapeHtml(f.name)}</strong> <span class="mono card-subtitle">(${escapeHtml(f.uid)}, ${escapeHtml(f.geom_type)})</span></span>
+          <span class="card-subtitle osm-item-state">${isExcl ? "kizárva" : "aktív"}</span>
+        </div>`;
+      })
+      .join("") +
+    (matched.length > 350
+      ? `<div class="card-subtitle" style="padding:4px;">… és további ${matched.length - 350} találat (szűkítsd a keresést vagy kattints a térképen).</div>`
+      : "")
+  );
+}
 
 export function renderStage1(container, ctx) {
   const { state, actions } = ctx;
@@ -21,19 +50,21 @@ export function renderStage1(container, ctx) {
   const numCols = headers.filter((h) => profile[h]?.isNumeric);
   const allOpts = (sel) =>
     `<option value="">— válassz —</option>` +
-    headers.map((h) => `<option value="${h}" ${h === sel ? "selected" : ""}>${h}</option>`).join("");
+    headers.map((h) => `<option value="${escapeHtml(h)}" ${h === sel ? "selected" : ""}>${escapeHtml(h)}</option>`).join("");
 
   const targets = state.recipe.spatial_targets || [];
+  const hasSnapshotTargets = targets.some((t) => state.rawOsmTargets[t.id] || state.rawGeojsonTargets[t.id]);
 
   container.innerHTML = `
     <div class="card">
       <div class="card-header">
         <div>
           <h3 class="card-title">1A. Saját Adatbázis Betöltése (CSV / GeoJSON)</h3>
-          <div class="card-subtitle">100%-ban kliensoldali: a nyers adatok soha nem hagyják el a böngésződet.</div>
+          <div class="card-subtitle">100%-ban kliensoldali: a nyers adatok soha nem hagyják el a böngésződet (UTF-8 &amp; Windows-1250 támogatással).</div>
         </div>
-        <div style="display:flex;gap:6px;">
-          <button class="btn btn-sm" id="btnDlCsvTemplate">📄 Üres CSV Sablon</button>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button class="btn btn-sm" id="btnLoadSampleStudy" title="Szintetikus városi minta-adatbázis, GeoJSON célpontok és utcahálózat azonnali kipróbáláshoz">🎯 Minta Sandbox</button>
+          <button class="btn btn-sm" id="btnDlCsvTemplate">📄 CSV Sablon</button>
           <button class="btn btn-sm" id="btnImportRecipeS1">📥 Recept (.json)</button>
           <input type="file" id="fileRecipeS1" accept=".json" style="display:none" />
         </div>
@@ -41,16 +72,23 @@ export function renderStage1(container, ctx) {
 
       <div class="dropzone" id="csvDropzone">
         <div style="font-weight:600;margin-bottom:4px;">📂 Húzd ide vagy válaszd ki a CSV / GeoJSON adatfájlt</div>
-        <div class="card-subtitle">Támogatott elválasztók: <code>,</code> <code>;</code> <code>Tab</code> | magyar/nemzetközi tizedesformátum | hiányzó koordináták megőrzése Heckman-szelekcióhoz</div>
+        <div class="card-subtitle">Támogatott elválasztók: <code>,</code> <code>;</code> <code>Tab</code> | idézett többsoros mezők | magyar/nemzetközi számformátum | hiányzó koordináták megőrzése Heckman-szelekcióhoz</div>
         <input type="file" id="csvFileInput" accept=".csv,.tsv,.txt,.geojson,.json" style="display:none" />
       </div>
 
       ${
         headers.length > 0
           ? `<div class="alert-box info" style="margin-top:10px;margin-bottom:0;">
-               Betöltve: <strong>${state.fileName}</strong> — <span class="mono">${state.nRows} sor</span>, <span class="mono">${headers.length} oszlop</span>
-               ${state.datasetInfo ? ` | Geokódolt: <strong class="mono">${state.datasetInfo.n_geocoded}</strong> | Nem geokódolt (Heckman pool): <strong class="mono">${state.datasetInfo.n_non_geocoded}</strong> | Vetület: <span class="mono">${state.datasetInfo.projection.nearest_utm_epsg} (${state.datasetInfo.projection.mode})</span>` : ""}
+               Betöltve: <strong>${escapeHtml(state.fileName)}</strong> — <span class="mono">${state.nRows} sor</span>, <span class="mono">${headers.length} oszlop</span>
+               ${state.datasetInfo ? ` | Geokódolt: <strong class="mono">${state.datasetInfo.n_geocoded}</strong> | Nem geokódolt (Heckman pool): <strong class="mono">${state.datasetInfo.n_non_geocoded}</strong> | Vetület: <span class="mono">${escapeHtml(state.datasetInfo.projection.nearest_utm_epsg)} (${escapeHtml(state.datasetInfo.projection.mode)})</span>` : ""}
              </div>`
+          : ""
+      }
+      ${
+        (state.datasetInfo?.warnings || []).length > 0
+          ? state.datasetInfo.warnings
+              .map((w) => `<div class="alert-box" style="margin-top:8px;margin-bottom:0;">⚠️ ${escapeHtml(w)}</div>`)
+              .join("")
           : ""
       }
     </div>
@@ -61,7 +99,7 @@ export function renderStage1(container, ctx) {
       <div class="card">
         <div class="card-header">
           <div>
-            <h3 class="card-title">1B. Oszlopszerepek & Függő Változó (y)</h3>
+            <h3 class="card-title">1B. Oszlopszerepek &amp; Függő Változó (y)</h3>
             <div class="card-subtitle">Koordináták, célváltozó-transzformáció és opcionális klaszter / szelekciós / proxy szerepkörök</div>
           </div>
           <button class="btn btn-primary btn-sm" id="btnApplySchema">✓ Séma Rögzítése</button>
@@ -116,7 +154,7 @@ export function renderStage1(container, ctx) {
           </div>
           <div class="field-row">
             <label>Koordináta-klaszter sugár (m)</label>
-            <input type="number" id="mapClusterRadius" value="${ds.cluster_spec.radius_m || 15}" min="1" max="500" />
+            <input type="number" id="mapClusterRadius" value="${escapeHtml(ds.cluster_spec.radius_m || 15)}" min="1" max="500" />
           </div>
         </div>
 
@@ -124,13 +162,13 @@ export function renderStage1(container, ctx) {
           <div class="field-row">
             <label>Térbeli Proxy / CBD oszlopok (Guard #1, több is jelölhető)</label>
             <select id="mapProxyCols" multiple size="2" style="height:46px;">
-              ${numCols.map((h) => `<option value="${h}" ${(ds.spatial_proxy_cols || []).includes(h) ? "selected" : ""}>${h}</option>`).join("")}
+              ${numCols.map((h) => `<option value="${escapeHtml(h)}" ${(ds.spatial_proxy_cols || []).includes(h) ? "selected" : ""}>${escapeHtml(h)}</option>`).join("")}
             </select>
           </div>
           <div class="field-row">
             <label>Heckman kizárási restrikció Z<sub>excl</sub> (Guard #4, opcionális)</label>
             <select id="mapHeckExcl" multiple size="2" style="height:46px;">
-              ${numCols.map((h) => `<option value="${h}" ${(ds.selection_spec.exclusion_restriction_cols || []).includes(h) ? "selected" : ""}>${h}</option>`).join("")}
+              ${numCols.map((h) => `<option value="${escapeHtml(h)}" ${(ds.selection_spec.exclusion_restriction_cols || []).includes(h) ? "selected" : ""}>${escapeHtml(h)}</option>`).join("")}
             </select>
           </div>
         </div>
@@ -140,17 +178,21 @@ export function renderStage1(container, ctx) {
         <div class="card-header">
           <div>
             <h3 class="card-title">1C. Parametrikus Térbeli Célpontok (Bármilyen OSM Entitás / GeoJSON)</h3>
-            <div class="card-subtitle">Adj hozzá célpontokat, kérd le az OSM objektumokat, majd kapcsold ki/be az elemeket a térképen mérés előtt</div>
+            <div class="card-subtitle">Adj hozzá célpontokat, kérd le az OSM objektumokat (vagy tölts be offline <code>.osm_bundle.json</code> csomagot)</div>
           </div>
-          <div style="display:flex;gap:6px;">
-            <button class="btn btn-sm" id="btnFetchOSM" ${targets.some((t) => t.source !== "csv_column") ? "" : "disabled"}>🌐 OSM / Rétegek Lekérése</button>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn btn-sm" id="btnFetchOSM" ${targets.some((t) => t.source === "osm_preset" || t.source === "osm_custom_tag") ? "" : "disabled"}>🌐 OSM Lekérése</button>
+            <button class="btn btn-sm" id="btnImportOsmBundle" title="Korábban mentett offline .osm_bundle.json betöltése">📦 Bundle Betöltés</button>
+            <input type="file" id="fileOsmBundle" accept=".json" style="display:none" />
+            <button class="btn btn-sm" id="btnExportOsmBundle" ${hasSnapshotTargets || Object.keys(state.rawStreetGraphs).length ? "" : "disabled"} title="OSM / GeoJSON rétegek és utcahálózat mentése offline reprodukálhatósághoz">💾 .osm_bundle</button>
+            <button class="btn btn-sm" id="btnClearOsmCache" title="IndexedDB OSM cache ürítése">🗑 Cache</button>
             <button class="btn btn-primary btn-sm" id="btnComputeDistances" ${targets.length ? "" : "disabled"}>📐 Távolságok Számítása</button>
           </div>
         </div>
 
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;align-items:center;">
           <select id="selOsmPreset" style="min-width:210px;">
-            ${OSM_TARGET_PRESETS.map((p) => `<option value="${p.preset_id}">${p.label}</option>`).join("")}
+            ${OSM_TARGET_PRESETS.map((p) => `<option value="${escapeHtml(p.preset_id)}">${escapeHtml(p.label)}</option>`).join("")}
           </select>
           <button class="btn btn-sm" id="btnAddOsmPreset">+ Sablon Célpont</button>
           <input type="text" id="txtCustomOsmTag" placeholder="Egyedi OSM tag (pl. amenity=school;leisure=park)" style="flex:1;min-width:210px;" />
@@ -163,8 +205,8 @@ export function renderStage1(container, ctx) {
         <div id="targetListArea">
           ${
             targets.length === 0
-              ? `<div class="card-subtitle">Még nincs felvett térbeli célpont. Válassz fentről egy OSM sablont vagy adj meg tetszőleges <code>key=value</code> címkét!</div>`
-              : targets.map((t, idx) => renderTargetRow(t, idx, numCols, state.targetPreviews[t.id])).join("")
+              ? `<div class="card-subtitle">Még nincs felvett térbeli célpont. Válassz fentről egy OSM sablont, vagy adj meg tetszőleges <code>key=value</code> címkét!</div>`
+              : targets.map((t, idx) => renderTargetRow(t, idx, numCols, state.targetPreviews[t.id], state.osmFilterQuery?.[t.id] || "")).join("")
           }
         </div>
       </div>
@@ -173,10 +215,10 @@ export function renderStage1(container, ctx) {
         state.stage1Res
           ? `<div class="card">
                <div class="card-header">
-                 <h3 class="card-title">1D. Térbeli Távolság & Hálózati Kanyargósság Összesítő</h3>
+                 <h3 class="card-title">1D. Térbeli Távolság &amp; Hálózati Kanyargósság Összesítő</h3>
                  <span class="card-subtitle">A becslések készen állnak a 2–5. fázisokhoz</span>
                </div>
-               ${(state.stage1Res.warnings || []).map((w) => `<div class="alert-box">⚠️ ${w}</div>`).join("")}
+               ${(state.stage1Res.warnings || []).map((w) => `<div class="alert-box">⚠️ ${escapeHtml(w)}</div>`).join("")}
                <div class="table-wrap">
                  <table class="academic">
                    <thead><tr>
@@ -188,9 +230,9 @@ export function renderStage1(container, ctx) {
                      ${state.stage1Res.summary
                        .map(
                          (r) => `<tr>
-                           <td><strong>${r.name}</strong> <span class="card-subtitle mono">(${r.target_id})</span></td>
-                           <td class="num">${r.n_active_features}</td>
-                           <td class="num">${r.n_excluded_features}</td>
+                           <td><strong>${escapeHtml(r.name)}</strong> <span class="card-subtitle mono">(${escapeHtml(r.target_id)})</span></td>
+                           <td class="num">${escapeHtml(r.n_active_features)}</td>
+                           <td class="num">${escapeHtml(r.n_excluded_features)}</td>
                            <td class="num">${r.median_eucl_m ?? "—"}</td>
                            <td class="num">${r.median_net_m ?? "—"}</td>
                            <td class="num">${r.median_detour_m ?? "—"}</td>
@@ -209,7 +251,7 @@ export function renderStage1(container, ctx) {
     }
   `;
 
-  // Bind File / Template / Recipe events
+  // Bind File / Sandbox / Template / Recipe events
   const dropzone = container.querySelector("#csvDropzone");
   const fileInput = container.querySelector("#csvFileInput");
   dropzone.addEventListener("click", () => fileInput.click());
@@ -224,19 +266,32 @@ export function renderStage1(container, ctx) {
     if (e.dataTransfer.files[0]) handleDataFile(e.dataTransfer.files[0], actions);
   });
   fileInput.addEventListener("change", (e) => {
-    if (e.target.files[0]) handleDataFile(e.target.files[0], actions);
+    const f = e.target.files[0];
+    e.target.value = "";
+    if (f) handleDataFile(f, actions);
+  });
+
+  container.querySelector("#btnLoadSampleStudy").addEventListener("click", async () => {
+    const sample = generateSampleStudy();
+    await actions.loadSampleStudy(sample);
   });
 
   container.querySelector("#btnDlCsvTemplate").addEventListener("click", () => {
-    actions.downloadText("geospec_empty_template.csv", generateEmptyCSVTemplate(), "text/csv");
+    actions.downloadText("geospec_template.csv", generateEmptyCSVTemplate(), "text/csv");
   });
   container.querySelector("#btnImportRecipeS1").addEventListener("click", () => {
     container.querySelector("#fileRecipeS1").click();
   });
   container.querySelector("#fileRecipeS1").addEventListener("change", async (e) => {
     const f = e.target.files[0];
+    e.target.value = "";
     if (!f) return;
-    actions.importRecipe(JSON.parse(await f.text()));
+    try {
+      const text = await readTextWithEncodingFallback(f);
+      actions.importRecipe(JSON.parse(text));
+    } catch (err) {
+      alert(`Recept betöltési hiba: ${err.message}`);
+    }
   });
 
   if (!headers.length) return;
@@ -314,23 +369,28 @@ export function renderStage1(container, ctx) {
   });
   container.querySelector("#fileGeojsonTarget").addEventListener("change", async (e) => {
     const f = e.target.files[0];
+    e.target.value = "";
     if (!f) return;
-    const gj = JSON.parse(await f.text());
-    const tid = makeUniqueTargetId(f.name.replace(/\.[^.]+$/, "").replace(/[^a-z0-9_]/gi, "_").toLowerCase(), targets);
-    targets.push({
-      id: tid,
-      name: `GeoJSON: ${f.name}`,
-      source: "geojson",
-      excluded_osm_ids: [],
-      geometry_handling: "polygon_boundary",
-      inside_is_zero: true,
-      distance_modes: "euclidean",
-      routing_profile: "walk",
-      max_snap_distance_m: 300,
-    });
-    state.rawGeojsonTargets[tid] = gj;
-    await actions.ingestSingleGeojsonTarget(tid, gj);
-    actions.render();
+    try {
+      const gj = JSON.parse(await readTextWithEncodingFallback(f));
+      const tid = makeUniqueTargetId(f.name.replace(/\.[^.]+$/, "").replace(/[^a-z0-9_]/gi, "_").toLowerCase(), targets);
+      targets.push({
+        id: tid,
+        name: `GeoJSON: ${f.name}`,
+        source: "geojson",
+        excluded_osm_ids: [],
+        geometry_handling: "polygon_boundary",
+        inside_is_zero: true,
+        distance_modes: "euclidean",
+        routing_profile: "walk",
+        max_snap_distance_m: 300,
+      });
+      state.rawGeojsonTargets[tid] = gj;
+      await actions.ingestSingleGeojsonTarget(tid, gj);
+      actions.render();
+    } catch (err) {
+      alert(`GeoJSON célpont hiba: ${err.message}`);
+    }
   });
 
   container.querySelector("#btnAddCsvDistTarget").addEventListener("click", () => {
@@ -348,14 +408,42 @@ export function renderStage1(container, ctx) {
     actions.render();
   });
 
-  // Bind per-target edits & feature exclusions
+  // Bundle export / import & Cache clear
+  container.querySelector("#btnExportOsmBundle")?.addEventListener("click", () => actions.exportOsmBundle());
+  container.querySelector("#btnImportOsmBundle")?.addEventListener("click", () => {
+    container.querySelector("#fileOsmBundle").click();
+  });
+  container.querySelector("#fileOsmBundle")?.addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    try {
+      const parsed = parseOsmBundle(JSON.parse(await readTextWithEncodingFallback(f)));
+      await actions.importOsmBundle(parsed);
+    } catch (err) {
+      alert(`OSM bundle betöltési hiba: ${err.message}`);
+    }
+  });
+  container.querySelector("#btnClearOsmCache")?.addEventListener("click", async () => {
+    await clearAllCachedOSM();
+    actions.setLog("IndexedDB OSM cache kiürítve.");
+  });
+
+  // Bind per-target edits & non-scrolling feature search/toggle
   container.querySelectorAll("[data-target-idx]").forEach((row) => {
     const idx = Number(row.getAttribute("data-target-idx"));
     const tgt = targets[idx];
     if (!tgt) return;
 
     row.querySelector(".tgt-geom")?.addEventListener("change", (e) => {
-      tgt.geometry_handling = e.target.value;
+      const prevGeom = tgt.geometry_handling;
+      const nextGeom = e.target.value;
+      tgt.geometry_handling = nextGeom;
+      const isOsm = tgt.source === "osm_preset" || tgt.source === "osm_custom_tag";
+      if (isOsm && state.rawOsmTargets[tgt.id] && (prevGeom === "point" || nextGeom === "point") && prevGeom !== nextGeom) {
+        actions.invalidateTargetSnapshot(tgt.id);
+        actions.setLog(`Geometria mód váltás (${tgt.id}: ${prevGeom} → ${nextGeom}): OSM lekérés frissítésre jelölve.`);
+      }
     });
     row.querySelector(".tgt-mode")?.addEventListener("change", (e) => {
       tgt.distance_modes = e.target.value;
@@ -373,14 +461,49 @@ export function renderStage1(container, ctx) {
     row.querySelector(".tgt-remove")?.addEventListener("click", () => {
       targets.splice(idx, 1);
       delete state.targetPreviews[tgt.id];
+      delete state.rawOsmTargets[tgt.id];
+      delete state.rawGeojsonTargets[tgt.id];
       actions.refreshMapTargets();
       actions.render();
     });
-    row.querySelectorAll(".osm-feature-item").forEach((el) => {
-      el.addEventListener("click", () => {
-        const uid = el.getAttribute("data-uid");
-        actions.toggleOsmFeature(tgt.id, uid);
+
+    const listBox = row.querySelector(".osm-feature-list");
+    const bindListClicks = () => {
+      if (!listBox) return;
+      listBox.querySelectorAll(".osm-feature-item").forEach((el) => {
+        el.addEventListener("click", () => {
+          const uid = el.getAttribute("data-uid");
+          actions.toggleOsmFeature(tgt.id, uid);
+        });
       });
+    };
+    bindListClicks();
+
+    row.querySelector(".osm-filter-input")?.addEventListener("input", (e) => {
+      state.osmFilterQuery = state.osmFilterQuery || {};
+      state.osmFilterQuery[tgt.id] = e.target.value;
+      if (listBox) {
+        listBox.innerHTML = renderFeatureListHtml(tgt, state.targetPreviews[tgt.id], e.target.value);
+        bindListClicks();
+      }
+    });
+
+    row.querySelector(".btn-osm-exclude-vis")?.addEventListener("click", () => {
+      const q = (state.osmFilterQuery?.[tgt.id] || "").trim().toLowerCase();
+      const featList = state.targetPreviews[tgt.id]?.feature_index || [];
+      const vis = q
+        ? featList.filter((f) => String(f.name || "").toLowerCase().includes(q) || String(f.uid || "").toLowerCase().includes(q))
+        : featList;
+      actions.setTargetExclusions(tgt.id, vis.map((f) => f.uid), true);
+    });
+
+    row.querySelector(".btn-osm-include-vis")?.addEventListener("click", () => {
+      const q = (state.osmFilterQuery?.[tgt.id] || "").trim().toLowerCase();
+      const featList = state.targetPreviews[tgt.id]?.feature_index || [];
+      const vis = q
+        ? featList.filter((f) => String(f.name || "").toLowerCase().includes(q) || String(f.uid || "").toLowerCase().includes(q))
+        : featList;
+      actions.setTargetExclusions(tgt.id, vis.map((f) => f.uid), false);
     });
   });
 
@@ -398,22 +521,22 @@ function makeUniqueTargetId(base, targets) {
   return `${clean}_${k}`;
 }
 
-function renderTargetRow(t, idx, numCols, previewInfo) {
+function renderTargetRow(t, idx, numCols, previewInfo, filterQuery) {
   const exclSet = new Set(t.excluded_osm_ids || []);
   const featList = previewInfo?.feature_index || [];
   return `
-    <div style="border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:8px;background:var(--surface-alt);" data-target-idx="${idx}">
+    <div style="border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:8px;background:var(--surface-alt);" data-target-idx="${idx}" data-target-id="${escapeHtml(t.id)}">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
         <div>
-          <strong>${t.name}</strong> <span class="mono card-subtitle">[${t.id}]</span>
-          ${previewInfo ? `<span class="status-pill" style="margin-left:6px;">${featList.length - exclSet.size}/${featList.length} aktív elem</span>` : ""}
+          <strong>${escapeHtml(t.name)}</strong> <span class="mono card-subtitle">[${escapeHtml(t.id)}]</span>
+          ${previewInfo ? `<span class="status-pill tgt-active-badge" style="margin-left:6px;">${featList.length - exclSet.size}/${featList.length} aktív elem</span>` : ""}
         </div>
         <button class="btn btn-sm tgt-remove" style="color:var(--fail);">✕ Eltávolítás</button>
       </div>
       ${
         t.source === "csv_column"
           ? `<div class="field-row"><label>Meglévő távolságoszlop (méter)</label>
-             <select class="tgt-csv-col">${numCols.map((c) => `<option value="${c}" ${c === t.csv_col ? "selected" : ""}>${c}</option>`).join("")}</select></div>`
+             <select class="tgt-csv-col">${numCols.map((c) => `<option value="${escapeHtml(c)}" ${c === t.csv_col ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}</select></div>`
           : `<div class="grid-3">
                <div class="field-row">
                  <label>Geometria kezelése</label>
@@ -433,7 +556,7 @@ function renderTargetRow(t, idx, numCols, previewInfo) {
                  </select>
                </div>
                <div class="field-row">
-                 <label>Hálózati profil & Belső zóna</label>
+                 <label>Hálózati profil &amp; Belső zóna</label>
                  <div style="display:flex;gap:8px;align-items:center;">
                    <select class="tgt-profile" style="flex:1;">
                      <option value="walk" ${t.routing_profile === "walk" ? "selected" : ""}>Gyalogos</option>
@@ -450,19 +573,13 @@ function renderTargetRow(t, idx, numCols, previewInfo) {
       ${
         featList.length > 0
           ? `<div style="margin-top:8px;">
-               <div class="card-subtitle" style="margin-bottom:4px;">Lekérdezett OSM / GeoJSON elemek (kattints itt vagy a térképen az egyedi kizáráshoz mérés előtt):</div>
+               <div class="osm-search-bar">
+                 <input type="text" class="osm-filter-input" value="${escapeHtml(filterQuery)}" placeholder="🔍 Szűrés név / UID alapján (${featList.length} elem)..." style="flex:1;min-width:160px;" />
+                 <button class="btn btn-sm btn-osm-include-vis" type="button">☑ Láthatók aktívvá</button>
+                 <button class="btn btn-sm btn-osm-exclude-vis" type="button">☐ Láthatók kizárása</button>
+               </div>
                <div class="osm-feature-list">
-                 ${featList
-                   .slice(0, 120)
-                   .map((f) => {
-                     const isExcl = exclSet.has(f.uid);
-                     return `<div class="osm-feature-item ${isExcl ? "excluded" : ""}" data-uid="${f.uid}">
-                       <span>${isExcl ? "☐" : "☑"} <strong>${f.name}</strong> <span class="mono card-subtitle">(${f.uid}, ${f.geom_type})</span></span>
-                       <span class="card-subtitle">${isExcl ? "kizárva" : "aktív"}</span>
-                     </div>`;
-                   })
-                   .join("")}
-                 ${featList.length > 120 ? `<div class="card-subtitle" style="padding:4px;">… és további ${featList.length - 120} elem (kattinthatsz közvetlenül a térképen is).</div>` : ""}
+                 ${renderFeatureListHtml(t, previewInfo, filterQuery)}
                </div>
              </div>`
           : ""
@@ -471,14 +588,31 @@ function renderTargetRow(t, idx, numCols, previewInfo) {
   `;
 }
 
-async function handleDataFile(file, actions) {
-  const text = await file.text();
-  let parsed;
-  if (file.name.toLowerCase().endsWith(".geojson") || file.name.toLowerCase().endsWith(".json")) {
-    parsed = parseGeoJSONDataset(text);
-  } else {
-    parsed = parseCSVText(text);
+async function readTextWithEncodingFallback(file) {
+  const buf = await file.arrayBuffer();
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    try {
+      return new TextDecoder("windows-1250").decode(buf);
+    } catch {
+      return new TextDecoder("iso-8859-2").decode(buf);
+    }
   }
-  const { profile, guesses } = inferColumnProfile(parsed.headers, parsed.columns);
-  actions.onDatasetParsed(file.name, parsed, profile, guesses);
+}
+
+async function handleDataFile(file, actions) {
+  try {
+    const text = await readTextWithEncodingFallback(file);
+    let parsed;
+    if (file.name.toLowerCase().endsWith(".geojson") || file.name.toLowerCase().endsWith(".json")) {
+      parsed = parseGeoJSONDataset(text);
+    } else {
+      parsed = parseCSVText(text);
+    }
+    const { profile, guesses } = inferColumnProfile(parsed.headers, parsed.columns);
+    await actions.onDatasetParsed(file.name, parsed, profile, guesses);
+  } catch (err) {
+    alert(`Fájl betöltési hiba: ${err.message}`);
+  }
 }

@@ -88,7 +88,7 @@ def _rpc_dispatch(method, payload_json):
         )
     elif method == "export_bundle":
         import base64
-        out = _SESSION.export_publication_bundle(payload["recipe"])
+        out = _SESSION.export_publication_bundle(payload["recipe"], payload.get("osm_bundle"))
         zb = out.pop("zip_bytes", b"")
         out["zip_base64"] = base64.b64encode(zb).decode("ascii")
         res = out

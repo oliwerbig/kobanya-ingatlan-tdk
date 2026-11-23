@@ -30,6 +30,39 @@ SNAP_TARGET_EMPTY = 3
 SNAP_FETCH_FAILED = 4
 
 
+def _dedup_min_edges(
+    rows: Any,
+    cols: Any,
+    weights: Any,
+    n_cols: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Deduplicate (row, col) edges by keeping the MINIMUM weight instead of summing."""
+    r = np.asarray(rows, dtype=np.int64)
+    c = np.asarray(cols, dtype=np.int64)
+    w = np.asarray(weights, dtype=np.float64)
+    if len(r) == 0:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64)
+    keys = r * int(n_cols) + c
+    order = np.lexsort((w, keys))
+    keys_s = keys[order]
+    keep = np.empty(len(keys_s), dtype=bool)
+    keep[0] = True
+    keep[1:] = keys_s[1:] != keys_s[:-1]
+    sel = order[keep]
+    return r[sel].astype(np.int32), c[sel].astype(np.int32), w[sel]
+
+
+def _dedup_min_csr(
+    rows: Any,
+    cols: Any,
+    weights: Any,
+    shape: Tuple[int, int],
+) -> csr_matrix:
+    """Build CSR matrix while taking minimum weight on duplicate (row, col) edges."""
+    r, c, w = _dedup_min_edges(rows, cols, weights, shape[1])
+    return csr_matrix((w, (r, c)), shape=shape, dtype=np.float64)
+
+
 def _shoelace_area_and_centroid(ring: np.ndarray) -> Tuple[float, float, float]:
     """Compute signed area, cx, cy of a closed 2D ring via Green's theorem."""
     if len(ring) < 3:
@@ -40,11 +73,77 @@ def _shoelace_area_and_centroid(ring: np.ndarray) -> Tuple[float, float, float]:
     y_next = np.roll(y, -1)
     cross = x * y_next - x_next * y
     signed_area = 0.5 * float(np.sum(cross))
-    if abs(signed_area) < 1e-9:
+    if abs(signed_area) < 1e-15:
         return 0.0, float(np.mean(x)), float(np.mean(y))
     cx = float(np.sum((x + x_next) * cross)) / (6.0 * signed_area)
     cy = float(np.sum((y + y_next) * cross)) / (6.0 * signed_area)
     return abs(signed_area), cx, cy
+
+
+def _is_osm_area_way(pts: List[Tuple[float, float]], tags: Dict[str, Any]) -> bool:
+    """Determine whether a closed OSM way represents an area/polygon vs linear loop."""
+    is_closed = len(pts) >= 4 and abs(pts[0][0] - pts[-1][0]) < 1e-6 and abs(pts[0][1] - pts[-1][1]) < 1e-6
+    if not is_closed:
+        return False
+    area_tag = str(tags.get("area", "")).lower()
+    if area_tag == "no":
+        return False
+    if area_tag == "yes":
+        return True
+    if str(tags.get("junction", "")).lower() == "roundabout":
+        return False
+    if tags.get("railway") in ("rail", "light_rail", "subway", "tram", "narrow_gauge", "monorail"):
+        return False
+    if tags.get("highway") in (
+        "motorway", "trunk", "primary", "secondary", "tertiary",
+        "unclassified", "residential", "living_street", "service",
+        "pedestrian", "footway", "cycleway", "path", "track",
+    ):
+        return False
+    if tags.get("waterway") in ("river", "canal", "stream", "drain", "ditch") and not tags.get("natural"):
+        return False
+    if tags.get("barrier"):
+        return False
+    return True
+
+
+def _build_polygon_parts(
+    outer_rings: List[List[Tuple[float, float]]],
+    inner_rings: List[List[Tuple[float, float]]],
+) -> List[Dict[str, Any]]:
+    """Assign each inner hole ring to its smallest enclosing outer ring (handles island-in-hole)."""
+    if not outer_rings:
+        return []
+    if len(outer_rings) == 1 or not inner_rings:
+        return [{"outer": outer_rings[0], "inners": list(inner_rings)}] + [
+            {"outer": r, "inners": []} for r in outer_rings[1:]
+        ]
+
+    outer_arrs = [np.asarray(r, dtype=np.float64) for r in outer_rings]
+    outer_areas = [_shoelace_area_and_centroid(arr)[0] for arr in outer_arrs]
+    order_by_area = sorted(range(len(outer_rings)), key=lambda i: outer_areas[i])
+    parts: List[Dict[str, Any]] = [{"outer": r, "inners": []} for r in outer_rings]
+
+    for ir in inner_rings:
+        ir_arr = np.asarray(ir, dtype=np.float64)
+        ir_area, cx, cy = _shoelace_area_and_centroid(ir_arr)
+        # Test centroid + edge midpoints so concave rings & shared vertices match accurately
+        sample_pts = [[cx, cy]]
+        if len(ir_arr) >= 2:
+            sample_pts.append(((ir_arr[0] + ir_arr[1]) * 0.5).tolist())
+            mid_i = len(ir_arr) // 2
+            sample_pts.append(((ir_arr[mid_i] + ir_arr[(mid_i + 1) % len(ir_arr)]) * 0.5).tolist())
+        samples_np = np.asarray(sample_pts, dtype=np.float64)
+
+        assigned = 0
+        for oi in order_by_area:
+            if outer_areas[oi] <= ir_area + 1e-15:
+                continue
+            if np.any(_points_in_ring(samples_np, outer_arrs[oi])):
+                assigned = oi
+                break
+        parts[assigned]["inners"].append(ir)
+    return parts
 
 
 def _stitch_way_segments(way_coords_list: List[List[Tuple[float, float]]]) -> List[List[Tuple[float, float]]]:
@@ -126,16 +225,12 @@ def parse_osm_elements(osm_json: Dict[str, Any]) -> List[Dict[str, Any]]:
                 pts = [(float(p["lon"]), float(p["lat"])) for p in geom if "lat" in p and "lon" in p]
                 if len(pts) < 2:
                     continue
-                is_closed = len(pts) >= 4 and abs(pts[0][0] - pts[-1][0]) < 1e-6 and abs(pts[0][1] - pts[-1][1]) < 1e-6
-                # Treat area/building/park/water closed ways as polygons unless explicitly highway/railway linear
-                is_area = is_closed and not (
-                    tags.get("railway") in ("rail", "light_rail", "subway", "tram")
-                    or tags.get("highway") in ("motorway", "trunk", "primary", "secondary", "tertiary", "residential")
-                )
+                is_area = _is_osm_area_way(pts, tags)
                 c_lon = float(np.mean([p[0] for p in pts]))
                 c_lat = float(np.mean([p[1] for p in pts]))
                 if center and "lat" in center and "lon" in center:
                     c_lon, c_lat = float(center["lon"]), float(center["lat"])
+                parts = [{"outer": pts, "inners": []}] if is_area else []
                 features.append({
                     "uid": uid,
                     "name": name,
@@ -143,6 +238,7 @@ def parse_osm_elements(osm_json: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "geom_type": "polygon" if is_area else "line",
                     "rings": [pts],
                     "inner_rings": [],
+                    "parts": parts,
                     "center": (c_lon, c_lat),
                 })
             elif center and "lat" in center and "lon" in center:
@@ -183,9 +279,9 @@ def parse_osm_elements(osm_json: Dict[str, Any]) -> List[Dict[str, Any]]:
                 if center and "lat" in center and "lon" in center:
                     c_lon, c_lat = float(center["lon"]), float(center["lat"])
                 is_poly = tags.get("type") in ("multipolygon", "boundary") or any(
-                    len(r) >= 4 and abs(r[0][0] - r[-1][0]) < 1e-6 and abs(r[0][1] - r[-1][1]) < 1e-6
-                    for r in outer_rings
+                    _is_osm_area_way(r, tags) for r in outer_rings
                 )
+                parts = _build_polygon_parts(outer_rings, inner_rings) if is_poly else []
                 features.append({
                     "uid": uid,
                     "name": name,
@@ -193,6 +289,7 @@ def parse_osm_elements(osm_json: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "geom_type": "polygon" if is_poly else "line",
                     "rings": outer_rings,
                     "inner_rings": inner_rings,
+                    "parts": parts,
                     "center": (c_lon, c_lat),
                 })
             elif point_pts:
@@ -276,26 +373,29 @@ def parse_geojson_features(geojson: Dict[str, Any], prefix: str = "geojson") -> 
                 })
         elif gtype == "Polygon":
             outer = [(float(c[0]), float(c[1])) for c in coords[0]]
-            inners = [[(float(c[0]), float(c[1])) for c in r] for r in coords[1:]]
+            inners = [[(float(c[0]), float(c[1])) for c in r] for r in coords[1:] if len(r) >= 3]
             if len(outer) >= 3:
                 features.append({
                     "uid": uid, "name": name, "tags": props, "geom_type": "polygon",
                     "rings": [outer], "inner_rings": inners,
+                    "parts": [{"outer": outer, "inners": inners}],
                     "center": (float(np.mean([p[0] for p in outer])), float(np.mean([p[1] for p in outer]))),
                 })
         elif gtype == "MultiPolygon":
-            outers, inners = [], []
+            outers, inners, parts = [], [], []
             for poly in coords:
                 if poly and len(poly[0]) >= 3:
-                    outers.append([(float(c[0]), float(c[1])) for c in poly[0]])
-                    for r in poly[1:]:
-                        if len(r) >= 3:
-                            inners.append([(float(c[0]), float(c[1])) for c in r])
+                    o_ring = [(float(c[0]), float(c[1])) for c in poly[0]]
+                    p_inners = [[(float(c[0]), float(c[1])) for c in r] for r in poly[1:] if len(r) >= 3]
+                    outers.append(o_ring)
+                    inners.extend(p_inners)
+                    parts.append({"outer": o_ring, "inners": p_inners})
             if outers:
                 all_p = [p for r in outers for p in r]
                 features.append({
                     "uid": uid, "name": name, "tags": props, "geom_type": "polygon",
                     "rings": outers, "inner_rings": inners,
+                    "parts": parts,
                     "center": (float(np.mean([p[0] for p in all_p])), float(np.mean([p[1] for p in all_p]))),
                 })
 
@@ -321,11 +421,31 @@ def features_to_preview_geojson(features: List[Dict[str, Any]], excluded_ids: Op
             else:
                 geom = {"type": "MultiLineString", "coordinates": [[list(p) for p in r] for r in rings]}
         else:
-            if len(rings) == 1:
-                coords = [[list(p) for p in rings[0]]] + [[list(p) for p in ir] for ir in inners]
+            def _closed_ring(ring_pts: List[Tuple[float, float]]) -> List[List[float]]:
+                coords = [list(p) for p in ring_pts]
+                if len(coords) >= 3 and (
+                    abs(coords[0][0] - coords[-1][0]) > 1e-9 or abs(coords[0][1] - coords[-1][1]) > 1e-9
+                ):
+                    coords.append(list(coords[0]))
+                return coords
+
+            parts = f.get("parts")
+            if parts and len(parts) > 1:
+                geom = {
+                    "type": "MultiPolygon",
+                    "coordinates": [
+                        [_closed_ring(part["outer"])] + [_closed_ring(ir) for ir in part.get("inners", [])]
+                        for part in parts
+                    ],
+                }
+            elif parts and len(parts) == 1:
+                coords = [_closed_ring(parts[0]["outer"])] + [_closed_ring(ir) for ir in parts[0].get("inners", [])]
+                geom = {"type": "Polygon", "coordinates": coords}
+            elif len(rings) == 1:
+                coords = [_closed_ring(rings[0])] + [_closed_ring(ir) for ir in inners]
                 geom = {"type": "Polygon", "coordinates": coords}
             else:
-                geom = {"type": "MultiPolygon", "coordinates": [[[list(p) for p in r]] for r in rings]}
+                geom = {"type": "MultiPolygon", "coordinates": [[_closed_ring(r)] for r in rings]}
 
         out_feats.append({
             "type": "Feature",
@@ -382,32 +502,34 @@ def _subdivide_segments(
     return np.vstack(a_parts), np.vstack(b_parts)
 
 
-def _point_to_segments_distance(
+def _point_to_segments_nearest(
     pts_xy: np.ndarray,
     seg_a: np.ndarray,
     seg_b: np.ndarray,
     max_len_m: float = 50.0,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Exact vectorized point-to-segment distance using midpoint cKDTree with
-    triangle-inequality ball guarantee (cannot miss long straight segments).
+    Exact vectorized point-to-segment distance and closest point using midpoint cKDTree
+    with triangle-inequality ball guarantee (cannot miss long straight segments).
     """
     n_pts = len(pts_xy)
     if len(seg_a) == 0:
-        return np.full(n_pts, np.nan, dtype=np.float64)
+        return np.full(n_pts, np.nan, dtype=np.float64), np.full((n_pts, 2), np.nan, dtype=np.float64)
 
     mids = 0.5 * (seg_a + seg_b)
     ab = seg_b - seg_a
     ab_len_sq = np.sum(ab * ab, axis=1)
     tree = cKDTree(mids)
-    r0, _ = tree.query(pts_xy, k=1)
+    r0, nn_mid = tree.query(pts_xy, k=1)
     radii = r0 + 0.5 * max_len_m + 1e-6
 
-    out = np.empty(n_pts, dtype=np.float64)
+    out_d = np.empty(n_pts, dtype=np.float64)
+    out_xy = np.empty((n_pts, 2), dtype=np.float64)
     cand_lists = tree.query_ball_point(pts_xy, radii)
     for i, cands in enumerate(cand_lists):
         if not cands:
-            out[i] = float(r0[i])
+            out_d[i] = float(r0[i])
+            out_xy[i] = mids[int(nn_mid[i])]
             continue
         idx = np.asarray(cands, dtype=np.int32)
         pa = pts_xy[i][None, :] - seg_a[idx]
@@ -415,14 +537,32 @@ def _point_to_segments_distance(
         t = np.clip(np.sum(pa * ab[idx], axis=1) / denom, 0.0, 1.0)
         proj = seg_a[idx] + t[:, None] * ab[idx]
         dists = np.hypot(pts_xy[i, 0] - proj[:, 0], pts_xy[i, 1] - proj[:, 1])
-        out[i] = float(np.min(dists))
-    return out
+        best = int(np.argmin(dists))
+        out_d[i] = float(dists[best])
+        out_xy[i] = proj[best]
+    return out_d, out_xy
 
 
-def _points_in_ring(pts_xy: np.ndarray, ring_xy: np.ndarray) -> np.ndarray:
-    """Vectorized even-odd ray-casting point-in-polygon check with bbox prefilter."""
+def _point_to_segments_distance(
+    pts_xy: np.ndarray,
+    seg_a: np.ndarray,
+    seg_b: np.ndarray,
+    max_len_m: float = 50.0,
+) -> np.ndarray:
+    """Exact vectorized point-to-segment distance."""
+    d, _ = _point_to_segments_nearest(pts_xy, seg_a, seg_b, max_len_m=max_len_m)
+    return d
+
+
+def _points_in_ring(
+    pts_xy: np.ndarray,
+    ring_xy: np.ndarray,
+    pt_chunk: int = 512,
+    edge_chunk: int = 2048,
+) -> np.ndarray:
+    """Chunked vectorized even-odd ray-casting point-in-polygon check with bbox prefilter."""
     n = len(pts_xy)
-    if len(ring_xy) < 3:
+    if len(ring_xy) < 3 or n == 0:
         return np.zeros(n, dtype=bool)
     min_x, min_y = np.min(ring_xy, axis=0)
     max_x, max_y = np.max(ring_xy, axis=0)
@@ -435,19 +575,65 @@ def _points_in_ring(pts_xy: np.ndarray, ring_xy: np.ndarray) -> np.ndarray:
     if not np.any(in_box):
         return np.zeros(n, dtype=bool)
 
-    px = pts_xy[in_box, 0][:, None]
-    py = pts_xy[in_box, 1][:, None]
-    x1 = ring_xy[:, 0][None, :]
-    y1 = ring_xy[:, 1][None, :]
-    x2 = np.roll(ring_xy[:, 0], -1)[None, :]
-    y2 = np.roll(ring_xy[:, 1], -1)[None, :]
+    box_idx = np.where(in_box)[0]
+    pts_in = pts_xy[box_idx]
+    m_pts = len(pts_in)
 
-    cond_y = (y1 > py) != (y2 > py)
-    x_intersect = (x2 - x1) * (py - y1) / np.where(np.abs(y2 - y1) > 1e-12, y2 - y1, 1e-12) + x1
-    crossings = np.sum(cond_y & (px < x_intersect), axis=1)
+    rx1 = ring_xy[:, 0]
+    ry1 = ring_xy[:, 1]
+    rx2 = np.roll(rx1, -1)
+    ry2 = np.roll(ry1, -1)
+    n_edges = len(rx1)
+
+    crossings_total = np.zeros(m_pts, dtype=np.int32)
+    for ps in range(0, m_pts, pt_chunk):
+        pe = min(m_pts, ps + pt_chunk)
+        px = pts_in[ps:pe, 0][:, None]
+        py = pts_in[ps:pe, 1][:, None]
+        c_sum = np.zeros(pe - ps, dtype=np.int32)
+        for es in range(0, n_edges, edge_chunk):
+            ee = min(n_edges, es + edge_chunk)
+            x1 = rx1[es:ee][None, :]
+            y1 = ry1[es:ee][None, :]
+            x2 = rx2[es:ee][None, :]
+            y2 = ry2[es:ee][None, :]
+            cond_y = (y1 > py) != (y2 > py)
+            dy = y2 - y1
+            x_intersect = (x2 - x1) * (py - y1) / np.where(np.abs(dy) > 1e-12, dy, 1e-12) + x1
+            c_sum += np.sum(cond_y & (px < x_intersect), axis=1, dtype=np.int32)
+        crossings_total[ps:pe] = c_sum
+
     res = np.zeros(n, dtype=bool)
-    res[in_box] = (crossings % 2) == 1
+    res[box_idx] = (crossings_total % 2) == 1
     return res
+
+
+def _inside_polygons_mask(pts_xy: np.ndarray, proj_feats: List[Dict[str, Any]]) -> np.ndarray:
+    """Check containment across polygon parts (supports MultiPolygon island-in-hole geometry)."""
+    n_pts = len(pts_xy)
+    inside = np.zeros(n_pts, dtype=bool)
+    if n_pts == 0:
+        return inside
+    for f in proj_feats:
+        if f["geom_type"] != "polygon":
+            continue
+        parts = f.get("parts_xy")
+        if parts:
+            for part in parts:
+                in_part = _points_in_ring(pts_xy, part["outer"])
+                if np.any(in_part):
+                    for ir in part.get("inners", []):
+                        in_part &= ~_points_in_ring(pts_xy, ir)
+                    inside |= in_part
+        else:
+            in_outer = np.zeros(n_pts, dtype=bool)
+            for r_xy in f["outer_xy"]:
+                in_outer |= _points_in_ring(pts_xy, r_xy)
+            in_inner = np.zeros(n_pts, dtype=bool)
+            for r_xy in f.get("inner_xy", []):
+                in_inner |= _points_in_ring(pts_xy, r_xy)
+            inside |= in_outer & ~in_inner
+    return inside
 
 
 def _project_feature_rings(
@@ -467,11 +653,22 @@ def _project_feature_rings(
             arr = np.asarray(r, dtype=np.float64)
             x, y = proj.forward(arr[:, 1], arr[:, 0])
             inner_xy.append(np.column_stack([x, y]))
+        parts_xy = []
+        for part in f.get("parts", []):
+            o_arr = np.asarray(part["outer"], dtype=np.float64)
+            ox, oy = proj.forward(o_arr[:, 1], o_arr[:, 0])
+            i_list = []
+            for ir in part.get("inners", []):
+                ir_arr = np.asarray(ir, dtype=np.float64)
+                ix, iy = proj.forward(ir_arr[:, 1], ir_arr[:, 0])
+                i_list.append(np.column_stack([ix, iy]))
+            parts_xy.append({"outer": np.column_stack([ox, oy]), "inners": i_list})
         cx, cy = proj.forward(f["center"][1], f["center"][0])
         projected.append({
             **f,
             "outer_xy": outer_xy,
             "inner_xy": inner_xy,
+            "parts_xy": parts_xy,
             "center_xy": (float(cx), float(cy)),
         })
     return projected
@@ -593,8 +790,8 @@ def build_street_graph(
             fwd_rows.append(vi); fwd_cols.append(ui); fwd_weights.append(w)
             rev_rows.append(ui); rev_cols.append(vi); rev_weights.append(w)
 
-    g_rev = csr_matrix((rev_weights, (rev_rows, rev_cols)), shape=(n_nodes, n_nodes), dtype=np.float64)
-    g_fwd = csr_matrix((fwd_weights, (fwd_rows, fwd_cols)), shape=(n_nodes, n_nodes), dtype=np.float64)
+    g_rev = _dedup_min_csr(rev_rows, rev_cols, rev_weights, shape=(n_nodes, n_nodes))
+    g_fwd = _dedup_min_csr(fwd_rows, fwd_cols, fwd_weights, shape=(n_nodes, n_nodes))
 
     # Subdivide long street edges to max 50 m for exact orthogonal edge snapping
     sub_a_list: List[np.ndarray] = []
@@ -799,6 +996,9 @@ def compute_target_distances(
 
     obs_valid_xy = obs_xy[valid_coord_mask]
     n_valid = len(obs_valid_xy)
+    inside_mask = np.zeros(n_valid, dtype=bool)
+    if n_valid > 0 and geom_mode == "polygon_boundary" and inside_is_zero:
+        inside_mask = _inside_polygons_mask(obs_valid_xy, proj_feats)
 
     # 1. Compute Euclidean Distance (always needed when dist_mode is 'euclidean' or 'both')
     if n_valid > 0:
@@ -864,16 +1064,6 @@ def compute_target_distances(
                 eucl_v = np.minimum(eucl_v, d_pt)
 
             if geom_mode == "polygon_boundary" and inside_is_zero:
-                inside_mask = np.zeros(n_valid, dtype=bool)
-                for f in proj_feats:
-                    if f["geom_type"] == "polygon":
-                        in_outer = np.zeros(n_valid, dtype=bool)
-                        for r_xy in f["outer_xy"]:
-                            in_outer |= _points_in_ring(obs_valid_xy, r_xy)
-                        in_inner = np.zeros(n_valid, dtype=bool)
-                        for r_xy in f.get("inner_xy", []):
-                            in_inner |= _points_in_ring(obs_valid_xy, r_xy)
-                        inside_mask |= in_outer & ~in_inner
                 eucl_v[inside_mask] = 0.0
 
         dist_eucl[valid_coord_mask] = eucl_v
@@ -881,7 +1071,13 @@ def compute_target_distances(
     # 2. Compute Network Dijkstra Distance via 1-pass virtual super-source S_0
     if dist_mode in ("network_dijkstra", "both") and n_valid > 0:
         if street_graph is None or street_graph.get("empty", True):
-            snap_status[valid_coord_mask] = SNAP_FETCH_FAILED
+            net_v = np.full(n_valid, np.nan, dtype=np.float64)
+            status_v = np.full(n_valid, SNAP_FETCH_FAILED, dtype=np.int32)
+            if np.any(inside_mask):
+                net_v[inside_mask] = 0.0
+                status_v[inside_mask] = SNAP_OK
+            dist_net[valid_coord_mask] = net_v
+            snap_status[valid_coord_mask] = status_v
             warnings.append(f"Target '{target_cfg.get('id')}': street routing graph unavailable.")
         else:
             t_access_xy = _collect_target_access_points(proj_feats, geom_mode, densify_step_m=50.0)
@@ -890,7 +1086,13 @@ def compute_target_distances(
 
             tgt_valid = tgt_snap["edge_idx"] >= 0
             if not np.any(tgt_valid):
-                snap_status[valid_coord_mask] = SNAP_EXCEEDED
+                net_v = np.full(n_valid, np.nan, dtype=np.float64)
+                status_v = np.full(n_valid, SNAP_EXCEEDED, dtype=np.int32)
+                if np.any(inside_mask):
+                    net_v[inside_mask] = 0.0
+                    status_v[inside_mask] = SNAP_OK
+                dist_net[valid_coord_mask] = net_v
+                snap_status[valid_coord_mask] = status_v
                 warnings.append(
                     f"Target '{target_cfg.get('id')}': no target features snapped within {max_snap_m:.0f} m of street graph."
                 )
@@ -904,9 +1106,9 @@ def compute_target_distances(
                 edge_len = street_graph["edge_len"]
 
                 # Construct augmented CSR graph with 1 virtual super-source S_0
-                aug_rows = []
-                aug_cols = []
-                aug_data = []
+                aug_rows: List[int] = []
+                aug_cols: List[int] = []
+                aug_data: List[float] = []
                 # Track target snaps per edge for direct same-edge travel
                 same_edge_targets: Dict[int, List[Tuple[float, float]]] = {}
 
@@ -930,10 +1132,12 @@ def compute_target_distances(
                         # v -> target -> u: reachable from v with (1-s)*L
                         aug_rows.append(s0); aug_cols.append(v_i); aug_data.append(float(d_s + (1.0 - s_val) * L))
 
+                # Deduplicate virtual super-source edges by MIN weight (never sum!)
+                ded_r, ded_c, ded_w = _dedup_min_edges(aug_rows, aug_cols, aug_data, n_nodes + 1)
                 coo = g_rev.tocoo()
-                all_rows = np.concatenate([coo.row, np.asarray(aug_rows, dtype=np.int32)])
-                all_cols = np.concatenate([coo.col, np.asarray(aug_cols, dtype=np.int32)])
-                all_data = np.concatenate([coo.data, np.asarray(aug_data, dtype=np.float64)])
+                all_rows = np.concatenate([coo.row, ded_r])
+                all_cols = np.concatenate([coo.col, ded_c])
+                all_data = np.concatenate([coo.data, ded_w])
                 aug_g = csr_matrix((all_data, (all_rows, all_cols)), shape=(n_nodes + 1, n_nodes + 1))
 
                 d_from_s0 = dijkstra(aug_g, directed=(street_graph["routing_profile"] != "walk"), indices=s0)
@@ -942,6 +1146,10 @@ def compute_target_distances(
                 status_v = np.full(n_valid, SNAP_OK, dtype=np.int32)
 
                 for idx_i in range(n_valid):
+                    if inside_mask[idx_i]:
+                        net_v[idx_i] = 0.0
+                        status_v[idx_i] = SNAP_OK
+                        continue
                     e_i = int(obs_snap["edge_idx"][idx_i])
                     if e_i < 0:
                         status_v[idx_i] = SNAP_EXCEEDED
@@ -977,18 +1185,20 @@ def compute_target_distances(
                 dist_net[valid_coord_mask] = net_v
                 snap_status[valid_coord_mask] = status_v
 
-                both_valid = valid_coord_mask & np.isfinite(dist_net) & np.isfinite(dist_eucl)
-                if np.any(both_valid):
-                    delta = np.maximum(0.0, dist_net[both_valid] - dist_eucl[both_valid])
-                    circuity_delta[both_valid] = delta
-                    circuity_ratio[both_valid] = dist_net[both_valid] / np.maximum(1.0, dist_eucl[both_valid])
-
                 n_disc = int(np.sum(status_v == SNAP_DISCONNECTED))
                 n_exc = int(np.sum(status_v == SNAP_EXCEEDED))
                 if n_disc > 0 or n_exc > 0:
                     warnings.append(
                         f"Target '{target_cfg.get('id')}': {n_disc} disconnected, {n_exc} >{max_snap_m:.0f}m snap limit (kept as NaN, zero 1.25x fabrication)."
                     )
+
+        both_valid = valid_coord_mask & np.isfinite(dist_net) & np.isfinite(dist_eucl)
+        if np.any(both_valid):
+            dn = dist_net[both_valid]
+            de = dist_eucl[both_valid]
+            zero_both = (de <= 1e-6) & (dn <= 1e-6)
+            circuity_delta[both_valid] = np.where(zero_both, 0.0, np.maximum(0.0, dn - de))
+            circuity_ratio[both_valid] = np.where(zero_both, 1.0, dn / np.maximum(1.0, de))
 
     return {
         "dist_eucl": dist_eucl,
@@ -1020,14 +1230,55 @@ def compute_single_route(
 
     proj_feats = _project_feature_rings(kept, proj)
     geom_mode = target_cfg.get("geometry_handling", "point")
+    inside_is_zero = bool(target_cfg.get("inside_is_zero", True))
     p_xy = np.asarray([obs_xy_single], dtype=np.float64)
     p_lat, p_lon = proj.inverse(obs_xy_single[0], obs_xy_single[1])
 
-    # Find nearest Euclidean point on target
+    is_inside = geom_mode == "polygon_boundary" and inside_is_zero and bool(_inside_polygons_mask(p_xy, proj_feats)[0])
+    if is_inside:
+        return {
+            "ok": True,
+            "target_id": target_cfg.get("id"),
+            "inside_zero": True,
+            "dist_eucl_m": 0.0,
+            "euclidean_geojson": None,
+            "network_geojson": None,
+            "dist_net_m": 0.0,
+            "detour_m": 0.0,
+        }
+
+    # Find exact nearest Euclidean point on target
     t_access_xy = _collect_target_access_points(proj_feats, geom_mode, densify_step_m=25.0)
-    d_eucl_arr, nn_idx = cKDTree(t_access_xy).query(p_xy, k=1)
-    eucl_d = float(d_eucl_arr[0])
-    nearest_tgt_xy = t_access_xy[int(nn_idx[0])]
+    eucl_d = np.inf
+    nearest_tgt_xy = obs_xy_single
+    if geom_mode in ("line_segment", "polygon_boundary"):
+        all_rings: List[np.ndarray] = []
+        pt_fallback: List[Tuple[float, float]] = []
+        for f in proj_feats:
+            if f["geom_type"] == "point":
+                for r_xy in f["outer_xy"]:
+                    pt_fallback.append((float(r_xy[0, 0]), float(r_xy[0, 1])))
+            else:
+                all_rings.extend(f["outer_xy"])
+                all_rings.extend(f.get("inner_xy", []))
+        if all_rings:
+            seg_a, seg_b = _subdivide_segments(all_rings, max_len_m=50.0)
+            if len(seg_a) > 0:
+                d_seg, xy_seg = _point_to_segments_nearest(p_xy, seg_a, seg_b, 50.0)
+                if float(d_seg[0]) < eucl_d:
+                    eucl_d = float(d_seg[0])
+                    nearest_tgt_xy = (float(xy_seg[0, 0]), float(xy_seg[0, 1]))
+        if pt_fallback:
+            pt_arr = np.asarray(pt_fallback, dtype=np.float64)
+            d_pt, nn_pt = cKDTree(pt_arr).query(p_xy, k=1)
+            if float(d_pt[0]) < eucl_d:
+                eucl_d = float(d_pt[0])
+                nearest_tgt_xy = (float(pt_arr[int(nn_pt[0]), 0]), float(pt_arr[int(nn_pt[0]), 1]))
+    if not math.isfinite(eucl_d) and len(t_access_xy) > 0:
+        d_eucl_arr, nn_idx = cKDTree(t_access_xy).query(p_xy, k=1)
+        eucl_d = float(d_eucl_arr[0])
+        nearest_tgt_xy = (float(t_access_xy[int(nn_idx[0]), 0]), float(t_access_xy[int(nn_idx[0]), 1]))
+
     t_lat, t_lon = proj.inverse(nearest_tgt_xy[0], nearest_tgt_xy[1])
 
     res: Dict[str, Any] = {
@@ -1044,7 +1295,7 @@ def compute_single_route(
         "detour_m": None,
     }
 
-    if street_graph is None or street_graph.get("empty", True):
+    if street_graph is None or street_graph.get("empty", True) or len(t_access_xy) == 0:
         return res
 
     max_snap_m = float(target_cfg.get("max_snap_distance_m", 300.0))
@@ -1081,7 +1332,7 @@ def compute_single_route(
     tgt_valid_idx = np.where(tgt_snap["edge_idx"] >= 0)[0]
     best_same = np.inf
     best_same_xy = None
-    tgt_snap_map: Dict[int, Tuple[float, float, np.ndarray]] = {}
+    tgt_best_exit: Dict[int, Tuple[float, np.ndarray, np.ndarray]] = {}
 
     for j in tgt_valid_idx:
         e_t = int(tgt_snap["edge_idx"][j])
@@ -1096,21 +1347,24 @@ def compute_single_route(
                     best_same_xy = (tgt_snap["snap_xy"][j], t_access_xy[j])
 
         if dir_t == 0 or dir_t == 1:
-            aug_rows.append(u_t); aug_cols.append(s_tgt_node); aug_data.append(float(s_t * L_t + d_st))
-            if u_t not in tgt_snap_map or d_st < tgt_snap_map[u_t][0]:
-                tgt_snap_map[u_t] = (d_st, s_t, tgt_snap["snap_xy"][j])
+            cost_u = float(s_t * L_t + d_st)
+            aug_rows.append(u_t); aug_cols.append(s_tgt_node); aug_data.append(cost_u)
+            if u_t not in tgt_best_exit or cost_u < tgt_best_exit[u_t][0]:
+                tgt_best_exit[u_t] = (cost_u, tgt_snap["snap_xy"][j], t_access_xy[j])
         if dir_t == 0 or dir_t == -1:
-            aug_rows.append(v_t); aug_cols.append(s_tgt_node); aug_data.append(float((1.0 - s_t) * L_t + d_st))
-            if v_t not in tgt_snap_map or d_st < tgt_snap_map[v_t][0]:
-                tgt_snap_map[v_t] = (d_st, s_t, tgt_snap["snap_xy"][j])
+            cost_v = float((1.0 - s_t) * L_t + d_st)
+            aug_rows.append(v_t); aug_cols.append(s_tgt_node); aug_data.append(cost_v)
+            if v_t not in tgt_best_exit or cost_v < tgt_best_exit[v_t][0]:
+                tgt_best_exit[v_t] = (cost_v, tgt_snap["snap_xy"][j], t_access_xy[j])
 
+    ded_r, ded_c, ded_w = _dedup_min_edges(aug_rows, aug_cols, aug_data, n_nodes + 2)
     coo = g_fwd.tocoo()
     aug_g = csr_matrix(
         (
-            np.concatenate([coo.data, np.asarray(aug_data, dtype=np.float64)]),
+            np.concatenate([coo.data, ded_w]),
             (
-                np.concatenate([coo.row, np.asarray(aug_rows, dtype=np.int32)]),
-                np.concatenate([coo.col, np.asarray(aug_cols, dtype=np.int32)]),
+                np.concatenate([coo.row, ded_r]),
+                np.concatenate([coo.col, ded_c]),
             ),
         ),
         shape=(n_nodes + 2, n_nodes + 2),
@@ -1137,8 +1391,10 @@ def compute_single_route(
         coords_xy = [obs_xy_single, tuple(obs_snap["snap_xy"][0])]
         for nid in chain_nodes:
             coords_xy.append((float(node_xy[nid, 0]), float(node_xy[nid, 1])))
-        if chain_nodes and chain_nodes[-1] in tgt_snap_map:
-            coords_xy.append(tuple(tgt_snap_map[chain_nodes[-1]][2]))
+        if chain_nodes and chain_nodes[-1] in tgt_best_exit:
+            _, snap_end_xy, tgt_end_xy = tgt_best_exit[chain_nodes[-1]]
+            coords_xy.append((float(snap_end_xy[0]), float(snap_end_xy[1])))
+            coords_xy.append((float(tgt_end_xy[0]), float(tgt_end_xy[1])))
         net_d = graph_d
     else:
         return res

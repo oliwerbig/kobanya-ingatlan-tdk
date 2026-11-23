@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy import optimize, stats
+from scipy.interpolate import PchipInterpolator
 from scipy.linalg import eigh
 from scipy.sparse import csr_matrix, eye as speye
 from scipy.sparse.linalg import splu
@@ -67,25 +68,64 @@ def build_spatial_weight_matrix(
         dedup = bool(w_cfg.get("dedup_colocated", False))
 
         if dedup:
-            # Group co-located points (< 0.5 m) into parcels, pick k nearest outside own parcel
-            dists_all, idx_all = tree.query(coords_xy, k=n)
-            for i in range(n):
+            # Group co-located points (< 0.5 m) into parcels without O(N^2) allocation
+            co_counts = tree.query_ball_point(coords_xy, r=0.5, return_length=True)
+            picked_lists: List[Optional[List[int]]] = [None] * n
+            pending = np.arange(n, dtype=np.int32)
+            k_q = min(n, k + 12)
+            dists_q, idx_q = tree.query(coords_xy, k=k_q)
+            if k_q == 1:
+                dists_q = dists_q[:, None]
+                idx_q = idx_q[:, None]
+            still_pending: List[int] = []
+            for pos, i in enumerate(pending):
                 picked = []
-                for d_ij, j_idx in zip(dists_all[i], idx_all[i]):
+                for d_ij, j_idx in zip(dists_q[pos], idx_q[pos]):
                     j = int(j_idx)
-                    if j == i:
-                        continue
-                    if d_ij <= 0.5:
+                    if j == i or d_ij <= 0.5:
                         continue
                     picked.append(j)
                     if len(picked) == k:
                         break
-                if not picked:
-                    # Fallback to standard k-NN if all points share one coordinate
-                    picked = [int(j) for j in idx_all[i] if int(j) != i][:k]
-                w_val = 1.0 / len(picked)
-                for j in picked:
-                    rows.append(i); cols.append(j); vals.append(w_val)
+                if len(picked) == k or k_q >= n:
+                    if not picked:
+                        picked = [int(j) for j in idx_q[pos] if int(j) != i][:k]
+                    picked_lists[i] = picked
+                else:
+                    still_pending.append(int(i))
+
+            # Escalate in small batches ONLY for dense co-located clusters
+            if still_pending:
+                pend_arr = np.asarray(still_pending, dtype=np.int32)
+                batch_sz = 128
+                for bs in range(0, len(pend_arr), batch_sz):
+                    sub = pend_arr[bs : bs + batch_sz]
+                    k_req = min(n, int(np.max(co_counts[sub])) + k + 2)
+                    dq, iq = tree.query(coords_xy[sub], k=k_req)
+                    if k_req == 1:
+                        dq = dq[:, None]
+                        iq = iq[:, None]
+                    for r_pos, i in enumerate(sub):
+                        picked = []
+                        for d_ij, j_idx in zip(dq[r_pos], iq[r_pos]):
+                            j = int(j_idx)
+                            if j == i or d_ij <= 0.5:
+                                continue
+                            picked.append(j)
+                            if len(picked) == k:
+                                break
+                        if not picked:
+                            picked = [int(j) for j in iq[r_pos] if int(j) != i][:k]
+                        picked_lists[int(i)] = picked
+
+            for i in range(n):
+                picked = picked_lists[i] or []
+                if picked:
+                    w_val = 1.0 / len(picked)
+                    for j in picked:
+                        rows.append(i); cols.append(j); vals.append(w_val)
+                else:
+                    islands.append(i)
         else:
             dists_q, idx_q = tree.query(coords_xy, k=k + 1)
             for i in range(n):
@@ -101,13 +141,38 @@ def build_spatial_weight_matrix(
         power = float(w_cfg.get("power", 1.0))
         cutoff_mode = str(w_cfg.get("cutoff_mode", "auto_connectivity"))
         d1, _ = tree.query(coords_xy, k=2)
-        d_conn = float(np.max(d1[:, 1])) * 1.001  # minimum distance guaranteeing 0 islands
-        if cutoff_mode == "fixed" and w_cfg.get("cutoff_m"):
+        d1_nn = d1[:, 1]
+        d_conn = float(np.max(d1_nn)) * 1.001  # minimum distance guaranteeing 0 islands
+        if cutoff_mode in ("fixed", "fixed_m") and w_cfg.get("cutoff_m"):
             d_cut = float(w_cfg["cutoff_m"])
         else:
             d_cut = max(d_conn, float(w_cfg.get("min_cutoff_m", 0.0)))
+            if n > 50:
+                p98 = max(1.0, float(np.percentile(d1_nn, 98)))
+                edge_cap = max(200000, 120 * n)
+                est_edges = int(np.sum(tree.query_ball_point(coords_xy, r=d_cut, return_length=True) - 1))
+                if d_conn > max(3000.0, 5.0 * p98) or est_edges > edge_cap:
+                    d_robust = max(float(w_cfg.get("min_cutoff_m", 0.0)), p98 * 1.25, 100.0)
+                    d_cut = min(d_cut, d_robust)
+                    est_edges2 = int(np.sum(tree.query_ball_point(coords_xy, r=d_cut, return_length=True) - 1))
+                    if est_edges2 > edge_cap:
+                        lo_r = max(1.0, float(np.median(d1_nn)))
+                        hi_r = d_cut
+                        for _ in range(12):
+                            mid_r = 0.5 * (lo_r + hi_r)
+                            ee = int(np.sum(tree.query_ball_point(coords_xy, r=mid_r, return_length=True) - 1))
+                            if ee <= edge_cap:
+                                lo_r = mid_r
+                            else:
+                                hi_r = mid_r
+                        d_cut = lo_r
+                    meta_extra["outlier_guard_triggered"] = True
+                    meta_extra["outlier_guard_msg"] = (
+                        f"IDW '{w_id}' connectivity radius capped at {d_cut:.1f}m "
+                        f"(unbounded max 1-NN={d_conn:.1f}m, est. {est_edges} edges)."
+                    )
 
-        pairs_list = tree.query_ball_tree(tree, r=d_cut)
+        pairs_list = tree.query_ball_point(coords_xy, r=d_cut)
         for i, nbrs in enumerate(pairs_list):
             nbr_valid = [int(j) for j in nbrs if int(j) != i]
             if not nbr_valid:
@@ -235,12 +300,15 @@ def compute_moran_i(vec: np.ndarray, w_obj: Dict[str, Any]) -> Dict[str, Any]:
 def compute_lisa(
     vec: np.ndarray,
     w_obj: Dict[str, Any],
-    n_perm: int = 199,
+    n_perm: int = 1999,
     use_fdr: bool = True,
     alpha: float = 0.05,
     seed: int = 42,
 ) -> Dict[str, Any]:
-    """Compute local Moran's I_i (LISA) with conditional permutation p-values and optional BH-FDR."""
+    """
+    Compute local Moran's I_i (LISA) with exact Anselin (1995) conditional permutation
+    p-values (holding z_i fixed outside its own neighborhood) and optional BH-FDR.
+    """
     W: csr_matrix = w_obj["W"]
     n = int(w_obj["n"])
     sd = float(np.std(vec, ddof=0))
@@ -251,17 +319,29 @@ def compute_lisa(
     wz = W @ z
     lisa_i = z * wz
 
-    # Vectorized conditional permutation test
+    # Vectorized exact conditional permutation test (batched sparse-dense matmul)
     rng = np.random.default_rng(seed)
-    # Approximate conditional randomization via global shuffled draws (fast in WASM)
     ge_count = np.zeros(n, dtype=np.int32)
     abs_obs = np.abs(lisa_i)
-    for _ in range(n_perm):
-        z_perm = rng.permutation(z)
+    b_sz = min(200, max(20, 200000 // max(1, n)))
+    row_base = np.arange(n, dtype=np.int32)
+
+    for s in range(0, n_perm, b_sz):
+        cur = min(b_sz, n_perm - s)
+        perms = np.argsort(rng.random((n, cur)), axis=0)
+        inv_p = np.empty_like(perms)
+        inv_p[perms, np.arange(cur)[None, :]] = row_base[:, None]
+
+        z_perm = z[perms]  # (n, cur)
         wz_p = W @ z_perm
-        # Note: in Anselin (1995), z_i stays fixed while neighbors permute
-        lisa_p = np.abs(z * wz_p)
-        ge_count += (lisa_p >= abs_obs).astype(np.int32)
+        # Exact Anselin conditional correction: swap z_i out if z_i landed on a neighbor m = inv_p[i, c]
+        ri = np.repeat(row_base[:, None], cur, axis=1).ravel()
+        corr_w = np.asarray(W[ri, inv_p.ravel()]).reshape(n, cur)
+        wz_p = wz_p + corr_w * (z_perm - z[:, None])
+
+        lisa_p = np.abs(z[:, None] * wz_p)
+        ge_count += np.sum(lisa_p >= abs_obs[:, None], axis=1, dtype=np.int32)
+
     p_vals = (ge_count + 1.0) / (n_perm + 1.0)
 
     if use_fdr and n > 0:
@@ -615,55 +695,82 @@ def compute_lesage_pace_impacts(
     """
     Compute inv-free LeSage & Pace (2009) Direct, Indirect (Spillover), Total impacts
     + 1,000-draw Krinsky-Robb Monte Carlo SEs, p-values, and 95% CIs.
+    Uses exact eigenvalues in Tier 1 (without islands) and common-probe anchored SuperLU
+    interpolation + exact island row-sum vectors in Tier 2 / island graphs.
     """
     rho = float(sar_or_sdm["rho"])
     beta_all = sar_or_sdm["beta"]
     vcov_br = sar_or_sdm["vcov_beta_rho"]
     eigvals = w_obj.get("eigvals")
+    has_islands = len(w_obj.get("islands", []) or []) > 0
     W: csr_matrix = w_obj["W"]
     n = w_obj["n"]
-
-    def _traces_for_rho_vec(rho_vec: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute T(rho) = (1/n) tr((I-rW)^{-1}) and U(rho) = (1/n) tr((I-rW)^{-1}W)."""
-        if eigvals is not None:
-            # Broadcast (D, 1) against (1, N) eigenvalues
-            denom = 1.0 - rho_vec[:, None] * eigvals[None, :]
-            inv_t = np.real(1.0 / denom)
-            t_arr = np.mean(inv_t, axis=1)
-            u_arr = np.mean(np.real(eigvals[None, :] / denom), axis=1)
-            return t_arr, u_arr
-        # Tier 2: sparse splu + Hutchinson probes at point estimate (and linear/series perturbation for KR)
-        lu = splu((speye(n, format="csc") - rho * W.tocsc()), permc_spec="MMD_AT_PLUS_A")
-        rng = np.random.default_rng(99)
-        V = rng.choice([-1.0, 1.0], size=(n, 80))
-        invV = lu.solve(V)
-        w_invV = W @ invV
-        t0 = float(np.mean(np.sum(V * invV, axis=0))) / n
-        u0 = float(np.mean(np.sum(V * w_invV, axis=0))) / n
-        # Approximate T(rho_d) via 4th-order Taylor expansion around rho
-        w2_invV = lu.solve(W @ w_invV)
-        t1 = float(np.mean(np.sum(V * w_invV, axis=0))) / n
-        t2 = float(np.mean(np.sum(V * w2_invV, axis=0))) / n
-        dr = rho_vec - rho
-        t_arr = t0 + dr * t1 + (dr ** 2) * t2
-        u_arr = u0 + dr * t2
-        return t_arr, u_arr
-
-    # Point estimates
-    t_pt, u_pt = _traces_for_rho_vec(np.array([rho]))
-    T0 = float(t_pt[0])
-    U0 = float(u_pt[0])
 
     # Krinsky-Robb draws from N([beta, rho], vcov_beta_rho)
     rng = np.random.default_rng(seed)
     mean_vec = np.concatenate([beta_all, [rho]])
-    # Ensure positive semi-definite covariance for sampling
     eig_v, eig_vec = np.linalg.eigh(0.5 * (vcov_br + vcov_br.T))
     eig_v = np.maximum(0.0, eig_v)
     cov_psd = (eig_vec * eig_v[None, :]) @ eig_vec.T
     draws = rng.multivariate_normal(mean_vec, cov_psd, size=krinsky_robb_draws)
-    rho_draws = np.clip(draws[:, -1], -0.99, 0.99)
-    t_draws, u_draws = _traces_for_rho_vec(rho_draws)
+    rho_draws = np.clip(draws[:, -1], -0.985, 0.985)
+
+    if eigvals is not None and not has_islands:
+        def _eval_eig(r_vec: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            denom = 1.0 - r_vec[:, None] * eigvals[None, :]
+            t_arr = np.mean(np.real(1.0 / denom), axis=1)
+            u_arr = np.mean(np.real(eigvals[None, :] / denom), axis=1)
+            s_arr = 1.0 / np.maximum(1e-6, 1.0 - r_vec)
+            return t_arr, u_arr, s_arr, s_arr
+
+        t_pt, u_pt, s_pt, v_pt = _eval_eig(np.array([rho]))
+        T0, U0, S0, V0 = float(t_pt[0]), float(u_pt[0]), float(s_pt[0]), float(v_pt[0])
+        t_draws, u_draws, s_draws, v_draws = _eval_eig(rho_draws)
+    else:
+        # Tier 2 (N > 1500) or W with islands: common-random-number Hutchinson probes across splu anchors
+        W_csc = W.tocsc()
+        I_csc = speye(n, format="csc")
+        probe_rng = np.random.default_rng(99)
+        V_probe = probe_rng.choice([-1.0, 1.0], size=(n, 96))
+        ones_vec = np.ones(n, dtype=np.float64)
+
+        def _eval_splu_single(r_val: float) -> Tuple[float, float, float, float]:
+            lu = splu((I_csc - r_val * W_csc), permc_spec="MMD_AT_PLUS_A")
+            invV = lu.solve(V_probe)
+            w_invV = W @ invV
+            t_val = float(np.mean(np.sum(V_probe * invV, axis=0))) / n
+            u_val = float(np.mean(np.sum(V_probe * w_invV, axis=0))) / n
+            if has_islands:
+                q1 = lu.solve(ones_vec)
+                s_val = float(np.mean(q1))
+                v_val = float(np.mean(W @ q1))
+            else:
+                s_val = 1.0 / max(1e-6, 1.0 - r_val)
+                v_val = s_val
+            return t_val, u_val, s_val, v_val
+
+        T0, U0, S0, V0 = _eval_splu_single(rho)
+        r_lo = float(np.min(rho_draws))
+        r_hi = float(np.max(rho_draws))
+        if r_hi - r_lo < 1e-6:
+            t_draws = np.full(krinsky_robb_draws, T0, dtype=np.float64)
+            u_draws = np.full(krinsky_robb_draws, U0, dtype=np.float64)
+            s_draws = np.full(krinsky_robb_draws, S0, dtype=np.float64)
+            v_draws = np.full(krinsky_robb_draws, V0, dtype=np.float64)
+        else:
+            anchors = np.unique(np.concatenate([np.linspace(r_lo, r_hi, 11), [np.clip(rho, -0.985, 0.985)]]))
+            a_t, a_u, a_s, a_v = [], [], [], []
+            for a in anchors:
+                tv, uv, sv, vv = _eval_splu_single(float(a))
+                a_t.append(tv); a_u.append(uv); a_s.append(sv); a_v.append(vv)
+            t_draws = PchipInterpolator(anchors, a_t)(rho_draws)
+            u_draws = PchipInterpolator(anchors, a_u)(rho_draws)
+            if has_islands:
+                s_draws = PchipInterpolator(anchors, a_s)(rho_draws)
+                v_draws = PchipInterpolator(anchors, a_v)(rho_draws)
+            else:
+                s_draws = 1.0 / np.maximum(1e-6, 1.0 - rho_draws)
+                v_draws = s_draws
 
     impacts_out: List[Dict[str, Any]] = []
     # Variable columns start at index 1 (exclude intercept)
@@ -684,12 +791,12 @@ def compute_lesage_pace_impacts(
             th_draws = np.zeros_like(b_draws)
 
         direct = b_j * T0 + th_j * U0
-        total = (b_j + th_j) / max(1e-6, 1.0 - rho)
+        total = b_j * S0 + th_j * V0
         indirect = total - direct
         share_pct = (indirect / total * 100.0) if abs(total) > 1e-12 else 0.0
 
         dir_d = b_draws * t_draws + th_draws * u_draws
-        tot_d = (b_draws + th_draws) / np.maximum(1e-6, 1.0 - rho_draws)
+        tot_d = b_draws * s_draws + th_draws * v_draws
         ind_d = tot_d - dir_d
 
         def _kr_stats(arr_d: np.ndarray, pt: float) -> Dict[str, Any]:
@@ -871,13 +978,17 @@ def run_spatial_pipeline(
         },
     ]
 
-    # Guard #5 alerts (e.g. co-located condo k-NN artifact)
+    # Guard #5 alerts (co-located condo k-NN artifact & IDW outlier connectivity cap)
     guard5_alerts = []
     if primary_w["colocated_pairs_pct"] > 5.0:
         guard5_alerts.append(
             f"Co-located coordinates: {primary_w['colocated_pairs_pct']:.1f}% of {primary_w['id']} neighbor links have d_ij <= 0.5m "
             "(intra-building clusters). Verify spatial spillover stability against the Inverse-Distance (IDW) matrix below."
         )
+    for w_o in w_objs:
+        ogm = w_o.get("meta", {}).get("outlier_guard_msg")
+        if ogm:
+            guard5_alerts.append(ogm)
 
     return {
         "ok": True,
