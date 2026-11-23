@@ -501,7 +501,7 @@ def build_street_graph(
                 # Handle fallback `out geom;` graph responses transparently
                 fake_ids = []
                 for idx, pt in enumerate(el["geometry"]):
-                    nid = hash((el["id"], idx, round(pt["lon"], 7), round(pt["lat"], 7)))
+                    nid = hash((round(float(pt["lon"]), 6), round(float(pt["lat"]), 6)))
                     node_map[nid] = (float(pt["lon"]), float(pt["lat"]))
                     fake_ids.append(nid)
                 ways.append({"type": "way", "id": el["id"], "nodes": fake_ids, "tags": el.get("tags", {})})

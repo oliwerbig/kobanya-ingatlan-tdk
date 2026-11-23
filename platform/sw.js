@@ -1,5 +1,5 @@
-/* GeoSpec Service Worker — caches Pyodide WASM + NumPy/SciPy assets for fast repeat boots */
-const CACHE_NAME = "geospec-wasm-v1";
+/* GeoSpec Service Worker — caches Pyodide WASM + CDN assets, network-first for local py_engine */
+const CACHE_NAME = "geospec-wasm-v2";
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
@@ -16,14 +16,30 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const url = event.request.url;
-  // Cache Pyodide CDN WASM/wheels and static GeoSpec py_engine files
-  const isCacheable =
+  const isCdn =
     url.includes("cdn.jsdelivr.net/pyodide/") ||
-    url.includes("/py_engine/") ||
     url.includes("unpkg.com/maplibre-gl") ||
     url.includes("cdn.plot.ly");
+  const isPyEngine = url.includes("/py_engine/");
 
-  if (!isCacheable || event.request.method !== "GET") {
+  if ((!isCdn && !isPyEngine) || event.request.method !== "GET") {
+    return;
+  }
+
+  if (isPyEngine) {
+    event.respondWith(
+      caches.open(CACHE_NAME).then(async (cache) => {
+        try {
+          const resp = await fetch(event.request);
+          if (resp && resp.status === 200) {
+            cache.put(event.request, resp.clone());
+          }
+          return resp;
+        } catch (err) {
+          return (await cache.match(event.request)) || Response.error();
+        }
+      })
+    );
     return;
   }
 

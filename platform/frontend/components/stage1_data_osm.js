@@ -277,10 +277,10 @@ export function renderStage1(container, ctx) {
       excluded_osm_ids: [],
       geometry_handling: preset.geometry_handling,
       inside_is_zero: preset.inside_is_zero,
-      distance_modes: "both",
+      distance_modes: preset.preset_id === "transit_stops" ? "both" : "euclidean",
       routing_profile: "walk",
       max_snap_distance_m: 300,
-      bbox_buffer_m: 1500,
+      bbox_buffer_m: 800,
     });
     actions.render();
   });
@@ -301,10 +301,10 @@ export function renderStage1(container, ctx) {
       excluded_osm_ids: [],
       geometry_handling: "polygon_boundary",
       inside_is_zero: true,
-      distance_modes: "both",
+      distance_modes: "euclidean",
       routing_profile: "walk",
       max_snap_distance_m: 300,
-      bbox_buffer_m: 1500,
+      bbox_buffer_m: 800,
     });
     actions.render();
   });

@@ -203,7 +203,7 @@ const actions = {
 
       for (const prof of needProfiles) {
         setLog(`Utcahálózat lekérése CSR Dijkstra útvonalhoz (${prof})...`);
-        const { data, fromCache } = await fetchStreetGraphOSM(state.datasetInfo.bbox, 1500, prof);
+        const { data, fromCache } = await fetchStreetGraphOSM(state.datasetInfo.bbox, 600, prof);
         const gRes = await dag.call("ingest_street_graph", { profile: prof, graph_json: data });
         setLog(`Utcahálózat (${prof}) kész: ${gRes.n_nodes} csúcs, ${gRes.n_edges} él (${fromCache ? "cache" : "Overpass"}).`);
       }
