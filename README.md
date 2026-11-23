@@ -27,5 +27,6 @@ Ez a repository a kutatás reprodukálható számítási motorját és az intera
 | **[`index.html`](index.html)** | Webes Dashboard | Az önálló, egyetlen állományból futó interaktív GitHub Pages kutatási felület. |
 | **[`Számítások.ipynb`](Számítások.ipynb)** | Jupyter Notebook | **Master ökonometriai és ML számítási motor:** 68 cella, M1–M4 OLS modellek (HC3 SE), robusztussági diagnosztika (VIF, BP, White, RESET, Jarque-Bera), térökonometria (Moran-I, SAR, SEM, LeSage & Pace 46,6% spillover), GWR és XGBoost/CatBoost SHAP TreeExplainer. |
 | **[`Vizualizacio.ipynb`](Vizualizacio.ipynb)** | Jupyter Notebook | **Master térinformatikai és vizualizációs motor:** 25 cella, a 24 db Plotly ábra és a webes dashboard generálása. |
+| **[`platform/`](platform/index.html)** | Tudományos Web Platform | **`GeoSpec` – Általános célú, böngészőben futó (Pyodide NumPy+SciPy WASM) parametrikus térökonometriai és OSM kutatói játszótér** tetszőleges vizsgálati területre (CSV/GeoJSON feltöltéssel, szerkeszthető modellekkel, 6 módszertani őrszemmel, CSR Dijkstra routinggal, SAR/SEM/SDM + Krinsky–Robb és Szelektív-Ridge GWR becsléssel). |
 | **`.nojekyll`** | Konfiguráció | Jekyll feldolgozás mellőzése a statikus GitHub Pages azonnali kiszolgálásához. |
 | **`.github/workflows/deploy-pages.yml`** | CI/CD | Automatikus GitHub Pages publikálás push eseménykor. |

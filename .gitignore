@@ -22,6 +22,10 @@ scratch/
 !/index.html
 !/Számítások.ipynb
 !/Vizualizacio.ipynb
+!/platform/
+!/platform/**
+__pycache__/
+.pytest_cache/
 !/.github/
 !/.github/workflows/
 !/.github/workflows/deploy-pages.yml

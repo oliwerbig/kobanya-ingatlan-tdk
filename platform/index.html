@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GeoSpec — Parametrikus Térökonometriai &amp; OSM Kutatói Munkaállomás</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+  <link rel="stylesheet" href="./frontend/styles/theme.css" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Header -->
+    <header class="top-bar">
+      <div class="brand-group">
+        <div class="brand-logo">
+          <span>GeoSpec</span>
+          <span class="badge">Parametric Spatial Workbench</span>
+        </div>
+        <div class="status-pill" title="Böngészőbeli Pyodide WebAssembly motor állapota">
+          <span class="dot busy" id="wasmDot"></span>
+          <span id="wasmStatusText">Pyodide indítása...</span>
+        </div>
+      </div>
+
+      <div class="top-actions">
+        <button class="btn btn-primary btn-sm" id="btnRunAll" disabled>▶ Teljes Pipeline Futtatása (1–5)</button>
+        <button class="btn btn-sm" id="btnTopRecipeExport">🧪 Recept (.json)</button>
+        <button class="btn btn-sm" id="btnTopZipExport">📦 .ZIP Export</button>
+        <button class="btn btn-sm" id="btnThemeToggle" title="Világos / Sötét nézet váltása">🌗</button>
+        <a href="../index.html" class="btn btn-sm" style="text-decoration:none;">← TDK 2026 Riport</a>
+      </div>
+    </header>
+
+    <!-- 5-Stage Pipeline Rail & 6-Guard Status Strip -->
+    <div class="sub-header">
+      <nav class="stage-rail" aria-label="Pipeline fázisok">
+        <button class="stage-tab active" data-stage="1"><span class="step-dot"></span>1. Adat &amp; OSM Célpontok</button>
+        <button class="stage-tab" data-stage="2"><span class="step-dot"></span>2. Leíró &amp; Gelbach</button>
+        <button class="stage-tab" data-stage="3"><span class="step-dot"></span>3. Modell-Műhely &amp; Diagnosztika</button>
+        <button class="stage-tab" data-stage="4"><span class="step-dot"></span>4. Térökonometria (SAR/SEM/SDM)</button>
+        <button class="stage-tab" data-stage="5"><span class="step-dot"></span>5. Adaptív GWR &amp; Export</button>
+      </nav>
+
+      <div class="guard-strip" aria-label="Módszertani Őrszemek">
+        <span class="guard-pill" id="g1Pill">G1 Diagnosztika</span>
+        <span class="guard-pill" id="g2Pill">G2 Ritka cellák</span>
+        <span class="guard-pill" id="g3Pill">G3 Gelbach/Step</span>
+        <span class="guard-pill" id="g4Pill">G4 Heckman/SE</span>
+        <span class="guard-pill" id="g5Pill">G5 Térbeli W</span>
+        <span class="guard-pill" id="g6Pill">G6 GWR Ridge</span>
+      </div>
+    </div>
+
+    <!-- Split Screen Workbench + Synchronized MapLibre Canvas -->
+    <main class="workspace-split">
+      <section class="workbench-pane" id="stageContent"></section>
+
+      <aside class="map-pane">
+        <div class="map-toolbar">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <strong style="font-size:12px;">Térképi réteg:</strong>
+            <select id="selMapLayer">
+              <option value="y_raw">Megfigyelt célváltozó (y)</option>
+              <option value="ols_resid">OLS Reziduumok</option>
+              <option value="lisa">LISA Klaszterek (HH/LL/HL/LH)</option>
+              <option value="gwr_beta">GWR Lokális β̂ᵢ (|t|&lt;1.96 halványított)</option>
+              <option value="gwr_r2">GWR Lokális R²</option>
+            </select>
+            <select id="selGwrVarLayer" style="display:none;"></select>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span class="card-subtitle">Útvonal célpont:</span>
+            <select id="selRouteTarget" style="max-width:130px;"></select>
+          </div>
+        </div>
+
+        <div id="mapContainer"></div>
+        <div class="inspector-drawer" id="pointInspector"></div>
+      </aside>
+    </main>
+
+    <footer class="console-strip">
+      <span id="consoleText">Készen áll.</span>
+      <span class="mono">Pure NumPy + SciPy WASM | Zero-Upload Client-Side</span>
+    </footer>
+  </div>
+
+  <script type="module" src="./frontend/app.js"></script>
+</body>
+</html>

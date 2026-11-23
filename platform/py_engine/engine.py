@@ -1,0 +1,739 @@
+"""
+GeoSpec Unified Session & Pipeline Orchestrator
+=============================================
+Connects DAGCache, Projection, Parametric OSM/GeoJSON GIS, Design Matrix,
+OLS/Gelbach/Heckman Kernel, Spatial Econometrics Kernel, GWR Kernel, and Exporters
+into a clean JSON-RPC session callable from Pyodide Web Worker or native Python.
+"""
+
+from __future__ import annotations
+
+import datetime
+import math
+from typing import Any, Callable, Dict, List, Optional
+
+import numpy as np
+
+from .dag_cache import DAGCache, hash_payload
+from .design_matrix import (
+    build_dependent_variable,
+    build_model_design,
+    compute_common_sample_mask,
+    generate_m1_m4_specs,
+    parse_binary_flag,
+    parse_numeric_array,
+)
+from .exporters import (
+    build_qgis_geojson,
+    build_zip_bundle,
+    dict_rows_to_csv,
+    generate_multi_model_latex,
+)
+from .gwr_kernel import fit_adaptive_gwr
+from .ols_kernel import (
+    build_cluster_ids,
+    compute_descriptive_and_normality,
+    compute_semi_log_effects,
+    fit_ols_core,
+    run_guard1_diagnostics,
+    run_heckman_two_step,
+    run_stepwise_and_gelbach,
+    scan_andersson_day_profile,
+)
+from .projection import LocalMetricProjection
+from .spatial_gis import (
+    build_street_graph,
+    compute_single_route,
+    compute_target_distances,
+    features_to_preview_geojson,
+    parse_geojson_features,
+    parse_osm_elements,
+)
+from .spatial_kernel import run_spatial_pipeline
+
+
+def _sig_stars(p: float) -> str:
+    if not math.isfinite(p):
+        return ""
+    if p < 0.01:
+        return "***"
+    if p < 0.05:
+        return "**"
+    if p < 0.10:
+        return "*"
+    return ""
+
+
+class GeoSpecSession:
+    """Stateful session managing incremental DAG computation for 1 study area."""
+
+    def __init__(self) -> None:
+        self.cache = DAGCache()
+        self.columns: Dict[str, List[Any]] = {}
+        self.n_rows: int = 0
+        self.lat: np.ndarray = np.array([], dtype=np.float64)
+        self.lon: np.ndarray = np.array([], dtype=np.float64)
+        self.valid_coord_mask: np.ndarray = np.array([], dtype=bool)
+        self.proj: Optional[LocalMetricProjection] = None
+        self.obs_xy: np.ndarray = np.empty((0, 2), dtype=np.float64)
+
+        self.target_features: Dict[str, List[Dict[str, Any]]] = {}
+        self.street_graphs: Dict[str, Dict[str, Any]] = {}
+        self.dist_results: Dict[str, Dict[str, Any]] = {}
+        self.last_outputs: Dict[str, Any] = {}
+
+    def load_dataset(
+        self,
+        columns: Dict[str, List[Any]],
+        lat_col: str,
+        lon_col: str,
+    ) -> Dict[str, Any]:
+        """Load tabular dataset columns and initialize universal metric projection."""
+        self.cache.clear_all()
+        self.columns = columns
+        self.target_features.clear()
+        self.street_graphs.clear()
+        self.dist_results.clear()
+        self.last_outputs.clear()
+
+        if not columns or lat_col not in columns or lon_col not in columns:
+            raise ValueError(f"Coordinate columns '{lat_col}' and '{lon_col}' are required.")
+
+        self.n_rows = len(columns[lat_col])
+        self.lat = parse_numeric_array(columns[lat_col])
+        self.lon = parse_numeric_array(columns[lon_col])
+        self.valid_coord_mask = (
+            np.isfinite(self.lat)
+            & np.isfinite(self.lon)
+            & (self.lat >= -90.0)
+            & (self.lat <= 90.0)
+            & (self.lon >= -180.0)
+            & (self.lon <= 180.0)
+            & ~((np.abs(self.lat) < 1e-12) & (np.abs(self.lon) < 1e-12))
+        )
+
+        n_geo = int(np.sum(self.valid_coord_mask))
+        if n_geo < 5:
+            raise ValueError(f"At least 5 valid geographic coordinates required (found {n_geo}).")
+
+        self.proj = LocalMetricProjection.from_points(
+            self.lat[self.valid_coord_mask],
+            self.lon[self.valid_coord_mask],
+        )
+        self.obs_xy = np.full((self.n_rows, 2), np.nan, dtype=np.float64)
+        xv, yv = self.proj.forward(self.lat[self.valid_coord_mask], self.lon[self.valid_coord_mask])
+        self.obs_xy[self.valid_coord_mask, 0] = xv
+        self.obs_xy[self.valid_coord_mask, 1] = yv
+
+        # Bounding box with helper coords for Overpass
+        lat_v = self.lat[self.valid_coord_mask]
+        lon_v = self.lon[self.valid_coord_mask]
+        bbox = {
+            "south": float(np.min(lat_v)),
+            "west": float(np.min(lon_v)),
+            "north": float(np.max(lat_v)),
+            "east": float(np.max(lon_v)),
+        }
+
+        return {
+            "ok": True,
+            "n_rows": self.n_rows,
+            "n_geocoded": n_geo,
+            "n_non_geocoded": self.n_rows - n_geo,
+            "projection": self.proj.metadata(),
+            "bbox": bbox,
+            "columns": list(columns.keys()),
+        }
+
+    def ingest_target_raw(
+        self,
+        target_id: str,
+        raw_payload: Dict[str, Any],
+        source_kind: str = "osm",
+        excluded_osm_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Parse Overpass JSON or GeoJSON for a target and return interactive map preview GeoJSON."""
+        if source_kind == "geojson":
+            feats = parse_geojson_features(raw_payload, prefix=target_id)
+        else:
+            feats = parse_osm_elements(raw_payload)
+        self.target_features[target_id] = feats
+        self.cache.invalidate_from("dist")
+        preview = features_to_preview_geojson(feats, excluded_ids=excluded_osm_ids)
+        return {
+            "ok": True,
+            "target_id": target_id,
+            "n_features": len(feats),
+            "preview_geojson": preview,
+            "feature_index": [
+                {"uid": f["uid"], "name": f["name"], "geom_type": f["geom_type"]}
+                for f in feats
+            ],
+        }
+
+    def ingest_street_graph(self, profile: str, overpass_graph_json: Dict[str, Any]) -> Dict[str, Any]:
+        """Parse street network JSON once into low-RAM CSR Dijkstra structure."""
+        if self.proj is None:
+            raise ValueError("Load dataset before ingesting street graph.")
+        graph = build_street_graph(overpass_graph_json, self.proj, routing_profile=profile)
+        self.street_graphs[profile] = graph
+        self.cache.invalidate_from("dist")
+        return {
+            "ok": not graph.get("empty", True),
+            "profile": profile,
+            "n_nodes": graph.get("n_nodes", 0),
+            "n_edges": graph.get("n_edges", 0),
+        }
+
+    def run_stage_1_distances(self, recipe: Dict[str, Any], run_id: int = 1) -> Dict[str, Any]:
+        """Stage 1: Compute Euclidean/Dijkstra distances & circuity for all configured spatial targets."""
+        if self.proj is None:
+            raise ValueError("No dataset loaded.")
+        self.cache.start_run(run_id)
+        targets = recipe.get("spatial_targets", [])
+        summary = []
+        warnings: List[str] = []
+
+        for tgt in targets:
+            self.cache.check_cancelled(run_id)
+            tid = tgt["id"]
+            if tgt.get("source") == "csv_column":
+                col_n = tgt.get("csv_col")
+                arr = parse_numeric_array(self.columns[col_n]) if col_n in self.columns else np.full(self.n_rows, np.nan)
+                d_res = {
+                    "dist_eucl": arr,
+                    "dist_net": np.full(self.n_rows, np.nan),
+                    "circuity_delta": np.full(self.n_rows, np.nan),
+                    "circuity_ratio": np.full(self.n_rows, np.nan),
+                    "snap_status": np.zeros(self.n_rows, dtype=np.int32),
+                    "n_active_features": 1,
+                    "n_excluded_features": 0,
+                    "warnings": [],
+                }
+            else:
+                feats = self.target_features.get(tid, [])
+                prof = tgt.get("routing_profile", "walk")
+                graph = self.street_graphs.get(prof) if tgt.get("distance_modes") in ("network_dijkstra", "both") else None
+                d_key = hash_payload({
+                    "tid": tid,
+                    "n_feats": len(feats),
+                    "excl": sorted(tgt.get("excluded_osm_ids", []) or []),
+                    "geom": tgt.get("geometry_handling"),
+                    "inside_is_zero": tgt.get("inside_is_zero", True),
+                    "mode": tgt.get("distance_modes"),
+                    "prof": prof,
+                    "snap_m": tgt.get("max_snap_distance_m", 300.0),
+                    "graph_n": graph.get("n_nodes", 0) if graph else 0,
+                })
+                d_res = self.cache.get_or_compute(
+                    "dist",
+                    d_key,
+                    lambda f=feats, t=tgt, g=graph: compute_target_distances(
+                        self.obs_xy, self.valid_coord_mask, f, t, self.proj, g  # type: ignore[arg-type]
+                    ),
+                    run_id=run_id,
+                )
+
+            self.dist_results[tid] = d_res
+            warnings.extend(d_res.get("warnings", []))
+            eucl_v = d_res["dist_eucl"][self.valid_coord_mask & np.isfinite(d_res["dist_eucl"])]
+            net_v = d_res["dist_net"][self.valid_coord_mask & np.isfinite(d_res["dist_net"])]
+            det_v = d_res["circuity_delta"][self.valid_coord_mask & np.isfinite(d_res["circuity_delta"])]
+            summary.append({
+                "target_id": tid,
+                "name": tgt.get("name", tid),
+                "n_active_features": d_res["n_active_features"],
+                "n_excluded_features": d_res["n_excluded_features"],
+                "median_eucl_m": round(float(np.median(eucl_v)), 1) if len(eucl_v) else None,
+                "median_net_m": round(float(np.median(net_v)), 1) if len(net_v) else None,
+                "median_detour_m": round(float(np.median(det_v)), 1) if len(det_v) else None,
+                "max_detour_m": round(float(np.max(det_v)), 1) if len(det_v) else None,
+            })
+
+        self.last_outputs["stage1"] = {"summary": summary, "warnings": warnings}
+        return {"ok": True, "summary": summary, "warnings": warnings}
+
+    def get_single_point_route(
+        self,
+        obs_idx: int,
+        target_id: str,
+        recipe: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Compute on-demand Dijkstra route replay for clicked observation on the map."""
+        if self.proj is None or obs_idx < 0 or obs_idx >= self.n_rows or not self.valid_coord_mask[obs_idx]:
+            return {"ok": False, "reason": "invalid_observation"}
+        tgt = next((t for t in recipe.get("spatial_targets", []) if t["id"] == target_id), None)
+        if tgt is None:
+            return {"ok": False, "reason": "unknown_target"}
+        feats = self.target_features.get(target_id, [])
+        graph = self.street_graphs.get(tgt.get("routing_profile", "walk"))
+        return compute_single_route(
+            (float(self.obs_xy[obs_idx, 0]), float(self.obs_xy[obs_idx, 1])),
+            feats,
+            tgt,
+            self.proj,
+            graph,
+        )
+
+    def _prepare_y_and_masks(self, recipe: Dict[str, Any]) -> Dict[str, Any]:
+        ds = recipe.get("dataset_schema", {})
+        y_info = build_dependent_variable(self.columns, ds.get("y_spec", {}))
+        sel_cfg = ds.get("selection_spec", {})
+        excl_col = sel_cfg.get("excluded_flag_col")
+        if excl_col and excl_col in self.columns:
+            explicit_excl = parse_binary_flag(self.columns[excl_col]) >= 0.5
+        else:
+            explicit_excl = np.zeros(self.n_rows, dtype=bool)
+        analytic_base = self.valid_coord_mask & ~explicit_excl
+        return {
+            "y_info": y_info,
+            "analytic_base": analytic_base,
+            "explicit_excl": explicit_excl,
+        }
+
+    def run_stage_2_descriptives_and_composition(self, recipe: Dict[str, Any], run_id: int = 1) -> Dict[str, Any]:
+        """Stage 2: Descriptive stats, normality, and dynamic Step 0..K + Gelbach OVB decomposition."""
+        self.cache.start_run(run_id)
+        prep = self._prepare_y_and_masks(recipe)
+        y_info = prep["y_info"]
+        analytic_base = prep["analytic_base"]
+        guards_cfg = recipe.get("guards_cfg", {})
+        tau = int(guards_cfg.get("sparse_min_cell", 5))
+
+        active_specs = [m for m in recipe.get("models", []) if m.get("active", True)]
+        if active_specs and guards_cfg.get("common_sample_lock", True):
+            common_mask = compute_common_sample_mask(
+                self.columns, self.dist_results, active_specs, y_info, analytic_base, tau
+            )
+        else:
+            common_mask = analytic_base & y_info["valid_mask"]
+
+        cov_union = []
+        seen_cov = set()
+        for m in active_specs:
+            for c in m.get("covariates", []):
+                if c["col"] not in seen_cov:
+                    seen_cov.add(c["col"])
+                    cov_union.append(c)
+
+        desc = compute_descriptive_and_normality(self.columns, self.dist_results, y_info, common_mask, cov_union)
+
+        chain_cfg = recipe.get("composition_chain", {})
+        stepwise = {"ok": False, "reason": "Disabled or no active model."}
+        if chain_cfg.get("enabled", True) and active_specs:
+            # Use the richest active model or spatial_engine.active_model_id
+            sp_mid = recipe.get("spatial_engine", {}).get("active_model_id")
+            ref_spec = next((m for m in active_specs if m["id"] == sp_mid), active_specs[-1])
+            stepwise = run_stepwise_and_gelbach(
+                self.columns, self.dist_results, ref_spec, chain_cfg, y_info, analytic_base, tau, common_mask
+            )
+
+        res = {"ok": True, "descriptives": desc, "composition": stepwise}
+        self.last_outputs["stage2"] = res
+        return res
+
+    def run_stage_3_ols_workbench(
+        self,
+        recipe: Dict[str, Any],
+        cov_type: str = "HC3",
+        run_id: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        Stage 3: Estimate all active composed ModelSpecs (with Guard #1, #2, #4),
+        plus Andersson-Day Profile-MLE cutoff curve when enabled.
+        """
+        self.cache.start_run(run_id)
+        prep = self._prepare_y_and_masks(recipe)
+        y_info = prep["y_info"]
+        analytic_base = prep["analytic_base"]
+        ds = recipe.get("dataset_schema", {})
+        guards_cfg = recipe.get("guards_cfg", {})
+        tau = int(guards_cfg.get("sparse_min_cell", 5))
+        lev_warn = float(guards_cfg.get("hc3_leverage_warn", 0.85))
+        active_specs = [m for m in recipe.get("models", []) if m.get("active", True)]
+
+        if not active_specs:
+            return {"ok": False, "reason": "No active model specifications."}
+
+        common_mask = None
+        if guards_cfg.get("common_sample_lock", True):
+            common_mask = compute_common_sample_mask(
+                self.columns, self.dist_results, active_specs, y_info, analytic_base, tau
+            )
+
+        # Build spatial proxy vectors for Guard #1 confounding alert
+        proxy_cols_raw: Dict[str, np.ndarray] = {}
+        for pcol in ds.get("spatial_proxy_cols", []) or []:
+            if pcol in self.columns:
+                proxy_cols_raw[pcol] = parse_numeric_array(self.columns[pcol])
+
+        models_out: List[Dict[str, Any]] = []
+        ad_profiles: Dict[str, Any] = {}
+        heckman_out: Optional[Dict[str, Any]] = None
+
+        for m_spec in active_specs:
+            self.cache.check_cancelled(run_id)
+            design = build_model_design(
+                self.columns, self.dist_results, m_spec, y_info, analytic_base, tau, common_mask
+            )
+            if design["n_obs"] <= design["k_params"] + 2:
+                models_out.append({
+                    "model_id": m_spec["id"],
+                    "model_name": m_spec.get("name", m_spec["id"]),
+                    "error": f"Insufficient observations (N={design['n_obs']}) for K={design['k_params']}.",
+                })
+                continue
+
+            cluster_ids = None
+            cluster_meta = {"method": "none"}
+            if cov_type == "cluster":
+                cluster_ids, cluster_meta = build_cluster_ids(
+                    self.columns, self.obs_xy, design["valid_indices"], ds.get("cluster_spec", {})
+                )
+
+            ols = fit_ols_core(
+                design["X"],
+                design["y"],
+                cov_type=cov_type,
+                cluster_ids=cluster_ids,
+                leverage_warn=lev_warn,
+            )
+
+            # Match spatial proxy columns to valid sample & grab focal distance if present
+            proxy_sub = {k: v[design["valid_mask"]] for k, v in proxy_cols_raw.items()}
+            focal_dist = None
+            if recipe.get("spatial_targets"):
+                ftgt = recipe["spatial_targets"][0]["id"]
+                if ftgt in self.dist_results:
+                    focal_dist = (ftgt, self.dist_results[ftgt]["dist_eucl"][design["valid_mask"]])
+
+            diag = run_guard1_diagnostics(design["X"], design["y"], ols, design["col_meta"], proxy_sub, focal_dist)
+
+            params_rows = []
+            for j, meta in enumerate(design["col_meta"]):
+                b_j = float(ols["beta"][j])
+                se_j = float(ols["se"][j])
+                p_j = float(ols["p"][j])
+                pcts = compute_semi_log_effects(b_j, se_j, meta["is_binary"], design["is_log_scale"])
+                params_rows.append({
+                    "name": meta["name"],
+                    "label": meta["label"],
+                    "kind": meta["kind"],
+                    "is_binary": meta["is_binary"],
+                    "beta": round(b_j, 4),
+                    "se": round(se_j, 4),
+                    "t": round(float(ols["t"][j]), 3),
+                    "p": round(p_j, 5),
+                    "sig": _sig_stars(p_j),
+                    "ci_lo": round(float(ols["ci_lo"][j]), 4),
+                    "ci_hi": round(float(ols["ci_hi"][j]), 4),
+                    "hp_pct": pcts["hp_pct"],
+                    "kennedy_pct": pcts["kennedy_pct"],
+                })
+
+            models_out.append({
+                "model_id": m_spec["id"],
+                "model_name": m_spec.get("name", m_spec["id"]),
+                "n_obs": design["n_obs"],
+                "k_params": design["k_params"],
+                "is_log_scale": design["is_log_scale"],
+                "y_label": design["y_label"],
+                "r2": round(float(ols["r2"]), 4),
+                "adj_r2": round(float(ols["adj_r2"]), 4),
+                "aic": round(float(ols["aic"]), 2),
+                "aicc": round(float(ols["aicc"]), 2),
+                "bic": round(float(ols["bic"]), 2),
+                "llf": round(float(ols["llf"]), 2),
+                "f_stat": round(float(ols["f_stat"]), 2) if math.isfinite(ols["f_stat"]) else None,
+                "f_pval": round(float(ols["f_pval"]), 5) if math.isfinite(ols["f_pval"]) else None,
+                "cov_type_used": ols["cov_type_used"],
+                "cluster_meta": cluster_meta,
+                "params": params_rows,
+                "diagnostics": diag,
+                "guard2_events": design["guard2_events"],
+                "footnotes": design["footnotes"],
+                "fitted": np.round(ols["fitted"], 5).tolist(),
+                "resid": np.round(ols["resid"], 5).tolist(),
+                "cooks_d": np.round(ols["cooks_d"], 5).tolist(),
+                "valid_indices": design["valid_indices"].tolist(),
+            })
+
+            # Scan AD cutoff profile for any AD spatial term in this spec
+            for st_idx, st in enumerate(m_spec.get("spatial_terms", [])):
+                if st.get("transform") == "andersson_day":
+                    rng_cfg = st.get("cutoff_range_m", [100.0, 600.0, 25.0])
+                    prof_res = scan_andersson_day_profile(
+                        self.columns,
+                        self.dist_results,
+                        m_spec,
+                        y_info,
+                        analytic_base,
+                        target_term_idx=st_idx,
+                        c_min=float(rng_cfg[0]),
+                        c_max=float(rng_cfg[1]),
+                        step=float(rng_cfg[2]),
+                        sparse_min_cell=tau,
+                        override_valid_mask=common_mask,
+                    )
+                    ad_profiles[f"{m_spec['id']}::{st.get('target_id')}"] = prof_res
+
+        # Guard #4 Heckman 2-Step Selection Check on reference active model
+        sel_cfg = ds.get("selection_spec", {})
+        sp_mid = recipe.get("spatial_engine", {}).get("active_model_id")
+        ref_spec = next((m for m in active_specs if m["id"] == sp_mid), active_specs[-1])
+        ref_design = build_model_design(
+            self.columns, self.dist_results, ref_spec, y_info, analytic_base, tau, common_mask
+        )
+        sel_indicator = analytic_base.astype(np.float64)
+        n_excl = int(np.sum(sel_indicator == 0.0))
+        if (
+            sel_cfg.get("enabled", True)
+            and n_excl >= int(guards_cfg.get("heckman_min_excluded", 10))
+            and ref_design["n_obs"] >= int(guards_cfg.get("heckman_min_analytic", 30))
+        ):
+            cov_cols = [c["col"] for c in ref_spec.get("covariates", []) if c.get("type", "numeric") != "categorical"]
+            fs_covs = sel_cfg.get("first_stage_covariates") or cov_cols
+            excl_cols = sel_cfg.get("exclusion_restriction_cols") or []
+            heckman_out = run_heckman_two_step(
+                self.columns,
+                sel_indicator,
+                ref_design["valid_indices"],
+                ref_design["X"],
+                ref_design["y"],
+                ref_design["col_meta"],
+                fs_covs,
+                excl_cols,
+            )
+        else:
+            heckman_out = {
+                "activated": False,
+                "reason": f"Complete or minimal exclusion sample (N_excluded={n_excl} < {guards_cfg.get('heckman_min_excluded', 10)}).",
+            }
+
+        res = {
+            "ok": True,
+            "common_sample_locked": bool(guards_cfg.get("common_sample_lock", True)),
+            "models": models_out,
+            "ad_profiles": ad_profiles,
+            "heckman": heckman_out,
+        }
+        self.last_outputs["stage3"] = res
+        return res
+
+    def run_stage_4_spatial_econometrics(self, recipe: Dict[str, Any], run_id: int = 1) -> Dict[str, Any]:
+        """Stage 4: Multi-W Moran/LISA, Anselin/Elhorst, ML SAR/SEM/SDM & Krinsky-Robb spillover."""
+        self.cache.start_run(run_id)
+        prep = self._prepare_y_and_masks(recipe)
+        y_info = prep["y_info"]
+        analytic_base = prep["analytic_base"]
+        guards_cfg = recipe.get("guards_cfg", {})
+        tau = int(guards_cfg.get("sparse_min_cell", 5))
+        sp_cfg = recipe.get("spatial_engine", {})
+        active_specs = [m for m in recipe.get("models", []) if m.get("active", True)]
+        if not active_specs:
+            return {"ok": False, "reason": "No active model specification."}
+
+        target_mid = sp_cfg.get("active_model_id")
+        ref_spec = next((m for m in active_specs if m["id"] == target_mid), active_specs[-1])
+        common_mask = None
+        if guards_cfg.get("common_sample_lock", True):
+            common_mask = compute_common_sample_mask(
+                self.columns, self.dist_results, active_specs, y_info, analytic_base, tau
+            )
+
+        design = build_model_design(
+            self.columns, self.dist_results, ref_spec, y_info, analytic_base, tau, common_mask
+        )
+        if design["n_obs"] <= design["k_params"] + 4:
+            return {"ok": False, "reason": f"Too few observations (N={design['n_obs']}) for spatial ML estimation."}
+
+        coords_v = self.obs_xy[design["valid_indices"]]
+        w_configs = sp_cfg.get("weights") or [
+            {"id": "knn5", "type": "knn", "k": 5, "dedup_colocated": False},
+            {"id": "idw_auto", "type": "idw", "power": 1.0, "cutoff_mode": "auto_connectivity"},
+        ]
+
+        sp_key = hash_payload({
+            "mid": ref_spec["id"],
+            "n": design["n_obs"],
+            "k": design["k_params"],
+            "w": w_configs,
+            "kr": int(sp_cfg.get("krinsky_robb_draws", 1000)),
+            "fdr": bool(sp_cfg.get("lisa_fdr", True)),
+            "x_hash": hash_payload(design["X"][:10].tolist()),
+        })
+
+        col_names = [m["name"] for m in design["col_meta"]]
+        res = self.cache.get_or_compute(
+            "spatial",
+            sp_key,
+            lambda: run_spatial_pipeline(
+                design["X"],
+                design["y"],
+                col_names,
+                coords_v,
+                w_configs,
+                krinsky_robb_draws=int(sp_cfg.get("krinsky_robb_draws", 1000)),
+                lisa_fdr=bool(sp_cfg.get("lisa_fdr", True)),
+            ),
+            run_id=run_id,
+        )
+        res["model_id"] = ref_spec["id"]
+        res["valid_indices"] = design["valid_indices"].tolist()
+        self.last_outputs["stage4"] = res
+        return res
+
+    def run_stage_5_gwr(
+        self,
+        recipe: Dict[str, Any],
+        run_id: int = 1,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+    ) -> Dict[str, Any]:
+        """Stage 5: Singularity-Guarded Adaptive Bisquare GWR with native-scale local estimates."""
+        self.cache.start_run(run_id)
+        prep = self._prepare_y_and_masks(recipe)
+        y_info = prep["y_info"]
+        analytic_base = prep["analytic_base"]
+        guards_cfg = recipe.get("guards_cfg", {})
+        tau = int(guards_cfg.get("sparse_min_cell", 5))
+        sp_cfg = recipe.get("spatial_engine", {})
+        gwr_cfg = sp_cfg.get("gwr", {})
+        active_specs = [m for m in recipe.get("models", []) if m.get("active", True)]
+        if not active_specs:
+            return {"ok": False, "reason": "No active model specification."}
+
+        focal_mid = gwr_cfg.get("focal_model_id") or sp_cfg.get("active_model_id")
+        ref_spec = next((m for m in active_specs if m["id"] == focal_mid), active_specs[-1])
+        common_mask = None
+        if guards_cfg.get("common_sample_lock", True):
+            common_mask = compute_common_sample_mask(
+                self.columns, self.dist_results, active_specs, y_info, analytic_base, tau
+            )
+
+        design = build_model_design(
+            self.columns, self.dist_results, ref_spec, y_info, analytic_base, tau, common_mask
+        )
+        coords_v = self.obs_xy[design["valid_indices"]]
+
+        res = fit_adaptive_gwr(
+            design["X"],
+            design["y"],
+            design["col_meta"],
+            coords_v,
+            gwr_cfg=gwr_cfg,
+            progress_cb=progress_cb,
+        )
+        if res.get("ok"):
+            res["model_id"] = ref_spec["id"]
+            res["valid_indices"] = design["valid_indices"].tolist()
+        self.last_outputs["stage5"] = res
+        return res
+
+    def generate_m1_m4(
+        self,
+        covariates: List[Dict[str, Any]],
+        spatial_targets: List[Dict[str, Any]],
+        default_rings: Optional[List[float]] = None,
+        default_cutoff_m: float = 300.0,
+    ) -> List[Dict[str, Any]]:
+        """Expose 1-click editable M1-M4 generator."""
+        return generate_m1_m4_specs(covariates, spatial_targets, default_rings, default_cutoff_m)
+
+    def export_publication_bundle(self, recipe: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate LaTeX, CSV, QGIS GeoJSON, Reproducibility Manifest, and ZIP bytes."""
+        prep = self._prepare_y_and_masks(recipe)
+        y_info = prep["y_info"]
+        ds = recipe.get("dataset_schema", {})
+        id_col = ds.get("row_id_col")
+        row_ids = self.columns[id_col] if (id_col and id_col in self.columns) else list(range(self.n_rows))
+
+        s3 = self.last_outputs.get("stage3", {})
+        s4 = self.last_outputs.get("stage4", {})
+        s5 = self.last_outputs.get("stage5", {})
+        s2 = self.last_outputs.get("stage2", {})
+
+        ols_models = [m for m in s3.get("models", []) if "params" in m]
+        sp_mid = recipe.get("spatial_engine", {}).get("active_model_id")
+        active_ols = next((m for m in ols_models if m["model_id"] == sp_mid), ols_models[-1] if ols_models else None)
+
+        analytic_indices = active_ols["valid_indices"] if active_ols else None
+        geojson = build_qgis_geojson(
+            [None if not math.isfinite(v) else float(v) for v in self.lat],
+            [None if not math.isfinite(v) else float(v) for v in self.lon],
+            row_ids,
+            [None if not math.isfinite(v) else float(v) for v in y_info["y_raw"]],
+            [None if not math.isfinite(v) else float(v) for v in y_info["y"]],
+            self.dist_results,
+            active_ols=active_ols,
+            spatial_res=s4 if s4.get("ok") else None,
+            gwr_res=s5 if s5.get("ok") else None,
+            analytic_indices=analytic_indices,
+        )
+
+        tables: Dict[str, List[Dict[str, Any]]] = {}
+        if s2.get("descriptives", {}).get("ok"):
+            tables["descriptives"] = s2["descriptives"].get("descriptives", [])
+            tables["normality"] = s2["descriptives"].get("normality", [])
+        if s2.get("composition", {}).get("ok"):
+            tables["stepwise_composition"] = s2["composition"].get("steps", [])
+            tables["gelbach_ovb"] = s2["composition"].get("gelbach", [])
+        if ols_models:
+            reg_rows = []
+            for m in ols_models:
+                for p in m["params"]:
+                    reg_rows.append({"model_id": m["model_id"], "model_name": m["model_name"], **p})
+            tables["ols_coefficients"] = reg_rows
+            tables["ols_diagnostics"] = [
+                {
+                    "model_id": m["model_id"],
+                    "n_obs": m["n_obs"],
+                    "r2": m["r2"],
+                    "adj_r2": m["adj_r2"],
+                    "aic": m["aic"],
+                    **{k: v for k, v in m["diagnostics"].items() if isinstance(v, (int, float, str, type(None)))},
+                }
+                for m in ols_models
+            ]
+        if s3.get("heckman", {}).get("activated"):
+            tables["heckman_selection"] = s3["heckman"].get("comparison", [])
+        if s4.get("ok"):
+            tables["spatial_model_comparison"] = s4.get("model_comparison", [])
+            tables["weights_robustness"] = s4.get("weights_robustness", [])
+            tables["lesage_pace_sar"] = [
+                {
+                    "variable": r["variable"],
+                    "direct": r["direct"]["est"], "direct_se": r["direct"]["se"], "direct_p": r["direct"]["p"],
+                    "indirect": r["indirect"]["est"], "indirect_se": r["indirect"]["se"], "indirect_p": r["indirect"]["p"],
+                    "total": r["total"]["est"], "total_se": r["total"]["se"], "total_p": r["total"]["p"],
+                    "spillover_pct": r["spillover_share_pct"],
+                }
+                for r in s4.get("impacts_sar", [])
+            ]
+        if s5.get("ok"):
+            tables["gwr_parameter_summary"] = s5.get("param_summaries", [])
+
+        latex_tables = {}
+        if ols_models:
+            latex_tables["regression_comparison"] = generate_multi_model_latex(ols_models)
+            latex_tables["regression_comparison_pct"] = generate_multi_model_latex(ols_models, show_pct_for_dummies=True)
+
+        manifest = {
+            "tool": "GeoSpec Parametric Spatial Econometric Workbench",
+            "version": "1.0.0",
+            "exported_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "n_rows_total": self.n_rows,
+            "n_geocoded": int(np.sum(self.valid_coord_mask)),
+            "projection": self.proj.metadata() if self.proj else {},
+            "stage1_summary": self.last_outputs.get("stage1", {}).get("summary", []),
+            "boxcox_info": y_info.get("boxcox_info"),
+        }
+
+        zip_bytes = build_zip_bundle(tables, latex_tables, geojson, recipe, manifest)
+        return {
+            "ok": True,
+            "latex_main": latex_tables.get("regression_comparison", ""),
+            "latex_pct": latex_tables.get("regression_comparison_pct", ""),
+            "geojson": geojson,
+            "manifest": manifest,
+            "zip_bytes": zip_bytes,
+        }
