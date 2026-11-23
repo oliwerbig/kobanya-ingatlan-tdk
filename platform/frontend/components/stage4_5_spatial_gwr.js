@@ -358,10 +358,11 @@ export function renderStage5(container, ctx) {
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
         <button class="btn btn-primary" id="btnExportZip">📦 Teljes Tudományos Csomag (.ZIP)</button>
+        <button class="btn" id="btnExportWorkspaceS5">💾 Teljes Projekt (.geospec.json)</button>
         <button class="btn" id="btnExportLatex">📋 Overleaf Booktabs LaTeX (.tex)</button>
         <button class="btn" id="btnExportGeojson">🗺️ QGIS Gazdagított GeoJSON</button>
         <button class="btn" id="btnExportOsmBundleS5">💾 Offline OSM Pillanatfelvétel (.osm_bundle.json)</button>
-        <button class="btn" id="btnExportRecipe">🧪 experiment_recipe.json Mentése</button>
+        <button class="btn" id="btnExportRecipe">💾 Recept Mentése (_recipe.json)</button>
       </div>
     </div>
   `;
@@ -378,6 +379,7 @@ export function renderStage5(container, ctx) {
   });
 
   container.querySelector("#btnExportZip").addEventListener("click", () => actions.exportBundle("zip"));
+  container.querySelector("#btnExportWorkspaceS5").addEventListener("click", () => actions.exportWorkspace());
   container.querySelector("#btnExportLatex").addEventListener("click", () => actions.copyLatexTable());
   container.querySelector("#btnExportGeojson").addEventListener("click", () => actions.exportBundle("geojson"));
   container.querySelector("#btnExportOsmBundleS5").addEventListener("click", () => actions.exportOsmBundle());

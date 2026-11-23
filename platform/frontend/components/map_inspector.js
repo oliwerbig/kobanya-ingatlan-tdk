@@ -314,6 +314,15 @@ export class MapInspector {
     this._flushRoute();
   }
 
+  clearObservations() {
+    this.obsFeatures = [];
+    this.selectedObsIdx = null;
+    this.routeFeatures = [];
+    this._flushObs();
+    this._flushRoute();
+    this._renderLegend({});
+  }
+
   _flushTargets() {
     if (!this.ready) return;
     const merged = [];

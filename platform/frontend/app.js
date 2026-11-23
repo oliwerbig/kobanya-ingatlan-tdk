@@ -6,16 +6,31 @@ import { renderStage1 } from "./components/stage1_data_osm.js";
 import { renderStage2 } from "./components/stage2_composition.js";
 import { patchStage3ResultsOnly, renderStage3 } from "./components/stage3_model_composer.js";
 import { renderStage4, renderStage5 } from "./components/stage4_5_spatial_gwr.js";
-import { buildOsmBundle } from "./gis/osm_idb_cache.js";
+import { buildOsmBundle, parseOsmBundle } from "./gis/osm_idb_cache.js";
 import { fetchStreetGraphOSM, fetchTargetOSM } from "./gis/overpass_client.js";
 import { DagClient } from "./state/dag_client.js";
-import { createDefaultRecipe, inferColumnProfile } from "./state/recipe_store.js";
+import {
+  buildWorkspaceBundle,
+  createDefaultRecipe,
+  inferColumnProfile,
+  inferGeojsonTargetDefaults,
+  makeUniqueTargetId,
+  parseCSVText,
+  parseGeoJSONDataset,
+  parseWorkspaceBundle,
+  prepareIncomingBatch,
+  readTextWithEncodingFallback,
+  slugifyTitle,
+} from "./state/recipe_store.js";
 import { escapeHtml, sanitizeRecipe } from "./utils/sanitize.js";
 
 const state = {
   activeStage: 1,
   recipe: createDefaultRecipe(),
   fileName: "",
+  recipeFileName: "",
+  workspaceFileName: "",
+  osmBundleFileName: "",
   headers: [],
   columns: null,
   nRows: 0,
@@ -40,7 +55,7 @@ const state = {
   pipelineRunning: false,
   wasmStatus: "booting",
   wasmMessage: "WASM indítása...",
-  logLine: "Várakozás saját CSV / GeoJSON adatbázis betöltésére.",
+  logLine: "Várakozás saját CSV / GeoJSON adatbázis, recept vagy .geospec.json projekt betöltésére.",
 };
 
 let debounceTimer = null;
@@ -187,69 +202,66 @@ const actions = {
     else if (state.activeStage === 5) renderStage5(pane, ctx);
   },
 
-  async onDatasetParsed(fileName, parsed, colProfile, guesses) {
+  async onDatasetParsed(fileName, parsed, colProfile, guesses, { skipSync = false, hasPendingRecipe = false } = {}) {
     datasetSeq++;
     s1Seq++; s2Seq++; s3Seq++; s4Seq++; s5Seq++;
+    const hadPrevDataset = Boolean(state.columns);
     state.fileName = fileName;
+    state.workspaceFileName = "";
     state.headers = parsed.headers;
     state.columns = parsed.columns;
     state.nRows = parsed.nRows;
     state.colProfile = colProfile;
     resetAnalysisResults();
     state.targetPreviews = {};
-    state.rawOsmTargets = {};
-    state.rawGeojsonTargets = {};
-    state.rawStreetGraphs = {};
     state.osmFilterQuery = {};
+    if (hadPrevDataset) {
+      state.rawOsmTargets = {};
+      state.rawGeojsonTargets = {};
+      state.rawStreetGraphs = {};
+      state.osmBundleFileName = "";
+    }
     mapInspector.clearTargets();
     mapInspector.clearRoute();
 
-    const ds = state.recipe.dataset_schema;
-    if (!ds.lat_col || !parsed.columns[ds.lat_col]) ds.lat_col = guesses.latGuess;
-    if (!ds.lon_col || !parsed.columns[ds.lon_col]) ds.lon_col = guesses.lonGuess;
-    if (!ds.row_id_col || !parsed.columns[ds.row_id_col]) ds.row_id_col = guesses.idGuess;
-    if (!ds.y_spec.num_col || !parsed.columns[ds.y_spec.num_col]) ds.y_spec.num_col = guesses.yGuess;
+    if (!hasPendingRecipe) {
+      const ds = state.recipe.dataset_schema;
+      if ((!ds.lat_col || !parsed.columns[ds.lat_col]) && guesses.latGuess) ds.lat_col = guesses.latGuess;
+      if ((!ds.lon_col || !parsed.columns[ds.lon_col]) && guesses.lonGuess) ds.lon_col = guesses.lonGuess;
+      if ((!ds.row_id_col || !parsed.columns[ds.row_id_col]) && guesses.idGuess) ds.row_id_col = guesses.idGuess;
+      if ((!ds.y_spec.num_col || !parsed.columns[ds.y_spec.num_col]) && guesses.yGuess) ds.y_spec.num_col = guesses.yGuess;
 
-    const specA = state.recipe.models[0];
-    if (specA && specA.covariates.length === 0) {
-      const skip = new Set([ds.lat_col, ds.lon_col, ds.row_id_col, ds.y_spec.num_col, ds.y_spec.den_col].filter(Boolean));
-      for (const h of parsed.headers) {
-        if (skip.has(h)) continue;
-        if (colProfile[h]?.isNumeric && specA.covariates.length < 3) {
-          specA.covariates.push({ col: h, type: "numeric", transform: "raw" });
+      const specA = state.recipe.models[0];
+      if (
+        !state.recipeFileName &&
+        !state.workspaceFileName &&
+        state.recipe.models.length === 1 &&
+        specA &&
+        specA.id === "spec_a" &&
+        specA.covariates.length === 0
+      ) {
+        const skip = new Set([ds.lat_col, ds.lon_col, ds.row_id_col, ds.y_spec.num_col, ds.y_spec.den_col].filter(Boolean));
+        for (const h of parsed.headers) {
+          if (skip.has(h)) continue;
+          if (colProfile[h]?.isNumeric && specA.covariates.length < 3) {
+            specA.covariates.push({ col: h, type: "numeric", transform: "raw" });
+          }
         }
       }
     }
 
-    await this.syncDatasetToWorker();
-  },
-
-  async loadSampleStudy(sample) {
-    datasetSeq++;
-    s1Seq++; s2Seq++; s3Seq++; s4Seq++; s5Seq++;
-    state.fileName = sample.fileName;
-    state.headers = sample.parsed.headers;
-    state.columns = sample.parsed.columns;
-    state.nRows = sample.parsed.nRows;
-    state.colProfile = sample.profile;
-    state.recipe = sanitizeRecipe(sample.recipe, createDefaultRecipe());
-    state.activeSpecId = state.recipe.models?.[3]?.id || state.recipe.models?.[0]?.id || "m4_ad";
-    resetAnalysisResults();
-    state.targetPreviews = {};
-    state.rawOsmTargets = {};
-    state.rawGeojsonTargets = { ...(sample.geojsonTargets || {}) };
-    state.rawStreetGraphs = { ...(sample.streetGraphs || {}) };
-    state.osmFilterQuery = {};
-    mapInspector.clearTargets();
-    mapInspector.clearRoute();
-
-    await this.syncDatasetToWorker();
-    setLog("Szintetikus városi Minta Sandbox betöltve (2 célpont + utcahálózat) — nyomd meg a 'Teljes Futtatás' gombot!");
+    if (!skipSync) {
+      await this.syncDatasetToWorker();
+    }
   },
 
   async syncDatasetToWorker() {
     const ds = state.recipe.dataset_schema;
-    if (!state.columns || !ds.lat_col || !ds.lon_col) {
+    if (!state.columns || !ds.lat_col || !ds.lon_col || !state.columns[ds.lat_col] || !state.columns[ds.lon_col]) {
+      state.datasetInfo = null;
+      if (state.columns) {
+        setLog("Add meg az érvényes szélességi (lat) és hosszúsági (lon) oszlopokat az 1B szekcióban, majd kattints a 'Séma Rögzítése' gombra.");
+      }
       this.render();
       return;
     }
@@ -302,8 +314,10 @@ const actions = {
       this.render();
     } catch (err) {
       if (mySeq !== datasetSeq) return;
+      state.datasetInfo = null;
       setLog(`Séma hiba: ${err.message}`);
       alert(`Séma hiba: ${err.message}`);
+      this.render();
     }
   },
 
@@ -311,6 +325,7 @@ const actions = {
     const myDsSeq = datasetSeq;
     state.rawGeojsonTargets[targetId] = geojsonObj;
     delete state.rawOsmTargets[targetId];
+    state.stage1Res = null;
     if (!state.datasetInfo) return;
     await dag.waitUntilReady();
     if (myDsSeq !== datasetSeq) return;
@@ -456,13 +471,14 @@ const actions = {
       rawGeojsonTargets: state.rawGeojsonTargets,
       rawStreetGraphs: state.rawStreetGraphs,
     });
-    this.downloadText("geospec_snapshot.osm_bundle.json", JSON.stringify(bundle), "application/json");
-    setLog("Offline OSM & hálózati pillanatfelvétel (.osm_bundle.json) elmentve.");
+    const slug = slugifyTitle(state.recipe?.recipe_meta?.title, "geospec_snapshot");
+    this.downloadText(`${slug}.osm_bundle.json`, JSON.stringify(bundle), "application/json");
+    setLog(`Offline OSM & hálózati pillanatfelvétel (${slug}.osm_bundle.json) elmentve.`);
   },
 
-  async importOsmBundle(parsedBundle) {
+  async importOsmBundle(parsedBundle, { fileName = "", skipIngest = false, skipRender = false } = {}) {
     if (!parsedBundle) return;
-    await dag.waitUntilReady();
+    if (fileName) state.osmBundleFileName = fileName;
 
     for (const [tid, entry] of Object.entries(parsedBundle.targets || {})) {
       const payload = entry?.payload || entry?.raw;
@@ -493,7 +509,20 @@ const actions = {
           bbox_buffer_m: Number(cfg.bbox_buffer_m) || 800,
         });
       }
-      if (state.datasetInfo) {
+    }
+
+    for (const [prof, sg] of Object.entries(parsedBundle.street_graphs || {})) {
+      if (!sg) continue;
+      state.rawStreetGraphs[prof] = sg;
+    }
+
+    if (state.datasetInfo && !skipIngest) {
+      await dag.waitUntilReady();
+      for (const [tid, entry] of Object.entries(parsedBundle.targets || {})) {
+        const payload = entry?.payload || entry?.raw;
+        if (!payload) continue;
+        const cfg = entry.target_cfg || {};
+        const srcKind = entry.source_kind === "geojson" || cfg.source === "geojson" ? "geojson" : "osm";
         const tgt = state.recipe.spatial_targets.find((t) => t.id === tid);
         const prev = await dag.call("ingest_target_raw", {
           target_id: tid,
@@ -503,20 +532,18 @@ const actions = {
         });
         state.targetPreviews[tid] = prev;
       }
-    }
-
-    for (const [prof, sg] of Object.entries(parsedBundle.street_graphs || {})) {
-      if (!sg) continue;
-      state.rawStreetGraphs[prof] = sg;
-      if (state.datasetInfo) {
+      for (const [prof, sg] of Object.entries(parsedBundle.street_graphs || {})) {
+        if (!sg) continue;
         await dag.call("ingest_street_graph", { profile: prof, graph_json: sg });
       }
     }
 
     resetAnalysisResults();
     this.refreshMapTargets();
-    setLog(`Offline OSM pillanatfelvétel betöltve (${Object.keys(parsedBundle.targets || {}).length} célpont, ${Object.keys(parsedBundle.street_graphs || {}).length} úthálózat).`);
-    this.render();
+    setLog(
+      `Offline OSM pillanatfelvétel betöltve (${Object.keys(parsedBundle.targets || {}).length} célpont, ${Object.keys(parsedBundle.street_graphs || {}).length} úthálózat).`
+    );
+    if (!skipRender) this.render();
   },
 
   async runStage1() {
@@ -795,7 +822,10 @@ const actions = {
   },
 
   async exportBundle(kind = "zip") {
-    if (!state.datasetInfo) return;
+    if (!state.datasetInfo) {
+      alert("Előbb tölts be egy érvényes adatbázist a .ZIP / GeoJSON exporthoz! (A recept és a projekt már adatbázis nélkül is menthető.)");
+      return;
+    }
     try {
       await dag.waitUntilReady();
       setLog("Publikációs export csomag összeállítása...");
@@ -814,15 +844,16 @@ const actions = {
         : null;
 
       const bundle = await dag.call("export_bundle", { recipe: state.recipe, osm_bundle });
+      const slug = slugifyTitle(state.recipe?.recipe_meta?.title, "geospec");
       if (kind === "geojson") {
-        this.downloadText("geospec_enriched.geojson", JSON.stringify(bundle.geojson, null, 2), "application/geo+json");
+        this.downloadText(`${slug}_enriched.geojson`, JSON.stringify(bundle.geojson, null, 2), "application/geo+json");
       } else {
         const bin = Uint8Array.from(atob(bundle.zip_base64), (c) => c.charCodeAt(0));
         const blob = new Blob([bin], { type: "application/zip" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `geospec_publication_bundle_${Date.now()}.zip`;
+        a.download = `${slug}_publication_bundle_${Date.now()}.zip`;
         a.click();
         URL.revokeObjectURL(url);
       }
@@ -833,34 +864,267 @@ const actions = {
   },
 
   exportRecipe() {
-    this.downloadText("experiment_recipe.json", JSON.stringify(state.recipe, null, 2), "application/json");
-    setLog("experiment_recipe.json mentve (nyers adatok nélkül).");
+    const slug = slugifyTitle(state.recipe?.recipe_meta?.title, "experiment");
+    const fileName = `${slug}_recipe.json`;
+    this.downloadText(fileName, JSON.stringify(state.recipe, null, 2), "application/json");
+    setLog(`${fileName} mentve (nyers adatok nélkül).`);
   },
 
-  importRecipe(loadedRecipe) {
+  exportWorkspace() {
+    const hasSnap =
+      Object.keys(state.rawOsmTargets).length > 0 ||
+      Object.keys(state.rawGeojsonTargets).length > 0 ||
+      Object.keys(state.rawStreetGraphs).length > 0;
+    const osmBundle = hasSnap
+      ? buildOsmBundle({
+          bbox: state.datasetInfo?.bbox || null,
+          targets: state.recipe.spatial_targets || [],
+          rawOsmTargets: state.rawOsmTargets,
+          rawGeojsonTargets: state.rawGeojsonTargets,
+          rawStreetGraphs: state.rawStreetGraphs,
+        })
+      : null;
+
+    const ws = buildWorkspaceBundle({
+      recipe: state.recipe,
+      fileName: state.fileName,
+      headers: state.headers,
+      columns: state.columns,
+      nRows: state.nRows,
+      osmBundle,
+      activeSpecId: state.activeSpecId,
+      covType: state.covType,
+      showPct: state.showPct,
+    });
+    const slug = slugifyTitle(state.recipe?.recipe_meta?.title, "geospec_study");
+    const fileName = `${slug}.geospec.json`;
+    this.downloadText(fileName, JSON.stringify(ws, null, 2), "application/json");
+    setLog(`Teljes projekt mentve: ${fileName}`);
+  },
+
+  async importRecipe(loadedRecipe, { fileName = "", skipSync = false, preserveSnapshots = true } = {}) {
     s1Seq++; s2Seq++; s3Seq++; s4Seq++; s5Seq++;
     const clean = sanitizeRecipe(loadedRecipe, createDefaultRecipe());
     state.recipe = clean;
-    state.activeSpecId = clean.models?.[0]?.id || "spec_a";
+    if (fileName) state.recipeFileName = fileName;
+    state.workspaceFileName = "";
+    const modelIds = new Set((clean.models || []).map((m) => m.id));
+    const preferredSpec = clean.spatial_engine?.active_model_id || clean.spatial_engine?.gwr?.focal_model_id;
+    state.activeSpecId =
+      preferredSpec && modelIds.has(preferredSpec)
+        ? preferredSpec
+        : clean.models?.[0]?.id || "spec_a";
+
+    resetAnalysisResults();
+    state.targetPreviews = {};
+    state.osmFilterQuery = {};
+    mapInspector.clearTargets();
+    mapInspector.clearRoute();
+
+    if (!preserveSnapshots) {
+      state.rawOsmTargets = {};
+      state.rawGeojsonTargets = {};
+      state.rawStreetGraphs = {};
+      state.osmBundleFileName = "";
+    } else {
+      const validIds = new Set((clean.spatial_targets || []).map((t) => t.id));
+      for (const tid of Object.keys(state.rawOsmTargets)) {
+        if (!validIds.has(tid)) delete state.rawOsmTargets[tid];
+      }
+      for (const tid of Object.keys(state.rawGeojsonTargets)) {
+        if (!validIds.has(tid)) delete state.rawGeojsonTargets[tid];
+      }
+    }
+
+    if (loadedRecipe && typeof loadedRecipe.osm_bundle === "object" && loadedRecipe.osm_bundle !== null) {
+      try {
+        const parsedEmbeddedBundle = parseOsmBundle(loadedRecipe.osm_bundle);
+        await this.importOsmBundle(parsedEmbeddedBundle, {
+          fileName: fileName || state.osmBundleFileName,
+          skipIngest: true,
+          skipRender: true,
+        });
+      } catch (err) {
+        console.warn("Beágyazott osm_bundle figyelmen kívül hagyva:", err);
+      }
+    }
+
+    if (state.columns) {
+      const { profile, guesses } = inferColumnProfile(state.headers, state.columns);
+      state.colProfile = profile;
+      const ds = state.recipe.dataset_schema;
+      if ((!ds.lat_col || !state.columns[ds.lat_col]) && guesses.latGuess) ds.lat_col = guesses.latGuess;
+      if ((!ds.lon_col || !state.columns[ds.lon_col]) && guesses.lonGuess) ds.lon_col = guesses.lonGuess;
+      if ((!ds.row_id_col || !state.columns[ds.row_id_col]) && guesses.idGuess) ds.row_id_col = guesses.idGuess;
+      if ((!ds.y_spec.num_col || !state.columns[ds.y_spec.num_col]) && guesses.yGuess) ds.y_spec.num_col = guesses.yGuess;
+    }
+
+    setLog(`Recept betöltve: ${clean.recipe_meta?.title || fileName || "recept"}`);
+    if (skipSync) return;
+
+    if (state.columns) {
+      await this.syncDatasetToWorker();
+    } else {
+      if (state.activeStage > 1) state.activeStage = 1;
+      this.render();
+    }
+  },
+
+  async importWorkspace(rawWorkspace, { fileName = "", skipSync = false } = {}) {
+    const parsed = parseWorkspaceBundle(rawWorkspace);
+    datasetSeq++;
+    s1Seq++; s2Seq++; s3Seq++; s4Seq++; s5Seq++;
+
     resetAnalysisResults();
     state.targetPreviews = {};
     state.rawOsmTargets = {};
     state.rawGeojsonTargets = {};
     state.rawStreetGraphs = {};
     state.osmFilterQuery = {};
+    state.osmBundleFileName = "";
     mapInspector.clearTargets();
     mapInspector.clearRoute();
 
-    setLog(`Recept betöltve: ${clean.recipe_meta?.title || "experiment_recipe.json"}`);
-    if (state.columns) {
-      const { profile, guesses } = inferColumnProfile(state.headers, state.columns);
+    state.recipe = parsed.recipe;
+    state.workspaceFileName = fileName || "workspace.geospec.json";
+    state.recipeFileName = fileName || "workspace.geospec.json";
+    state.activeSpecId = parsed.ui_state.activeSpecId;
+    state.covType = parsed.ui_state.covType;
+    state.showPct = parsed.ui_state.showPct;
+
+    if (parsed.dataset) {
+      state.fileName = parsed.dataset.fileName;
+      state.headers = parsed.dataset.headers;
+      state.columns = parsed.dataset.columns;
+      state.nRows = parsed.dataset.nRows;
+      const { profile } = inferColumnProfile(state.headers, state.columns);
       state.colProfile = profile;
-      const ds = state.recipe.dataset_schema;
-      if (!state.columns[ds.lat_col]) ds.lat_col = guesses.latGuess;
-      if (!state.columns[ds.lon_col]) ds.lon_col = guesses.lonGuess;
-      this.syncDatasetToWorker();
     } else {
+      state.fileName = "";
+      state.headers = [];
+      state.columns = null;
+      state.nRows = 0;
+      state.colProfile = {};
+      state.datasetInfo = null;
+      mapInspector.clearObservations();
+    }
+
+    if (parsed.osm_bundle) {
+      await this.importOsmBundle(parsed.osm_bundle, {
+        fileName: fileName || "workspace_osm_bundle",
+        skipIngest: true,
+        skipRender: true,
+      });
+    }
+
+    setLog(`Projekt betöltve: ${state.recipe.recipe_meta?.title || fileName || ".geospec.json"}`);
+    if (skipSync) return;
+
+    if (state.columns) {
+      await this.syncDatasetToWorker();
+    } else {
+      if (state.activeStage > 1) state.activeStage = 1;
       this.render();
+    }
+  },
+
+  async handleIncomingFiles(fileList) {
+    const files = Array.from(fileList || []).filter(Boolean);
+    if (!files.length) return;
+    try {
+      const entries = [];
+      for (const f of files) {
+        const text = await readTextWithEncodingFallback(f);
+        entries.push({ fileName: f.name, text });
+      }
+      const plan = prepareIncomingBatch(entries, { hasDataset: Boolean(state.columns) });
+      const hasPendingRecipe = plan.some((item) => item.kind === "recipe");
+      const needsFullWorkerSync =
+        !state.datasetInfo ||
+        plan.some((item) => ["workspace", "dataset_csv", "dataset_geojson", "recipe"].includes(item.kind));
+      const summaryMsgs = [];
+
+      for (const item of plan) {
+        if (item.kind === "workspace") {
+          await this.importWorkspace(item.data, { fileName: item.fileName, skipSync: true });
+          summaryMsgs.push(`Projekt: ${item.fileName}`);
+        } else if (item.kind === "dataset_csv" || item.kind === "dataset_geojson") {
+          const parsed =
+            item.kind === "dataset_csv"
+              ? parseCSVText(item.text)
+              : parseGeoJSONDataset(item.data);
+          const { profile, guesses } = inferColumnProfile(parsed.headers, parsed.columns);
+          await this.onDatasetParsed(item.fileName, parsed, profile, guesses, {
+            skipSync: true,
+            hasPendingRecipe,
+          });
+          summaryMsgs.push(`Adat: ${item.fileName} (N=${parsed.nRows})`);
+        } else if (item.kind === "recipe") {
+          await this.importRecipe(item.data, {
+            fileName: item.fileName,
+            skipSync: true,
+            preserveSnapshots: true,
+          });
+          summaryMsgs.push(`Recept: ${item.data.recipe_meta?.title || item.fileName}`);
+        } else if (item.kind === "osm_bundle") {
+          const parsedBundle = parseOsmBundle(item.data);
+          await this.importOsmBundle(parsedBundle, {
+            fileName: item.fileName,
+            skipIngest: needsFullWorkerSync,
+            skipRender: true,
+          });
+          summaryMsgs.push(`OSM csomag: ${item.fileName}`);
+        } else if (item.kind === "target_geojson") {
+          const tid = makeUniqueTargetId(
+            item.fileName.replace(/\.[^.]+$/, ""),
+            state.recipe.spatial_targets
+          );
+          const { geometry_handling, inside_is_zero } = inferGeojsonTargetDefaults(item.data);
+          state.recipe.spatial_targets.push({
+            id: tid,
+            name: `GeoJSON: ${item.fileName}`,
+            source: "geojson",
+            excluded_osm_ids: [],
+            geometry_handling,
+            inside_is_zero,
+            distance_modes: "euclidean",
+            routing_profile: "walk",
+            max_snap_distance_m: 300,
+          });
+          if (needsFullWorkerSync) {
+            state.rawGeojsonTargets[tid] = item.data;
+          } else {
+            try {
+              await this.ingestSingleGeojsonTarget(tid, item.data);
+            } catch (ingestErr) {
+              const rmIdx = state.recipe.spatial_targets.findIndex((t) => t.id === tid);
+              if (rmIdx >= 0) state.recipe.spatial_targets.splice(rmIdx, 1);
+              delete state.rawGeojsonTargets[tid];
+              throw ingestErr;
+            }
+          }
+          summaryMsgs.push(`GeoJSON célpont (${tid}): ${item.fileName}`);
+        }
+      }
+
+      if (state.columns && needsFullWorkerSync) {
+        await this.syncDatasetToWorker();
+      } else {
+        if (!state.columns && state.activeStage > 1) state.activeStage = 1;
+        this.render();
+      }
+      if (summaryMsgs.length) {
+        if (state.columns && !state.datasetInfo) {
+          if (!state.logLine.startsWith("Séma hiba:")) {
+            setLog(`Betöltve (${summaryMsgs.join(" | ")}) — jelöld ki az érvényes lat/lon oszlopokat az 1B szekcióban!`);
+          }
+        } else {
+          setLog(`Betöltve (${summaryMsgs.join(" | ")})`);
+        }
+      }
+    } catch (err) {
+      setLog(`Betöltési hiba: ${err.message}`);
+      alert(`Fájl betöltési hiba: ${err.message}`);
     }
   },
 
@@ -939,13 +1203,44 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   document.getElementById("btnRunAll").addEventListener("click", () => actions.runFullPipeline());
-  document.getElementById("btnTopRecipeExport").addEventListener("click", () => actions.exportRecipe());
-  document.getElementById("btnTopZipExport").addEventListener("click", () => actions.exportBundle("zip"));
+
+  const fileTopLoadAny = document.getElementById("fileTopLoadAny");
+  document.getElementById("btnTopLoadAny")?.addEventListener("click", () => fileTopLoadAny?.click());
+  fileTopLoadAny?.addEventListener("change", (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = "";
+    if (files.length) actions.handleIncomingFiles(files);
+  });
+
+  const fileTopRecipeImport = document.getElementById("fileTopRecipeImport");
+  document.getElementById("btnTopRecipeImport")?.addEventListener("click", () => fileTopRecipeImport?.click());
+  fileTopRecipeImport?.addEventListener("change", (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = "";
+    if (files.length) actions.handleIncomingFiles(files);
+  });
+
+  document.getElementById("btnTopRecipeExport")?.addEventListener("click", () => actions.exportRecipe());
+  document.getElementById("btnTopProjectExport")?.addEventListener("click", () => actions.exportWorkspace());
+  document.getElementById("btnTopZipExport")?.addEventListener("click", () => actions.exportBundle("zip"));
   document.getElementById("btnThemeToggle").addEventListener("click", () => {
     const nextDark = !document.body.classList.contains("dark-theme");
     applyTheme(nextDark);
     if (state.activeStage >= 2 && state.activeStage <= 5) {
       actions.render();
+    }
+  });
+
+  // Prevent browser from navigating away if files are dropped anywhere in the workbench
+  window.addEventListener("dragover", (e) => {
+    if (Array.from(e.dataTransfer?.types || []).includes("Files")) {
+      e.preventDefault();
+    }
+  });
+  window.addEventListener("drop", (e) => {
+    if (e.dataTransfer?.files?.length) {
+      e.preventDefault();
+      actions.handleIncomingFiles(e.dataTransfer.files);
     }
   });
 

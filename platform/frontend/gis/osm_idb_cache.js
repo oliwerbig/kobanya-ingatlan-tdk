@@ -152,6 +152,7 @@ export function buildOsmBundle({ bbox = null, targets = [], rawOsmTargets = {}, 
     }
   }
   return {
+    kind: "geospec_osm_bundle",
     schema: "geospec.osm_bundle.v1",
     created_utc: new Date().toISOString(),
     bbox,
@@ -161,15 +162,25 @@ export function buildOsmBundle({ bbox = null, targets = [], rawOsmTargets = {}, 
 }
 
 export function parseOsmBundle(rawObj) {
-  if (!rawObj || typeof rawObj !== "object") {
+  if (!rawObj || typeof rawObj !== "object" || Array.isArray(rawObj)) {
     throw new Error("Érvénytelen .osm_bundle.json formátum.");
   }
-  const targets = rawObj.targets && typeof rawObj.targets === "object" ? rawObj.targets : {};
-  const streetGraphs = rawObj.street_graphs && typeof rawObj.street_graphs === "object" ? rawObj.street_graphs : {};
+  const safeDict = (src) => {
+    const out = {};
+    if (!src || typeof src !== "object" || Array.isArray(src)) return out;
+    for (const [k, v] of Object.entries(src)) {
+      if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
+      Object.defineProperty(out, k, { value: v, enumerable: true, writable: true, configurable: true });
+    }
+    return out;
+  };
+  const targets = safeDict(rawObj.targets);
+  const streetGraphs = safeDict(rawObj.street_graphs);
   if (Object.keys(targets).length === 0 && Object.keys(streetGraphs).length === 0) {
     throw new Error("Az .osm_bundle.json nem tartalmaz térbeli réteget vagy utcahálózatot.");
   }
   return {
+    kind: "geospec_osm_bundle",
     schema: rawObj.schema || "geospec.osm_bundle.v1",
     bbox: rawObj.bbox || null,
     targets,

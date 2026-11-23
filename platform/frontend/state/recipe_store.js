@@ -1,5 +1,6 @@
-/* ExperimentRecipe Store, RFC-4180 CSV/GeoJSON Parser, Empty Template & Generic Sandbox Study */
-import { parseNumericScalar } from "../utils/sanitize.js";
+/* ExperimentRecipe Store, RFC-4180 CSV/GeoJSON Parser, Workspace Bundle & Multi-File Intake Classifier */
+import { parseOsmBundle } from "../gis/osm_idb_cache.js";
+import { parseJsonText, parseNumericScalar, sanitizeRecipe, stripBom } from "../utils/sanitize.js";
 
 export function createDefaultRecipe() {
   return {
@@ -93,7 +94,7 @@ export function detectDelimiter(firstLine) {
 }
 
 export function parseCSVText(text) {
-  const cleanText = String(text ?? "").replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const cleanText = stripBom(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   // Find first non-empty, non-comment line for delimiter detection
   let firstNonEmpty = "";
   for (const rawLine of cleanText.split("\n")) {
@@ -173,8 +174,10 @@ export function parseCSVText(text) {
   });
 
   const columns = {};
+  const setColProp = (obj, key, val) =>
+    Object.defineProperty(obj, key, { value: val, enumerable: true, writable: true, configurable: true });
   headers.forEach((h) => {
-    columns[h] = [];
+    setColProp(columns, h, []);
   });
 
   for (let r = 1; r < rows.length; r++) {
@@ -187,30 +190,35 @@ export function parseCSVText(text) {
   return { headers, columns, nRows: rows.length - 1 };
 }
 
-export function parseGeoJSONDataset(text) {
-  const gj = JSON.parse(text);
+export function parseGeoJSONDataset(textOrObj) {
+  const gj = typeof textOrObj === "string" ? parseJsonText(textOrObj, "GeoJSON") : textOrObj;
+  if (!gj || typeof gj !== "object") {
+    throw new Error("A GeoJSON fájl nem érvényes objektum.");
+  }
   const feats = gj.type === "FeatureCollection" ? gj.features || [] : gj.type === "Feature" ? [gj] : [];
   if (!feats.length) throw new Error("A GeoJSON fájl nem tartalmaz Feature elemeket.");
 
   const propKeys = new Set();
   for (const f of feats) {
-    Object.keys(f.properties || {}).forEach((k) => propKeys.add(k));
+    Object.keys(f?.properties || {}).forEach((k) => {
+      if (k !== "lat" && k !== "lon") propKeys.add(k);
+    });
   }
   const columns = { lat: [], lon: [] };
   propKeys.forEach((k) => {
-    columns[k] = [];
+    Object.defineProperty(columns, k, { value: [], enumerable: true, writable: true, configurable: true });
   });
 
   for (const f of feats) {
     let lon = null;
     let lat = null;
-    if (f.geometry && f.geometry.type === "Point" && Array.isArray(f.geometry.coordinates)) {
+    if (f?.geometry && f.geometry.type === "Point" && Array.isArray(f.geometry.coordinates)) {
       lon = f.geometry.coordinates[0];
       lat = f.geometry.coordinates[1];
     }
-    columns.lat.push(lat === null ? "" : lat);
-    columns.lon.push(lon === null ? "" : lon);
-    const props = f.properties || {};
+    columns.lat.push(lat === null || lat === undefined ? "" : lat);
+    columns.lon.push(lon === null || lon === undefined ? "" : lon);
+    const props = f?.properties || {};
     propKeys.forEach((k) => {
       columns[k].push(props[k] !== undefined && props[k] !== null ? props[k] : "");
     });
@@ -269,280 +277,315 @@ export function generateEmptyCSVTemplate() {
   ].join("\n") + "\n";
 }
 
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+export async function readTextWithEncodingFallback(file) {
+  const buf = await file.arrayBuffer();
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    try {
+      return new TextDecoder("windows-1250").decode(buf);
+    } catch {
+      return new TextDecoder("iso-8859-2").decode(buf);
+    }
+  }
+}
+
+export function slugifyTitle(title, fallback = "geospec_study") {
+  const ascii = String(title ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return ascii || fallback;
+}
+
+export function makeUniqueTargetId(base, targets = []) {
+  const clean =
+    String(base ?? "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9_]/gi, "_")
+      .replace(/^_+|_+$/g, "")
+      .toLowerCase() || "target";
+  const existing = new Set((targets || []).map((t) => t.id));
+  if (!existing.has(clean)) return clean;
+  let k = 2;
+  while (existing.has(`${clean}_${k}`)) k++;
+  return `${clean}_${k}`;
+}
+
+export function inferGeojsonTargetDefaults(geojsonObj) {
+  const feats =
+    geojsonObj?.type === "FeatureCollection"
+      ? geojsonObj.features || []
+      : geojsonObj?.type === "Feature"
+        ? [geojsonObj]
+        : [];
+  let hasPoly = false;
+  let hasLine = false;
+  for (const f of feats) {
+    const gt = f?.geometry?.type;
+    if (gt === "Polygon" || gt === "MultiPolygon") {
+      hasPoly = true;
+      break;
+    }
+    if (gt === "LineString" || gt === "MultiLineString") {
+      hasLine = true;
+    }
+  }
+  if (hasPoly) return { geometry_handling: "polygon_boundary", inside_is_zero: true };
+  if (hasLine) return { geometry_handling: "line_segment", inside_is_zero: false };
+  return { geometry_handling: "point", inside_is_zero: false };
+}
+
+export function buildWorkspaceBundle({
+  recipe,
+  fileName = "",
+  headers = [],
+  columns = null,
+  nRows = 0,
+  osmBundle = null,
+  activeSpecId = "",
+  covType = "HC3",
+  showPct = false,
+}) {
+  return {
+    kind: "geospec_workspace",
+    schema_version: "1.0.0",
+    saved_utc: new Date().toISOString(),
+    recipe,
+    dataset: columns
+      ? {
+          fileName: fileName || "dataset.csv",
+          headers: Array.isArray(headers) ? [...headers] : Object.keys(columns),
+          columns,
+          nRows: Number(nRows) || (headers.length && columns[headers[0]] ? columns[headers[0]].length : 0),
+        }
+      : null,
+    osm_bundle: osmBundle || null,
+    ui_state: {
+      activeSpecId: activeSpecId || recipe?.spatial_engine?.active_model_id || recipe?.models?.[0]?.id || "spec_a",
+      covType: covType || "HC3",
+      showPct: Boolean(showPct),
+    },
   };
 }
 
-function randNorm(rng) {
-  const u1 = Math.max(1e-12, rng());
-  const u2 = rng();
-  return Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-}
+export function parseWorkspaceBundle(rawObj) {
+  if (!rawObj || typeof rawObj !== "object" || Array.isArray(rawObj) || rawObj.kind !== "geospec_workspace") {
+    throw new Error("Érvénytelen .geospec.json munkamenet formátum.");
+  }
+  const recipe = sanitizeRecipe(rawObj.recipe && typeof rawObj.recipe === "object" ? rawObj.recipe : {}, createDefaultRecipe());
 
-/**
- * Domain-agnostic offline Sandbox Study generator (~160 obs, synthetic grid street graph,
- * park polygon & transit corridor GeoJSON, + Heckman non-geocoded rows).
- */
-export function generateSampleStudy() {
-  const rng = mulberry32(202611);
-  const lat0 = 47.0;
-  const lon0 = 15.0;
-  const mPerDegLat = 111132.95;
-  const mPerDegLon = 111132.95 * Math.cos((lat0 * Math.PI) / 180);
-  const toLatLon = (xM, yM) => [lon0 + xM / mPerDegLon, lat0 + yM / mPerDegLat];
-
-  // 1. Synthetic 9x9 street grid covering [-800m, +800m] x [-800m, +800m] (200m blocks)
-  const gridVals = [-800, -600, -400, -200, 0, 200, 400, 600, 800];
-  const graphElements = [];
-  let nid = 1;
-  const nodeGrid = {};
-  for (let iy = 0; iy < gridVals.length; iy++) {
-    for (let ix = 0; ix < gridVals.length; ix++) {
-      const [lo, la] = toLatLon(gridVals[ix], gridVals[iy]);
-      nodeGrid[`${ix}_${iy}`] = nid;
-      graphElements.push({ type: "node", id: nid, lat: Number(la.toFixed(6)), lon: Number(lo.toFixed(6)) });
-      nid++;
+  let dataset = null;
+  if (rawObj.dataset !== null && rawObj.dataset !== undefined) {
+    const dsObj = rawObj.dataset;
+    if (!dsObj || typeof dsObj !== "object" || !dsObj.columns || typeof dsObj.columns !== "object" || Array.isArray(dsObj.columns)) {
+      throw new Error("A .geospec.json fájl adatbázis-szekciója sérült.");
     }
-  }
-  let wid = 1000;
-  for (let iy = 0; iy < gridVals.length; iy++) {
-    for (let ix = 0; ix < gridVals.length; ix++) {
-      if (ix + 1 < gridVals.length) {
-        graphElements.push({
-          type: "way",
-          id: wid++,
-          nodes: [nodeGrid[`${ix}_${iy}`], nodeGrid[`${ix + 1}_${iy}`]],
-          tags: { highway: "residential" },
-        });
-      }
-      if (iy + 1 < gridVals.length) {
-        graphElements.push({
-          type: "way",
-          id: wid++,
-          nodes: [nodeGrid[`${ix}_${iy}`], nodeGrid[`${ix}_${iy + 1}`]],
-          tags: { highway: "residential" },
-        });
-      }
+    const rawCols = dsObj.columns;
+    const safeCols = {};
+    const candidateHeaders = Array.isArray(dsObj.headers) && dsObj.headers.length ? dsObj.headers.map(String) : Object.keys(rawCols);
+    const headers = [];
+    for (const h of candidateHeaders) {
+      if (h === "__proto__" || h === "constructor" || h === "prototype") continue;
+      if (!Object.prototype.hasOwnProperty.call(rawCols, h) || !Array.isArray(rawCols[h])) continue;
+      Object.defineProperty(safeCols, h, {
+        value: [...rawCols[h]],
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+      headers.push(h);
     }
-  }
-  const streetGraph = { version: 0.6, generator: "GeoSpec-Sandbox", elements: graphElements };
-
-  // 2. Central Park Polygon [-140..140] x [-140..140] + Transit Line & Stops
-  const parkRing = [
-    toLatLon(-140, -140),
-    toLatLon(140, -140),
-    toLatLon(140, 140),
-    toLatLon(-140, 140),
-    toLatLon(-140, -140),
-  ];
-  const parkGeojson = {
-    type: "FeatureCollection",
-    features: [
-      {
-        type: "Feature",
-        id: "central_park",
-        properties: { name: "Central Urban Park", leisure: "park" },
-        geometry: { type: "Polygon", coordinates: [parkRing] },
-      },
-    ],
-  };
-
-  const transitGeojson = {
-    type: "FeatureCollection",
-    features: [
-      {
-        type: "Feature",
-        id: "station_west",
-        properties: { name: "West Transit Hub", railway: "station" },
-        geometry: { type: "Point", coordinates: toLatLon(-400, 0) },
-      },
-      {
-        type: "Feature",
-        id: "station_east",
-        properties: { name: "East Transit Hub", railway: "station" },
-        geometry: { type: "Point", coordinates: toLatLon(400, 0) },
-      },
-    ],
-  };
-
-  // 3. Synthetic observations (145 geocoded + 15 non-geocoded for Heckman selection check)
-  const columns = {
-    row_id: [],
-    lat: [],
-    lon: [],
-    price_eur: [],
-    area_m2: [],
-    rooms: [],
-    condition: [],
-    renovated: [],
-    dist_cbd_m: [],
-    listing_quality: [],
-  };
-
-  const nTotal = 160;
-  for (let i = 0; i < nTotal; i++) {
-    const isGeocoded = i < 145;
-    const xM = (rng() * 1400) - 700;
-    const yM = (rng() * 1400) - 700;
-    const [lo, la] = toLatLon(xM, yM);
-
-    const area = Math.max(24, Math.min(130, 58 + 0.015 * xM + randNorm(rng) * 14));
-    const rooms = Math.max(1, Math.min(5, Math.round(area / 24 + randNorm(rng) * 0.4)));
-    const renov = rng() < (xM > 0 ? 0.52 : 0.28) ? 1 : 0;
-    const cond = renov ? "renovated" : rng() < 0.6 ? "good" : "fair";
-    const condAdj = cond === "renovated" ? 0.14 : cond === "good" ? 0.0 : -0.11;
-
-    // Distance to Park boundary (inside = 0)
-    const dxP = Math.max(0, Math.abs(xM) - 140);
-    const dyP = Math.max(0, Math.abs(yM) - 140);
-    const dPark = Math.hypot(dxP, dyP);
-
-    // Distance to nearest station
-    const dSt = Math.min(Math.hypot(xM + 400, yM), Math.hypot(xM - 400, yM));
-    const dCbd = Math.hypot(xM - 950, yM - 650);
-    const qual = Number((0.4 + 0.6 * (isGeocoded ? 1 : 0) + randNorm(rng) * 0.4).toFixed(3));
-
-    // Spatially varying park amenity + transit proximity + mild gradient
-    const adPark = Math.max(0, Math.log(400 / Math.max(1, dPark)));
-    const adTransit = Math.max(0, Math.log(500 / Math.max(1, dSt)));
-    const parkSlope = 0.05 + 0.04 * ((xM + 700) / 1400);
-    const lnUnitPrice =
-      7.45 +
-      parkSlope * adPark +
-      0.06 * adTransit +
-      condAdj +
-      0.002 * area -
-      0.00012 * dCbd +
-      randNorm(rng) * 0.075;
-    const totalPrice = Math.round(Math.exp(lnUnitPrice) * area);
-
-    columns.row_id.push(i + 1);
-    columns.lat.push(isGeocoded ? la.toFixed(6) : "");
-    columns.lon.push(isGeocoded ? lo.toFixed(6) : "");
-    columns.price_eur.push(totalPrice);
-    columns.area_m2.push(Number(area.toFixed(1)));
-    columns.rooms.push(rooms);
-    columns.condition.push(cond);
-    columns.renovated.push(renov);
-    columns.dist_cbd_m.push(Math.round(dCbd));
-    columns.listing_quality.push(qual);
+    if (!headers.length) {
+      throw new Error("A .geospec.json fájl adatbázisa nem tartalmaz érvényes oszlopokat.");
+    }
+    const nRows = safeCols[headers[0]].length;
+    dataset = {
+      fileName: typeof dsObj.fileName === "string" && dsObj.fileName ? dsObj.fileName : "workspace_dataset.csv",
+      headers,
+      columns: safeCols,
+      nRows,
+    };
   }
 
-  const recipe = createDefaultRecipe();
-  recipe.recipe_meta.title = "GeoSpec Sandbox — Synthetic Urban Study";
-  recipe.dataset_schema = {
-    row_id_col: "row_id",
-    lat_col: "lat",
-    lon_col: "lon",
-    y_spec: { mode: "ratio", num_col: "price_eur", den_col: "area_m2", transform: "log", boxcox_lambda: null, log1p_shift: 1.0 },
-    cluster_spec: { mode: "auto_or_column", col: "", regex: "", radius_m: 35.0 },
-    selection_spec: {
-      enabled: true,
-      excluded_flag_col: "",
-      first_stage_covariates: ["area_m2", "rooms"],
-      exclusion_restriction_cols: ["listing_quality"],
-    },
-    spatial_proxy_cols: ["dist_cbd_m"],
-  };
-  recipe.spatial_targets = [
-    {
-      id: "park",
-      name: "Central Park (GeoJSON)",
-      source: "geojson",
-      excluded_osm_ids: [],
-      geometry_handling: "polygon_boundary",
-      inside_is_zero: true,
-      distance_modes: "both",
-      routing_profile: "walk",
-      max_snap_distance_m: 300,
-    },
-    {
-      id: "transit",
-      name: "Transit Hubs (GeoJSON)",
-      source: "geojson",
-      excluded_osm_ids: [],
-      geometry_handling: "point",
-      inside_is_zero: false,
-      distance_modes: "both",
-      routing_profile: "walk",
-      max_snap_distance_m: 300,
-    },
-  ];
-  const baseCovs = [
-    { col: "area_m2", type: "numeric", transform: "raw" },
-    { col: "rooms", type: "numeric", transform: "raw" },
-    { col: "condition", type: "categorical", reference_level: "good" },
-  ];
-  recipe.models = [
-    { id: "m1_base", name: "M1: Fizikai alapmodell", active: true, covariates: baseCovs.map((c) => ({ ...c })), spatial_terms: [], interactions: [] },
-    {
-      id: "m2_rings",
-      name: "M2: Távolsági sávok",
-      active: true,
-      covariates: baseCovs.map((c) => ({ ...c })),
-      spatial_terms: [
-        { target_id: "park", metric: "eucl", transform: "rings", breakpoints_m: [150, 300, 500] },
-        { target_id: "transit", metric: "net", transform: "rings", breakpoints_m: [200, 400, 650] },
-      ],
-      interactions: [],
-    },
-    {
-      id: "m3_log",
-      name: "M3: Folytonos ln(d)",
-      active: true,
-      covariates: baseCovs.map((c) => ({ ...c })),
-      spatial_terms: [
-        { target_id: "park", metric: "eucl", transform: "ln_d", floor_m: 1.0 },
-        { target_id: "transit", metric: "net", transform: "ln_d", floor_m: 1.0 },
-      ],
-      interactions: [],
-    },
-    {
-      id: "m4_ad",
-      name: "M4: Andersson–Day",
-      active: true,
-      covariates: baseCovs.map((c) => ({ ...c })),
-      spatial_terms: [
-        { target_id: "park", metric: "eucl", transform: "andersson_day", floor_m: 1.0, cutoff_m: 400, cutoff_range_m: [150, 650, 25] },
-        { target_id: "transit", metric: "net", transform: "andersson_day", floor_m: 1.0, cutoff_m: 500, cutoff_range_m: [200, 750, 25] },
-      ],
-      interactions: [],
-    },
-  ];
-  recipe.composition_chain = {
-    enabled: true,
-    focal_term_ref: "park::andersson_day",
-    blocks: [
-      { name: "Méret & Szobák", terms: ["area_m2", "rooms"] },
-      { name: "Műszaki állapot", terms: ["condition"] },
-    ],
-    compute_gelbach_ovb: true,
-  };
-  recipe.spatial_engine.active_model_id = "m4_ad";
-  recipe.spatial_engine.gwr.focal_model_id = "m4_ad";
+  let osm_bundle = null;
+  if (rawObj.osm_bundle !== null && rawObj.osm_bundle !== undefined) {
+    osm_bundle = parseOsmBundle(rawObj.osm_bundle);
+  }
 
-  const headers = Object.keys(columns);
-  const { profile, guesses } = inferColumnProfile(headers, columns);
+  const uiIn = rawObj.ui_state && typeof rawObj.ui_state === "object" ? rawObj.ui_state : {};
+  const modelIds = new Set((recipe.models || []).map((m) => m.id));
+  const fallbackSpec =
+    (recipe.spatial_engine?.active_model_id && modelIds.has(recipe.spatial_engine.active_model_id)
+      ? recipe.spatial_engine.active_model_id
+      : recipe.models?.[0]?.id) || "spec_a";
+  const activeSpecId = typeof uiIn.activeSpecId === "string" && modelIds.has(uiIn.activeSpecId) ? uiIn.activeSpecId : fallbackSpec;
+  const covType = ["HC3", "cluster", "OLS"].includes(uiIn.covType) ? uiIn.covType : "HC3";
+  const showPct = Boolean(uiIn.showPct);
 
   return {
-    fileName: "sandbox_urban_study.csv",
-    parsed: { headers, columns, nRows: nTotal },
-    profile,
-    guesses,
+    kind: "geospec_workspace",
     recipe,
-    geojsonTargets: {
-      park: parkGeojson,
-      transit: transitGeojson,
-    },
-    streetGraphs: {
-      walk: streetGraph,
-    },
+    dataset,
+    osm_bundle,
+    ui_state: { activeSpecId, covType, showPct },
   };
+}
+
+function isPlainObject(v) {
+  return Boolean(v) && typeof v === "object" && !Array.isArray(v);
+}
+
+function isOsmBundleObject(obj) {
+  if (!isPlainObject(obj)) return false;
+  if (obj.kind === "geospec_osm_bundle" || obj.schema === "geospec.osm_bundle.v1") return true;
+  if (isPlainObject(obj.targets) && isPlainObject(obj.street_graphs) && !obj.dataset_schema) return true;
+  if (
+    isPlainObject(obj.targets) &&
+    !obj.dataset_schema &&
+    !obj.models &&
+    !obj.spatial_targets &&
+    !obj.recipe_meta &&
+    !obj.schema_version &&
+    obj.type !== "FeatureCollection" &&
+    obj.type !== "Feature"
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isRecipeObject(obj) {
+  if (!isPlainObject(obj)) return false;
+  if (obj.type === "FeatureCollection" || obj.type === "Feature") return false;
+  return Boolean(obj.dataset_schema || obj.models || obj.spatial_targets || obj.recipe_meta || obj.schema_version);
+}
+
+export function validateGeojsonObject(gj, fileName = "GeoJSON") {
+  if (!isPlainObject(gj)) {
+    throw new Error(`Érvénytelen GeoJSON (${fileName}): JSON objektum szükséges.`);
+  }
+  if (gj.type !== "FeatureCollection" && gj.type !== "Feature") {
+    throw new Error(`Érvénytelen GeoJSON (${fileName}): FeatureCollection vagy Feature típus szükséges.`);
+  }
+  const feats = gj.type === "FeatureCollection" ? (Array.isArray(gj.features) ? gj.features : []) : [gj];
+  if (!feats.length) {
+    throw new Error(`A GeoJSON fájl (${fileName}) nem tartalmaz Feature elemeket.`);
+  }
+  const hasValidGeom = feats.some(
+    (f) =>
+      f &&
+      typeof f === "object" &&
+      f.geometry &&
+      typeof f.geometry === "object" &&
+      typeof f.geometry.type === "string" &&
+      (Array.isArray(f.geometry.coordinates) || Array.isArray(f.geometry.geometries))
+  );
+  if (!hasValidGeom) {
+    throw new Error(`A GeoJSON fájl (${fileName}) nem tartalmaz érvényes geometriát.`);
+  }
+  return feats;
+}
+
+export function classifyIncomingJson(parsed, fileName = "", { hasDataset = false, batchHasDataset = false } = {}) {
+  if (!isPlainObject(parsed)) {
+    throw new Error(`Érvénytelen JSON objektum (${fileName || "fájl"}): gyökérobjektum szükséges.`);
+  }
+  if (parsed.kind === "geospec_workspace") {
+    return { kind: "workspace", fileName, data: parsed };
+  }
+  if (isOsmBundleObject(parsed)) {
+    return { kind: "osm_bundle", fileName, data: parsed };
+  }
+  if (parsed.type === "FeatureCollection" || parsed.type === "Feature") {
+    const feats = validateGeojsonObject(parsed, fileName || "GeoJSON");
+    const hasNonPoint = feats.some((f) => f?.geometry && f.geometry.type !== "Point");
+    if (hasDataset || batchHasDataset || hasNonPoint) {
+      return { kind: "target_geojson", fileName, data: parsed };
+    }
+    return { kind: "dataset_geojson", fileName, data: parsed };
+  }
+  if (isRecipeObject(parsed)) {
+    return { kind: "recipe", fileName, data: parsed };
+  }
+  throw new Error(
+    `Ismeretlen JSON fájlformátum (${fileName || "fájl"}): nem GeoSpec recept, nem projekt (.geospec.json), nem OSM csomag és nem GeoJSON.`
+  );
+}
+
+const BATCH_PRIORITY = {
+  workspace: 0,
+  dataset_csv: 1,
+  dataset_geojson: 1,
+  recipe: 2,
+  osm_bundle: 3,
+  target_geojson: 4,
+};
+
+export function prepareIncomingBatch(entries, { hasDataset = false } = {}) {
+  const list = Array.isArray(entries) ? entries : [];
+  const prelim = [];
+  let batchHasDataset = false;
+
+  for (let idx = 0; idx < list.length; idx++) {
+    const fileName = String(list[idx]?.fileName || "");
+    const text = stripBom(list[idx]?.text ?? "");
+    const lower = fileName.toLowerCase();
+
+    if (lower.endsWith(".csv") || lower.endsWith(".tsv") || lower.endsWith(".txt")) {
+      batchHasDataset = true;
+      prelim.push({ idx, kind: "dataset_csv", fileName, text });
+      continue;
+    }
+
+    let parsed;
+    try {
+      parsed = parseJsonText(text, fileName || "JSON");
+    } catch (err) {
+      if (lower.endsWith(".json") || lower.endsWith(".geojson")) {
+        throw new Error(`Érvénytelen JSON fájl (${fileName}): ${err.message}`);
+      }
+      throw new Error(`Nem támogatott fájlformátum (${fileName}): csak .csv, .tsv, .txt, .json vagy .geojson tölthető be.`);
+    }
+
+    if (!isPlainObject(parsed)) {
+      throw new Error(`Érvénytelen JSON objektum (${fileName}): gyökérobjektum szükséges.`);
+    }
+
+    if (parsed.kind === "geospec_workspace") {
+      if (parsed.dataset && typeof parsed.dataset === "object" && parsed.dataset.columns) {
+        batchHasDataset = true;
+      }
+      prelim.push({ idx, kind: "workspace", fileName, data: parsed });
+    } else if (parsed.type === "FeatureCollection" || parsed.type === "Feature") {
+      prelim.push({ idx, kind: "geojson_pending", fileName, data: parsed });
+    } else {
+      const classified = classifyIncomingJson(parsed, fileName, { hasDataset, batchHasDataset });
+      prelim.push({ idx, ...classified });
+    }
+  }
+
+  let datasetClaimed = Boolean(hasDataset || batchHasDataset);
+  const resolved = prelim.map((item) => {
+    if (item.kind !== "geojson_pending") return item;
+    const classified = classifyIncomingJson(item.data, item.fileName, {
+      hasDataset,
+      batchHasDataset: datasetClaimed,
+    });
+    if (classified.kind === "dataset_geojson") {
+      datasetClaimed = true;
+    }
+    return { idx: item.idx, ...classified };
+  });
+
+  resolved.sort((a, b) => {
+    const pa = BATCH_PRIORITY[a.kind] ?? 99;
+    const pb = BATCH_PRIORITY[b.kind] ?? 99;
+    return pa !== pb ? pa - pb : a.idx - b.idx;
+  });
+
+  return resolved;
 }

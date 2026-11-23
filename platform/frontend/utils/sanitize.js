@@ -38,21 +38,34 @@ export function parseNumericScalar(val) {
   return Number.isFinite(num) ? num : NaN;
 }
 
+export function stripBom(text) {
+  return String(text ?? "").replace(/^\uFEFF/, "");
+}
+
+export function parseJsonText(text, label = "JSON") {
+  const clean = stripBom(text).trim();
+  if (!clean) {
+    throw new Error(`A ${label} fájl üres.`);
+  }
+  return JSON.parse(clean);
+}
+
 export function sanitizeRecipe(loaded, defaults) {
   if (!loaded || typeof loaded !== "object" || Array.isArray(loaded)) {
     throw new Error("Érvénytelen recept formátum (JSON objektum szükséges).");
   }
   const cleanStr = (v, fallback = "") => (typeof v === "string" ? v : v == null ? fallback : String(v));
   const cleanStrArr = (arr) => (Array.isArray(arr) ? arr.map((x) => cleanStr(x)).filter(Boolean) : []);
+  const safeObj = (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : {});
 
-  const dsIn = loaded.dataset_schema && typeof loaded.dataset_schema === "object" ? loaded.dataset_schema : {};
-  const yIn = dsIn.y_spec && typeof dsIn.y_spec === "object" ? dsIn.y_spec : {};
-  const clIn = dsIn.cluster_spec && typeof dsIn.cluster_spec === "object" ? dsIn.cluster_spec : {};
-  const selIn = dsIn.selection_spec && typeof dsIn.selection_spec === "object" ? dsIn.selection_spec : {};
-  const spIn = loaded.spatial_engine && typeof loaded.spatial_engine === "object" ? loaded.spatial_engine : {};
-  const gwrIn = spIn.gwr && typeof spIn.gwr === "object" ? spIn.gwr : {};
-  const ccIn = loaded.composition_chain && typeof loaded.composition_chain === "object" ? loaded.composition_chain : {};
-  const grdIn = loaded.guards_cfg && typeof loaded.guards_cfg === "object" ? loaded.guards_cfg : {};
+  const dsIn = safeObj(loaded.dataset_schema);
+  const yIn = safeObj(dsIn.y_spec);
+  const clIn = safeObj(dsIn.cluster_spec);
+  const selIn = safeObj(dsIn.selection_spec);
+  const spIn = safeObj(loaded.spatial_engine);
+  const gwrIn = safeObj(spIn.gwr);
+  const ccIn = safeObj(loaded.composition_chain);
+  const grdIn = safeObj(loaded.guards_cfg);
 
   const dDs = defaults.dataset_schema;
   const dSp = defaults.spatial_engine;
@@ -62,11 +75,22 @@ export function sanitizeRecipe(loaded, defaults) {
         id: cleanStr(m?.id, `spec_${idx + 1}`),
         name: cleanStr(m?.name, `Spec ${idx + 1}`),
         active: m?.active !== false,
-        covariates: Array.isArray(m?.covariates) ? m.covariates.map((c) => ({ ...c })) : [],
-        spatial_terms: Array.isArray(m?.spatial_terms) ? m.spatial_terms.map((st) => ({ ...st })) : [],
-        interactions: Array.isArray(m?.interactions) ? m.interactions.map((it) => ({ ...it })) : [],
+        covariates: Array.isArray(m?.covariates) ? m.covariates.filter((c) => c && typeof c === "object").map((c) => ({ ...c })) : [],
+        spatial_terms: Array.isArray(m?.spatial_terms) ? m.spatial_terms.filter((st) => st && typeof st === "object").map((st) => ({ ...st })) : [],
+        interactions: Array.isArray(m?.interactions) ? m.interactions.filter((it) => it && typeof it === "object").map((it) => ({ ...it })) : [],
       }))
     : defaults.models;
+
+  const spatialTargets = Array.isArray(loaded.spatial_targets)
+    ? loaded.spatial_targets
+        .filter((t) => t && typeof t === "object" && !Array.isArray(t))
+        .map((t, idx) => ({
+          ...t,
+          id: cleanStr(t.id, `target_${idx + 1}`),
+          name: cleanStr(t.name, cleanStr(t.id, `Target ${idx + 1}`)),
+          excluded_osm_ids: cleanStrArr(t.excluded_osm_ids),
+        }))
+    : [];
 
   return {
     schema_version: cleanStr(loaded.schema_version, defaults.schema_version),
@@ -97,7 +121,7 @@ export function sanitizeRecipe(loaded, defaults) {
       },
       spatial_proxy_cols: cleanStrArr(dsIn.spatial_proxy_cols),
     },
-    spatial_targets: Array.isArray(loaded.spatial_targets) ? loaded.spatial_targets.map((t) => ({ ...t })) : [],
+    spatial_targets: spatialTargets,
     models,
     composition_chain: {
       ...defaults.composition_chain,

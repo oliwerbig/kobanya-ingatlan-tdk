@@ -30,8 +30,13 @@
 
       <div class="top-actions">
         <button class="btn btn-primary btn-sm" id="btnRunAll" disabled>▶ Teljes Pipeline Futtatása (1–5)</button>
-        <button class="btn btn-sm" id="btnTopRecipeExport">🧪 Recept (.json)</button>
-        <button class="btn btn-sm" id="btnTopZipExport">📦 .ZIP Export</button>
+        <button class="btn btn-sm" id="btnTopLoadAny" title="CSV, GeoJSON, Recept (_recipe.json), OSM bundle vagy Projekt (.geospec.json) betöltése — több fájl is kijelölhető">📥 Betöltés</button>
+        <input type="file" id="fileTopLoadAny" accept=".csv,.tsv,.txt,.geojson,.json" multiple style="display:none" />
+        <button class="btn btn-sm" id="btnTopRecipeImport" title="Recept (.json) betöltése">📥 Recept</button>
+        <input type="file" id="fileTopRecipeImport" accept=".json" multiple style="display:none" />
+        <button class="btn btn-sm" id="btnTopRecipeExport" title="Recept (_recipe.json) mentése nyers adatok nélkül">💾 Recept Mentés</button>
+        <button class="btn btn-sm" id="btnTopProjectExport" title="Teljes projekt / munkamenet mentése (&lt;slug&gt;.geospec.json: adat + recept + OSM rétegek)">💾 Projekt Mentés</button>
+        <button class="btn btn-sm" id="btnTopZipExport" title="Publikációs csomag exportálása (.zip)">📦 .ZIP Export</button>
         <button class="btn btn-sm" id="btnThemeToggle" title="Világos / Sötét nézet váltása">🌗</button>
       </div>
     </header>
