@@ -372,9 +372,17 @@ def parse_geojson_features(geojson: Dict[str, Any], prefix: str = "geojson") -> 
                     "center": (float(np.mean([p[0] for p in all_p])), float(np.mean([p[1] for p in all_p]))),
                 })
         elif gtype == "Polygon":
-            outer = [(float(c[0]), float(c[1])) for c in coords[0]]
-            inners = [[(float(c[0]), float(c[1])) for c in r] for r in coords[1:] if len(r) >= 3]
-            if len(outer) >= 3:
+            def _close_ring_pts(r_raw: List[Any]) -> List[Tuple[float, float]]:
+                pts_r = [(float(c[0]), float(c[1])) for c in r_raw]
+                if len(pts_r) >= 3 and (
+                    abs(pts_r[0][0] - pts_r[-1][0]) > 1e-9 or abs(pts_r[0][1] - pts_r[-1][1]) > 1e-9
+                ):
+                    pts_r.append(pts_r[0])
+                return pts_r
+
+            outer = _close_ring_pts(coords[0])
+            inners = [_close_ring_pts(r) for r in coords[1:] if len(r) >= 3]
+            if len(outer) >= 4:
                 features.append({
                     "uid": uid, "name": name, "tags": props, "geom_type": "polygon",
                     "rings": [outer], "inner_rings": inners,
@@ -382,11 +390,19 @@ def parse_geojson_features(geojson: Dict[str, Any], prefix: str = "geojson") -> 
                     "center": (float(np.mean([p[0] for p in outer])), float(np.mean([p[1] for p in outer]))),
                 })
         elif gtype == "MultiPolygon":
+            def _close_ring_pts(r_raw: List[Any]) -> List[Tuple[float, float]]:
+                pts_r = [(float(c[0]), float(c[1])) for c in r_raw]
+                if len(pts_r) >= 3 and (
+                    abs(pts_r[0][0] - pts_r[-1][0]) > 1e-9 or abs(pts_r[0][1] - pts_r[-1][1]) > 1e-9
+                ):
+                    pts_r.append(pts_r[0])
+                return pts_r
+
             outers, inners, parts = [], [], []
             for poly in coords:
                 if poly and len(poly[0]) >= 3:
-                    o_ring = [(float(c[0]), float(c[1])) for c in poly[0]]
-                    p_inners = [[(float(c[0]), float(c[1])) for c in r] for r in poly[1:] if len(r) >= 3]
+                    o_ring = _close_ring_pts(poly[0])
+                    p_inners = [_close_ring_pts(r) for r in poly[1:] if len(r) >= 3]
                     outers.append(o_ring)
                     inners.extend(p_inners)
                     parts.append({"outer": o_ring, "inners": p_inners})
@@ -491,7 +507,9 @@ def _subdivide_segments(
 
         long_idx = np.where(~short_mask)[0]
         for i in long_idx:
-            n_sub = int(math.ceil(lens[i] / max_len_m))
+            if not math.isfinite(float(lens[i])):
+                continue
+            n_sub = min(4000, max(1, int(math.ceil(float(lens[i]) / max_len_m))))
             t = np.linspace(0.0, 1.0, n_sub + 1)[:, None]
             sub_pts = p0[i][None, :] + t * (p1[i] - p0[i])[None, :]
             a_parts.append(sub_pts[:-1])
@@ -732,7 +750,10 @@ def build_street_graph(
         if len(nids) < 2:
             continue
         tags = w.get("tags", {}) or {}
-        oneway_val = str(tags.get("oneway", "")).lower()
+        oneway_val = str(tags.get("oneway", "")).lower().strip()
+        junction_val = str(tags.get("junction", "")).lower().strip()
+        hwy_val = str(tags.get("highway", "")).lower().strip()
+        bike_ow_val = str(tags.get("oneway:bicycle", "")).lower().strip()
         if routing_profile == "walk":
             w_dir = 0
         else:
@@ -740,7 +761,13 @@ def build_street_graph(
                 w_dir = 1
             elif oneway_val in ("-1", "reverse"):
                 w_dir = -1
+            elif oneway_val in ("no", "false", "0"):
+                w_dir = 0
+            elif junction_val == "roundabout" or hwy_val in ("motorway", "motorway_link"):
+                w_dir = 1
             else:
+                w_dir = 0
+            if routing_profile == "bike" and bike_ow_val in ("no", "false", "0"):
                 w_dir = 0
 
         prev = _get_idx(int(nids[0]))
@@ -769,6 +796,9 @@ def build_street_graph(
     v_arr = v_arr[valid_e]
     dir_arr = dir_arr[valid_e]
     edge_len = edge_len[valid_e]
+
+    if len(u_arr) == 0:
+        return {"empty": True, "n_nodes": 0, "n_edges": 0}
 
     n_nodes = len(node_xy)
     # Build reversed graph (target -> obs) and forward graph (obs -> target) for single-route replay

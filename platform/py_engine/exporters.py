@@ -19,23 +19,26 @@ import zipfile
 from typing import Any, Dict, List, Optional
 
 
+import re
+
+_LATEX_ESCAPE_MAP = {
+    "\\": r"\textbackslash{}",
+    "&": r"\&",
+    "%": r"\%",
+    "$": r"\$",
+    "#": r"\#",
+    "_": r"\_",
+    "{": r"\{",
+    "}": r"\}",
+    "~": r"\textasciitilde{}",
+    "^": r"\textasciicircum{}",
+}
+_LATEX_ESCAPE_RE = re.compile("|".join(re.escape(k) for k in _LATEX_ESCAPE_MAP))
+
+
 def _latex_escape(text: str) -> str:
-    """Escape LaTeX special characters cleanly."""
-    s = str(text)
-    for old, new in [
-        ("\\", "\\textbackslash{}"),
-        ("&", "\\&"),
-        ("%", "\\%"),
-        ("$", "\\$"),
-        ("#", "\\#"),
-        ("_", "\\_"),
-        ("{", "\\{"),
-        ("}", "\\}"),
-        ("~", "\\textasciitilde{}"),
-        ("^", "\\textasciicircum{}"),
-    ]:
-        s = s.replace(old, new)
-    return s
+    """Escape LaTeX special characters cleanly in a single pass."""
+    return _LATEX_ESCAPE_RE.sub(lambda m: _LATEX_ESCAPE_MAP[m.group(0)], str(text))
 
 
 def _sig_stars(p: Optional[float]) -> str:
@@ -218,6 +221,15 @@ def build_qgis_geojson(
     if analytic_indices is not None:
         analytic_pos_map = {int(orig_i): pos for pos, orig_i in enumerate(analytic_indices)}
 
+    def _make_pos_map(stage_dict: Optional[Dict[str, Any]]) -> Dict[int, int]:
+        if stage_dict and stage_dict.get("valid_indices") is not None:
+            return {int(orig_i): pos for pos, orig_i in enumerate(stage_dict["valid_indices"])}
+        return analytic_pos_map
+
+    ols_pos_map = _make_pos_map(active_ols)
+    sp_pos_map = _make_pos_map(spatial_res)
+    gwr_pos_map = _make_pos_map(gwr_res)
+
     features = []
     for idx in range(len(lat_arr)):
         lat_v = lat_arr[idx]
@@ -239,22 +251,27 @@ def build_qgis_geojson(
             props[f"circuity_delta_{tid}"] = None if (dd is None or dd != dd) else round(float(dd), 2)
             props[f"circuity_ratio_{tid}"] = None if (tr is None or tr != tr) else round(float(tr), 4)
 
-        pos = analytic_pos_map.get(idx)
-        if pos is not None:
-            if active_ols:
-                props["ols_fitted"] = active_ols["fitted"][pos]
-                props["ols_resid"] = active_ols["resid"][pos]
-                props["ols_cooks_d"] = active_ols["cooks_d"][pos]
-            if spatial_res and spatial_res.get("ok"):
-                props["lisa_y_quad"] = spatial_res["lisa_y"]["quadrants"][pos]
-                props["lisa_resid_quad"] = spatial_res["lisa_resid"]["quadrants"][pos]
-            if gwr_res and gwr_res.get("ok"):
-                props["gwr_local_r2"] = gwr_res["local_r2"][pos]
-                props["gwr_resid"] = gwr_res["resid_native"][pos]
+        pos_ols = ols_pos_map.get(idx)
+        if pos_ols is not None and active_ols and pos_ols < len(active_ols.get("fitted", [])):
+            props["ols_fitted"] = active_ols["fitted"][pos_ols]
+            props["ols_resid"] = active_ols["resid"][pos_ols]
+            props["ols_cooks_d"] = active_ols["cooks_d"][pos_ols]
+
+        pos_sp = sp_pos_map.get(idx)
+        if pos_sp is not None and spatial_res and spatial_res.get("ok"):
+            if pos_sp < len(spatial_res.get("lisa_y", {}).get("quadrants", [])):
+                props["lisa_y_quad"] = spatial_res["lisa_y"]["quadrants"][pos_sp]
+                props["lisa_resid_quad"] = spatial_res["lisa_resid"]["quadrants"][pos_sp]
+
+        pos_gwr = gwr_pos_map.get(idx)
+        if pos_gwr is not None and gwr_res and gwr_res.get("ok"):
+            if pos_gwr < len(gwr_res.get("local_r2", [])):
+                props["gwr_local_r2"] = gwr_res["local_r2"][pos_gwr]
+                props["gwr_resid"] = gwr_res["resid_native"][pos_gwr]
                 for c_idx, cname in enumerate(gwr_res["col_names"]):
                     safe_c = "".join(ch if ch.isalnum() else "_" for ch in cname).strip("_")
-                    props[f"gwr_beta_{safe_c}"] = gwr_res["betas_native"][pos][c_idx]
-                    props[f"gwr_t_{safe_c}"] = gwr_res["t_vals"][pos][c_idx]
+                    props[f"gwr_beta_{safe_c}"] = gwr_res["betas_native"][pos_gwr][c_idx]
+                    props[f"gwr_t_{safe_c}"] = gwr_res["t_vals"][pos_gwr][c_idx]
 
         features.append({
             "type": "Feature",

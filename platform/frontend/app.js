@@ -86,7 +86,7 @@ function updateBootIndicator(status, message) {
 const dag = new DagClient("./worker/pyodide_worker.js", updateBootIndicator, setLog);
 
 const mapInspector = new MapInspector("mapContainer", "pointInspector", {
-  onToggleOsmFeature: (targetId, uid) => actions.toggleOsmFeature(targetId, uid),
+  onToggleOsmFeature: (targetId, uid) => actions.toggleOsmFeature(targetId, uid, true),
   onClickObservation: (obsIdx) => actions.inspectObservation(obsIdx),
 });
 
@@ -392,7 +392,12 @@ const actions = {
     }
   },
 
-  toggleOsmFeature(targetId, uid) {
+  restyleMap() {
+    restyleMap();
+  },
+
+  toggleOsmFeature(targetId, uid, fromMap = false) {
+    if (fromMap && state.activeStage !== 1) return;
     const tgt = state.recipe.spatial_targets.find((t) => t.id === targetId);
     if (!tgt) return;
     tgt.excluded_osm_ids = tgt.excluded_osm_ids || [];
@@ -898,7 +903,7 @@ const actions = {
     });
     const slug = slugifyTitle(state.recipe?.recipe_meta?.title, "geospec_study");
     const fileName = `${slug}.geospec.json`;
-    this.downloadText(fileName, JSON.stringify(ws, null, 2), "application/json");
+    this.downloadText(fileName, JSON.stringify(ws), "application/json");
     setLog(`Teljes projekt mentve: ${fileName}`);
   },
 

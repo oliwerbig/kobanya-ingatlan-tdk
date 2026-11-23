@@ -289,7 +289,7 @@ export function renderStage5(container, ctx) {
       <div class="card-header">
         <div>
           <h3 class="card-title">5A. Szingularitás-Védett Adaptív Bisquare GWR (Guard #6)</h3>
-          <div class="card-subtitle">Mikro-jitter + Szelektív Kondíciószám-Ridge (κ &gt; ${gwrCfg.kappa_thresh}) + Natív skálájú β̂<sub>i</sub></div>
+          <div class="card-subtitle">Mikro-jitter + Szelektív Kondíciószám-Ridge (κ &gt; ${escapeHtml(gwrCfg.kappa_thresh)}) + Natív skálájú β̂<sub>i</sub></div>
         </div>
         <button class="btn btn-primary btn-sm" id="btnRunStage5">▶ GWR Futtatása</button>
       </div>

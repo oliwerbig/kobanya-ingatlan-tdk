@@ -268,6 +268,8 @@ class GeoSpecSession:
             })
 
         self.last_outputs["stage1"] = {"summary": summary, "warnings": warnings}
+        self.last_outputs.pop("stage4", None)
+        self.last_outputs.pop("stage5", None)
         return {"ok": True, "summary": summary, "warnings": warnings}
 
     def get_single_point_route(
@@ -293,8 +295,22 @@ class GeoSpecSession:
         )
 
     def _prepare_y_and_masks(self, recipe: Dict[str, Any]) -> Dict[str, Any]:
+        for tgt in recipe.get("spatial_targets", []):
+            tid = tgt.get("id")
+            if tid and tgt.get("source") == "csv_column" and tid not in self.dist_results:
+                col_n = tgt.get("csv_col")
+                arr = parse_numeric_array(self.columns[col_n]) if col_n in self.columns else np.full(self.n_rows, np.nan)
+                self.dist_results[tid] = {
+                    "dist_eucl": arr,
+                    "dist_net": np.full(self.n_rows, np.nan),
+                    "circuity_delta": np.full(self.n_rows, np.nan),
+                    "circuity_ratio": np.full(self.n_rows, np.nan),
+                    "snap_status": np.zeros(self.n_rows, dtype=np.int32),
+                    "n_active_features": 1,
+                    "n_excluded_features": 0,
+                    "warnings": [],
+                }
         ds = recipe.get("dataset_schema", {})
-        y_info = build_dependent_variable(self.columns, ds.get("y_spec", {}))
         sel_cfg = ds.get("selection_spec", {})
         excl_col = sel_cfg.get("excluded_flag_col")
         if excl_col and excl_col in self.columns:
@@ -302,6 +318,37 @@ class GeoSpecSession:
         else:
             explicit_excl = np.zeros(self.n_rows, dtype=bool)
         analytic_base = self.valid_coord_mask & ~explicit_excl
+
+        y_spec = ds.get("y_spec", {})
+        x_cond_mat: Optional[np.ndarray] = None
+        cond_mask: Optional[np.ndarray] = None
+        if y_spec.get("transform") == "boxcox" and y_spec.get("boxcox_lambda") is None:
+            active_specs = [m for m in recipe.get("models", []) if m.get("active", True)]
+            if active_specs:
+                sp_mid = recipe.get("spatial_engine", {}).get("active_model_id")
+                ref_spec = next((m for m in active_specs if m.get("id") == sp_mid), active_specs[-1])
+                cols_list = [np.ones(self.n_rows, dtype=np.float64)]
+                c_mask = analytic_base.copy()
+                for cov in ref_spec.get("covariates", []):
+                    c_name = cov.get("col")
+                    if c_name in self.columns and cov.get("type", "numeric") != "categorical":
+                        arr_c = parse_numeric_array(self.columns[c_name])
+                        tr_c = cov.get("transform", "raw")
+                        if tr_c == "log":
+                            c_mask &= np.isfinite(arr_c) & (arr_c > 0.0)
+                            arr_t = np.where(c_mask, np.log(np.maximum(arr_c, 1e-12)), 0.0)
+                        elif tr_c == "log1p":
+                            c_mask &= np.isfinite(arr_c) & (arr_c > -1.0)
+                            arr_t = np.where(c_mask, np.log1p(np.maximum(arr_c, -1.0 + 1e-12)), 0.0)
+                        else:
+                            c_mask &= np.isfinite(arr_c)
+                            arr_t = np.where(c_mask, arr_c, 0.0)
+                        cols_list.append(arr_t)
+                if len(cols_list) > 1:
+                    x_cond_mat = np.column_stack(cols_list)
+                    cond_mask = c_mask
+
+        y_info = build_dependent_variable(self.columns, y_spec, X_cond=x_cond_mat, cond_mask=cond_mask)
         return {
             "y_info": y_info,
             "analytic_base": analytic_base,
@@ -690,6 +737,8 @@ class GeoSpecSession:
             "conditional_boxcox": cond_boxcox,
         }
         self.last_outputs["stage3"] = res
+        self.last_outputs.pop("stage4", None)
+        self.last_outputs.pop("stage5", None)
         return res
 
     def run_stage_4_spatial_econometrics(self, recipe: Dict[str, Any], run_id: int = 1) -> Dict[str, Any]:

@@ -135,6 +135,7 @@ export function sanitizeRecipe(loaded, defaults) {
       gwr: {
         ...dSp.gwr,
         ...gwrIn,
+        kappa_thresh: Number.isFinite(Number(gwrIn.kappa_thresh)) ? Number(gwrIn.kappa_thresh) : dSp.gwr.kappa_thresh,
       },
     },
     guards_cfg: {

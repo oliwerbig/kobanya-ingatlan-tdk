@@ -87,9 +87,9 @@ export function padBbox(bbox, bufferM = 1500) {
   const dLon = bufferM / (111132.95 * Math.max(0.15, Math.cos((latMid * Math.PI) / 180)));
   return {
     south: Math.max(-89.9, bbox.south - dLat),
-    west: bbox.west - dLon,
+    west: Math.max(-179.999, bbox.west - dLon),
     north: Math.min(89.9, bbox.north + dLat),
-    east: bbox.east + dLon,
+    east: Math.min(179.999, bbox.east + dLon),
   };
 }
 
@@ -138,13 +138,13 @@ export function buildTargetOverpassQL(target, paddedBbox) {
 export function buildStreetGraphOverpassQL(paddedBbox, profile = "walk") {
   const b = `${paddedBbox.south.toFixed(6)},${paddedBbox.west.toFixed(6)},${paddedBbox.north.toFixed(6)},${paddedBbox.east.toFixed(6)}`;
   if (profile === "drive") {
-    return `[out:json][timeout:30];\nway["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service)$"]["access"!="private"](${b});\nout tags;\n>;\nout skel qt;`;
+    return `[out:json][timeout:30];\nway["highway"~"^(motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|service)$"]["access"!="private"](${b});\nout tags;\n>;\nout skel qt;`;
   }
   if (profile === "bike") {
-    return `[out:json][timeout:30];\nway["highway"~"^(cycleway|primary|secondary|tertiary|unclassified|residential|living_street|path|track|service)$"]["bicycle"!="no"](${b});\nout tags;\n>;\nout skel qt;`;
+    return `[out:json][timeout:30];\nway["highway"~"^(cycleway|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|path|track|service)$"]["bicycle"!="no"](${b});\nout tags;\n>;\nout skel qt;`;
   }
   // Undirected pedestrian walk network: minimal out skel qt payload (60-80% smaller)
-  return `[out:json][timeout:30];\nway["highway"~"^(primary|secondary|tertiary|unclassified|residential|living_street|pedestrian|footway|path|cycleway|steps)$"]["foot"!="no"](${b});\n(._;>;);\nout skel qt;`;
+  return `[out:json][timeout:30];\nway["highway"~"^(primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|pedestrian|footway|path|cycleway|steps|service)$"]["foot"!="no"](${b});\n(._;>;);\nout skel qt;`;
 }
 
 function sqlLit(s) {
@@ -328,13 +328,13 @@ export function buildStreetGraphPostpassSQL(paddedBbox, profile = "walk") {
   let filterExpr;
   if (profile === "drive") {
     filterExpr =
-      "tags->>'highway' IN ('motorway','trunk','primary','secondary','tertiary','unclassified','residential','living_street','service') AND COALESCE(tags->>'access','yes') <> 'private'";
+      "tags->>'highway' IN ('motorway','motorway_link','trunk','trunk_link','primary','primary_link','secondary','secondary_link','tertiary','tertiary_link','unclassified','residential','living_street','service') AND COALESCE(tags->>'access','yes') <> 'private'";
   } else if (profile === "bike") {
     filterExpr =
-      "tags->>'highway' IN ('cycleway','primary','secondary','tertiary','unclassified','residential','living_street','path','track','service') AND COALESCE(tags->>'bicycle','yes') <> 'no'";
+      "tags->>'highway' IN ('cycleway','primary','primary_link','secondary','secondary_link','tertiary','tertiary_link','unclassified','residential','living_street','path','track','service') AND COALESCE(tags->>'bicycle','yes') <> 'no'";
   } else {
     filterExpr =
-      "tags->>'highway' IN ('primary','secondary','tertiary','unclassified','residential','living_street','pedestrian','footway','path','cycleway','steps') AND COALESCE(tags->>'foot','yes') <> 'no'";
+      "tags->>'highway' IN ('primary','primary_link','secondary','secondary_link','tertiary','tertiary_link','unclassified','residential','living_street','pedestrian','footway','path','cycleway','steps','service') AND COALESCE(tags->>'foot','yes') <> 'no'";
   }
   return `SELECT osm_id, tags, ST_Intersection(geom, ${env}) AS geom FROM postpass_line WHERE geom && ${env} AND ${filterExpr}`;
 }

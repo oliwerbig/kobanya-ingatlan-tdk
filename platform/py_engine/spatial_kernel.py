@@ -145,6 +145,24 @@ def build_spatial_weight_matrix(
         d_conn = float(np.max(d1_nn)) * 1.001  # minimum distance guaranteeing 0 islands
         if cutoff_mode in ("fixed", "fixed_m") and w_cfg.get("cutoff_m"):
             d_cut = float(w_cfg["cutoff_m"])
+            if n > 50:
+                edge_cap = max(200000, 120 * n)
+                est_edges = int(np.sum(tree.query_ball_point(coords_xy, r=d_cut, return_length=True) - 1))
+                if est_edges > edge_cap:
+                    lo_r = max(1.0, float(np.median(d1_nn)))
+                    hi_r = d_cut
+                    for _ in range(12):
+                        mid_r = 0.5 * (lo_r + hi_r)
+                        ee = int(np.sum(tree.query_ball_point(coords_xy, r=mid_r, return_length=True) - 1))
+                        if ee <= edge_cap:
+                            lo_r = mid_r
+                        else:
+                            hi_r = mid_r
+                    d_cut = lo_r
+                    meta_extra["outlier_guard_triggered"] = True
+                    meta_extra["outlier_guard_msg"] = (
+                        f"IDW '{w_id}' fixed cutoff capped at {d_cut:.1f}m (est. {est_edges} edges exceeded memory cap {edge_cap})."
+                    )
         else:
             d_cut = max(d_conn, float(w_cfg.get("min_cutoff_m", 0.0)))
             if n > 50:
@@ -862,7 +880,15 @@ def run_spatial_pipeline(
     k_no_int = X_no_int.shape[1]
     WX_no_int = W_prim @ X_no_int
     X_sdm = np.column_stack([X, WX_no_int])
-    sdm_res = _fit_ml_sar_core(X_sdm, y, primary_w)
+    if X.shape[0] <= X_sdm.shape[1] + 2:
+        sdm_res = dict(sar_res)
+        sdm_res["betas"] = np.concatenate([sar_res["betas"], np.zeros(k_no_int)])
+        sdm_res["se"] = np.concatenate([sar_res["se"], np.zeros(k_no_int)])
+        sdm_res["t_stats"] = np.concatenate([sar_res["t_stats"], np.zeros(k_no_int)])
+        sdm_res["p_vals"] = np.concatenate([sar_res["p_vals"], np.ones(k_no_int)])
+        sdm_res["sdm_underdetermined_fallback"] = True
+    else:
+        sdm_res = _fit_ml_sar_core(X_sdm, y, primary_w)
 
     # Elhorst Common-Factor Tests on SDM:
     # 1) H0: theta = 0 (SDM vs SAR) -> LR test (and Wald)
@@ -927,6 +953,10 @@ def run_spatial_pipeline(
     sdm_rho_z = sdm_res["rho"] / max(1e-12, sdm_res["se_rho"])
     sdm_rho_p = float(2.0 * stats.norm.sf(abs(sdm_rho_z)))
 
+    n_obs_comp = X.shape[0]
+    k_ols_ml = X.shape[1] + 1  # Include sigma^2 for exact AIC/BIC parity with SAR/SEM/SDM
+    ols_aic_ml = 2.0 * k_ols_ml - 2.0 * float(ols["llf"])
+    ols_bic_ml = math.log(max(n_obs_comp, 1)) * k_ols_ml - 2.0 * float(ols["llf"])
     model_comparison = [
         {
             "model": "OLS (Baseline)",
@@ -935,8 +965,8 @@ def run_spatial_pipeline(
             "spatial_p": None,
             "r2_or_pseudo": round(float(ols["r2"]), 4),
             "llf": round(float(ols["llf"]), 2),
-            "aic": round(float(ols["aic"]), 2),
-            "bic": round(float(ols["bic"]), 2),
+            "aic": round(float(ols_aic_ml), 2),
+            "bic": round(float(ols_bic_ml), 2),
             "resid_moran_i": moran_resid["moran_i"],
             "resid_moran_p": moran_resid["p"],
         },

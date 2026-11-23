@@ -112,6 +112,10 @@ def fit_ols_core(
     df_infer = df_resid
     g_count: Optional[int] = None
 
+    if cov_type == "cluster" and cluster_ids is None:
+        cov_type = "HC3"
+        cov_warnings.append("Cluster IDs unavailable; fell back to HC3 robust SEs.")
+
     if cov_type == "cluster" and cluster_ids is not None:
         uniq_g, inv_idx = np.unique(cluster_ids, return_inverse=True)
         g_count = len(uniq_g)

@@ -109,7 +109,7 @@ def _boxcox_profile_mle(y: np.ndarray, X: Optional[np.ndarray] = None) -> Tuple[
         else:
             var = float(np.mean((yt - np.mean(yt)) ** 2))
         var = max(var, 1e-18)
-        ll = -0.5 * n * math.log(var) + (lam - 1.0) * sum_log_y
+        ll = -0.5 * n * (math.log(2.0 * math.pi) + 1.0) - 0.5 * n * math.log(var) + (lam - 1.0) * sum_log_y
         return -ll
 
     res = optimize.minimize_scalar(_neg_ll, bounds=(-2.0, 2.0), method="bounded")
@@ -128,6 +128,8 @@ def _boxcox_profile_mle(y: np.ndarray, X: Optional[np.ndarray] = None) -> Tuple[
 def build_dependent_variable(
     columns: Dict[str, List[Any]],
     y_spec: Dict[str, Any],
+    X_cond: Optional[np.ndarray] = None,
+    cond_mask: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Construct target vector y, raw y, validity mask, per-obs Jacobian log|g'(y)|, and Box-Cox diagnostics."""
     mode = y_spec.get("mode", "column")
@@ -185,13 +187,25 @@ def build_dependent_variable(
         yv = y_raw[valid_y]
         if len(yv) < 5:
             raise ValueError("Insufficient positive observations for Box-Cox transformation.")
-        lam_mle, ll_mle, p_log, p_lin = _boxcox_profile_mle(yv)
+        bc_mode = "unconditional_intercept_only"
+        if X_cond is not None and cond_mask is not None:
+            cm = cond_mask & valid_y
+            if int(np.sum(cm)) >= max(10, X_cond.shape[1] + 5):
+                lam_mle, ll_mle, p_log, p_lin = _boxcox_profile_mle(y_raw[cm], X=X_cond[cm])
+                bc_mode = "conditional_on_X"
+            else:
+                lam_mle, ll_mle, p_log, p_lin = _boxcox_profile_mle(yv)
+        elif X_cond is not None and X_cond.shape[0] == len(yv):
+            lam_mle, ll_mle, p_log, p_lin = _boxcox_profile_mle(yv, X=X_cond)
+            bc_mode = "conditional_on_X"
+        else:
+            lam_mle, ll_mle, p_log, p_lin = _boxcox_profile_mle(yv)
         lam_use = float(fixed_lam) if fixed_lam is not None else lam_mle
         y_trans[valid_y] = _boxcox_transform(yv, lam_use)
         jacobian_log[valid_y] = (lam_use - 1.0) * np.log(yv)
         label = f"BoxCox({base_label}, λ={lam_use:.3f})"
         boxcox_info = {
-            "mode": "unconditional_intercept_only",
+            "mode": bc_mode,
             "lambda_used": round(lam_use, 4),
             "lambda_mle": round(lam_mle, 4),
             "ll_mle": round(ll_mle, 3),

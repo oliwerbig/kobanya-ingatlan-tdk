@@ -245,10 +245,21 @@ export class MapInspector {
     if (this._eventsBound || !this.map) return;
     this._eventsBound = true;
 
+    let _lastTargetClickTs = 0;
+    let _lastTargetClickUid = "";
     const handleTargetClick = (e) => {
       if (!e.features || !e.features.length) return;
+      if (e.point) {
+        const obsHits = this.map.queryRenderedFeatures(e.point, { layers: ["obs-points"] });
+        if (obsHits && obsHits.length > 0) return;
+      }
       const props = e.features[0].properties || {};
       if (props.target_id && props.uid && this.callbacks.onToggleOsmFeature) {
+        const now = Date.now();
+        const key = `${props.target_id}::${props.uid}`;
+        if (key === _lastTargetClickUid && now - _lastTargetClickTs < 120) return;
+        _lastTargetClickTs = now;
+        _lastTargetClickUid = key;
         this.callbacks.onToggleOsmFeature(props.target_id, props.uid);
       }
     };
@@ -285,11 +296,16 @@ export class MapInspector {
       const lim = Math.max(Math.abs(minV), Math.abs(maxV), 1e-9);
       const t = Math.max(-1, Math.min(1, val / lim));
       if (t >= 0) {
+        const r = Math.round(230 - 10 * t);
         const g = Math.round(230 - 150 * t);
-        return `rgb(220, ${g}, 60)`;
+        const b = Math.round(230 - 170 * t);
+        return `rgb(${r}, ${g}, ${b})`;
       }
-      const r = Math.round(230 + 180 * t);
-      return `rgb(${Math.max(30, r)}, 130, 235)`;
+      const u = -t;
+      const r = Math.round(230 - 180 * u);
+      const g = Math.round(230 - 100 * u);
+      const b = Math.round(230 + 5 * u);
+      return `rgb(${Math.max(30, r)}, ${g}, ${b})`;
     }
     const u = Math.max(0, Math.min(1, (val - minV) / span));
     const r = Math.round(37 + 190 * u);

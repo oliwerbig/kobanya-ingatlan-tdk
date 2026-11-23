@@ -212,19 +212,20 @@ class LocalMetricProjection:
             cos_chi = np.cos(chi)
             sin_half_c2 = np.sin(0.5 * dchi) ** 2 + self._cos_chi0 * cos_chi * (np.sin(0.5 * dlam) ** 2)
             c = 2.0 * np.arcsin(np.minimum(1.0, np.sqrt(np.maximum(0.0, sin_half_c2))))
-            c = np.minimum(c, math.pi - 1e-7)
-            k_prime = np.where(
-                c < 1e-5,
-                1.0 + (c * c) / 6.0 + (7.0 * (c ** 4)) / 360.0,
-                c / np.sin(np.maximum(c, 1e-12)),
-            )
-            x = self._r_conf * k_prime * cos_chi * np.sin(dlam)
-            y = self._r_conf * k_prime * (self._cos_chi0 * sin_chi - self._sin_chi0 * cos_chi * np.cos(dlam))
+            dx_u = cos_chi * np.sin(dlam)
+            dy_u = self._cos_chi0 * sin_chi - self._sin_chi0 * cos_chi * np.cos(dlam)
+            norm_u = np.hypot(dx_u, dy_u)
+            small_c = c < 1e-5
+            k_small = 1.0 + (c * c) / 6.0 + (7.0 * (c ** 4)) / 360.0
+            ux = np.where(norm_u > 1e-12, dx_u / np.maximum(norm_u, 1e-12), 1.0)
+            uy = np.where(norm_u > 1e-12, dy_u / np.maximum(norm_u, 1e-12), 0.0)
+            x = np.where(small_c, self._r_conf * k_small * dx_u, self._r_conf * c * ux)
+            y = np.where(small_c, self._r_conf * k_small * dy_u, self._r_conf * c * uy)
         else:
             sin_p = np.sin(phi)
             q = np.arcsinh(np.tan(phi)) - _SQRT_N_TERM * np.arctanh(_SQRT_N_TERM * sin_p)
             xi_p = np.arctan2(np.sinh(q), np.cos(dlam))
-            eta_p = np.arctanh(np.sin(dlam) / np.cosh(q))
+            eta_p = np.arctanh(np.clip(np.sin(dlam) / np.cosh(q), -0.9999999, 0.9999999))
 
             xi = xi_p.copy()
             eta = eta_p.copy()

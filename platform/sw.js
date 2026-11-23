@@ -1,7 +1,7 @@
 /* GeoSpec Service Worker — caches Pyodide WASM + CDN assets (cache-first),
  * and full same-origin app shell + py_engine (network-first with offline fallback).
  */
-const CACHE_NAME = "geospec-wasm-v5";
+const CACHE_NAME = "geospec-wasm-v6";
 
 const CORE_SHELL_ASSETS = [
   "./",
@@ -74,7 +74,12 @@ self.addEventListener("fetch", (event) => {
           }
           return resp;
         } catch (err) {
-          return (await cache.match(event.request)) || (await cache.match("./index.html")) || Response.error();
+          const cached = await cache.match(event.request);
+          if (cached) return cached;
+          if (event.request.mode === "navigate") {
+            return (await cache.match("./index.html")) || Response.error();
+          }
+          return Response.error();
         }
       })
     );

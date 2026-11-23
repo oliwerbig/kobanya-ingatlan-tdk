@@ -187,6 +187,7 @@ export function renderStage3(container, ctx) {
   container.querySelectorAll(".spec-tab").forEach((b) => {
     b.addEventListener("click", () => {
       state.activeSpecId = b.getAttribute("data-spec-id");
+      actions.restyleMap?.();
       actions.render();
     });
   });

@@ -522,3 +522,132 @@ def test_export_fallback_osm_bundle_and_closed_preview_rings():
     assert osm_b["targets"]["park"]["source_kind"] == "geojson"
     assert "payload" in osm_b["targets"]["park"]
     assert osm_b["targets"]["park"]["target_cfg"]["id"] == "park"
+
+
+def test_round2_p0_regressions():
+    """Verify Round-2 swarm audit P0 fixes:
+    1. Closed polygon boundary distance (4th closing edge not missing).
+    2. Conditional Box-Cox estimation in GeoSpecSession & exact normal constant in profile MLE.
+    3. Stage 4 OLS vs SAR AIC +2.0 parity when rho ~ 0 and SDM small-N fallback guard.
+    4. Single-pass _latex_escape without double-escaping backslash braces.
+    5. build_qgis_geojson multi-stage valid_indices alignment and auto-hydrated csv_column targets.
+    """
+    from py_engine.exporters import _latex_escape, build_qgis_geojson
+    from py_engine.spatial_gis import compute_target_distances, parse_geojson_features
+    from py_engine.projection import LocalMetricProjection
+
+    # 1. Single-pass LaTeX escape
+    assert _latex_escape(r"a\b_c") == r"a\textbackslash{}b\_c"
+
+    # 2. Unclosed 4-point GeoJSON square polygon boundary: point near the 4th closing edge (west edge x=19.0)
+    proj = LocalMetricProjection(47.501, 19.001)
+    unclosed_poly = {
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "id": "sq1",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[19.000, 47.500], [19.002, 47.500], [19.002, 47.502], [19.000, 47.502]]],
+            },
+        }],
+    }
+    feats = parse_geojson_features(unclosed_poly, proj)
+    # Point just west of the 4th edge (lon=18.9999, lat=47.501 -> ~7.5m from west edge, >110m from north/south edges)
+    px, py = proj.forward(np.array([47.501]), np.array([18.9999]))
+    obs_xy = np.column_stack([px, py])
+    d_res = compute_target_distances(
+        obs_xy,
+        np.array([True]),
+        feats,
+        {"id": "sq", "geometry_handling": "polygon_boundary", "inside_is_zero": False, "distance_modes": "euclidean"},
+        proj,
+        None,
+    )
+    assert float(d_res["dist_eucl"][0]) < 20.0
+
+    # 3. Auto-hydrated csv_column targets + Conditional Box-Cox + Stage 4 OLS/SAR AIC parity
+    rng = np.random.default_rng(2026)
+    n = 45
+    lat = 47.49 + rng.uniform(-0.01, 0.01, n)
+    lon = 19.14 + rng.uniform(-0.01, 0.01, n)
+    x_val = rng.uniform(30.0, 100.0, n)
+    d_csv = rng.uniform(50.0, 800.0, n)
+    # True log-linear model so conditional Box-Cox lambda_mle is near 0
+    y_val = np.exp(10.0 + 0.015 * x_val - 0.0004 * d_csv + rng.normal(0, 0.08, n))
+
+    sess = GeoSpecSession()
+    sess.load_dataset(
+        {
+            "id": list(range(n)),
+            "lat": lat.tolist(),
+            "lon": lon.tolist(),
+            "price": y_val.tolist(),
+            "area": x_val.tolist(),
+            "dist_park_m": d_csv.tolist(),
+        },
+        "lat",
+        "lon",
+    )
+    recipe = {
+        "dataset_schema": {
+            "row_id_col": "id",
+            "lat_col": "lat",
+            "lon_col": "lon",
+            "y_spec": {"mode": "column", "num_col": "price", "transform": "boxcox", "boxcox_lambda": None},
+            "cluster_spec": {"mode": "none"},
+            "selection_spec": {"enabled": False},
+        },
+        "spatial_targets": [
+            {"id": "park", "name": "Park CSV", "source": "csv_column", "csv_col": "dist_park_m", "distance_modes": "euclidean"}
+        ],
+        "models": [
+            {
+                "id": "m1",
+                "name": "M1",
+                "active": True,
+                "covariates": [{"col": "area", "type": "numeric", "transform": "raw"}],
+                "spatial_terms": [{"target_id": "park", "metric": "eucl", "transform": "linear"}],
+                "interactions": [],
+            }
+        ],
+        "spatial_engine": {
+            "active_model_id": "m1",
+            "weights": [{"id": "knn4", "type": "knn", "k": 4}],
+        },
+    }
+    # Deliberately call Stage 3 WITHOUT calling Stage 1 first: csv_column must auto-hydrate and Box-Cox must be conditional_on_X
+    s3 = sess.run_stage_3_ols_workbench(recipe, run_id=1)
+    assert s3["ok"] is True
+    assert "park" in sess.dist_results
+    s2 = sess.run_stage_2_descriptives_and_composition(recipe, run_id=1)
+    assert s2["descriptives"]["boxcox_info"]["mode"] == "conditional_on_X"
+
+    s4 = sess.run_stage_4_spatial_econometrics(recipe, run_id=1)
+    assert s4["ok"] is True
+    comp = {row["model"]: row for row in s4["model_comparison"]}
+    # OLS AIC in Stage 4 uses k = X.shape[1] + 1 (counting sigma^2), so at the same LLF, AIC_SAR - AIC_OLS <= 2.0
+    ols_aic = comp["OLS (Baseline)"]["aic"]
+    ols_llf = comp["OLS (Baseline)"]["llf"]
+    sar_aic = comp["SAR (ML, knn4)"]["aic"]
+    sar_llf = comp["SAR (ML, knn4)"]["llf"]
+    assert abs((sar_aic + 2.0 * sar_llf) - (ols_aic + 2.0 * ols_llf) - 2.0) < 0.1
+
+    # 4. build_qgis_geojson with mismatched valid_indices across active_ols and spatial_res
+    gj = build_qgis_geojson(
+        row_ids=[0, 1, 2],
+        lat_arr=[47.5, 47.51, 47.52],
+        lon_arr=[19.1, 19.11, 19.12],
+        y_raw=[100.0, 200.0, 300.0],
+        y_trans=[4.6, 5.3, 5.7],
+        dist_dict={},
+        active_ols={"valid_indices": [0, 2], "fitted": [4.5, 5.8], "resid": [0.1, -0.1], "cooks_d": [0.01, 0.02]},
+        spatial_res={"ok": True, "valid_indices": [1, 2], "lisa_y": {"quadrants": ["HH", "LL"]}, "lisa_resid": {"quadrants": ["NS", "HL"]}},
+        gwr_res=None,
+        analytic_indices=[0, 2],
+    )
+    p0, p1, p2 = [f["properties"] for f in gj["features"]]
+    assert p0["ols_fitted"] == 4.5 and "lisa_y_quad" not in p0
+    assert "ols_fitted" not in p1 and p1["lisa_y_quad"] == "HH"
+    assert p2["ols_fitted"] == 5.8 and p2["lisa_y_quad"] == "LL"
+
