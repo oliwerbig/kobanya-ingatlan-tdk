@@ -194,7 +194,7 @@ export function sanitizeRecipe(loaded, defaults) {
             .map((w, idx) => ({
               ...w,
               id: cleanStr(w.id, `w_${idx + 1}`),
-              type: ["knn", "idw", "network_idw"].includes(w.type) ? w.type : "knn",
+              type: ["knn", "idw", "network_idw", "adaptive_bisquare"].includes(w.type) ? w.type : "knn",
               k: Math.round(clampNum(w.k, 1, 200, 5)),
               power: clampNum(w.power, 0.25, 5, 1.0),
               cutoff_m: clampNum(w.cutoff_m, 50, 100000, 1500),
@@ -206,13 +206,17 @@ export function sanitizeRecipe(loaded, defaults) {
         mode: ["gwr", "mgwr"].includes(gwrIn.mode) ? gwrIn.mode : (dSp.gwr.mode || "gwr"),
         kappa_thresh: clampNum(gwrIn.kappa_thresh, 1, 10000, dSp.gwr.kappa_thresh),
         b_min_floor: Math.round(clampNum(gwrIn.b_min_floor, 10, 5000, dSp.gwr.b_min_floor ?? 30)),
-        prevalence_min_pct: clampNum(gwrIn.prevalence_min_pct, 0, 50, dSp.gwr.prevalence_min_pct ?? 15.0),
+        prevalence_min_pct: (() => {
+          const rawP = Number(gwrIn.prevalence_min_pct);
+          const norm = Number.isFinite(rawP) && rawP > 1.0 ? rawP / 100.0 : gwrIn.prevalence_min_pct;
+          return clampNum(norm, 0, 0.5, dSp.gwr.prevalence_min_pct ?? 0.10);
+        })(),
       },
     },
     guards_cfg: {
       ...defaults.guards_cfg,
       ...grdIn,
-      sparse_min_cell: Math.round(clampNum(grdIn.sparse_min_cell, 1, 200, defaults.guards_cfg.sparse_min_cell)),
+      sparse_min_cell: Math.round(clampNum(grdIn.sparse_min_cell, 0, 200, defaults.guards_cfg.sparse_min_cell)),
       hc3_leverage_warn: clampNum(grdIn.hc3_leverage_warn, 0.05, 0.999, defaults.guards_cfg.hc3_leverage_warn),
       heckman_min_excluded: Math.round(clampNum(grdIn.heckman_min_excluded, 1, 5000, defaults.guards_cfg.heckman_min_excluded)),
       heckman_min_analytic: Math.round(clampNum(grdIn.heckman_min_analytic, 10, 5000, defaults.guards_cfg.heckman_min_analytic)),

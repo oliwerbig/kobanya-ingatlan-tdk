@@ -492,7 +492,7 @@ const actions = {
       if (myDsSeq !== datasetSeq) return false;
       const targets = state.recipe.spatial_targets || [];
       const osmTargets = targets.filter((t) => t.source === "osm_preset" || t.source === "osm_custom_tag");
-      const routingTargets = targets.filter((t) => t.distance_modes === "network_dijkstra" || t.distance_modes === "both");
+      const routingTargets = targets.filter((t) => t.source !== "csv_column" && (t.distance_modes === "network_dijkstra" || t.distance_modes === "both"));
       const needProfiles = new Set(routingTargets.map((t) => t.routing_profile || "walk"));
       const streetBufM = Math.max(800, ...targets.map((t) => Number(t.bbox_buffer_m ?? 800) || 800));
       mapInspector.setFetchedBbox(padBbox(state.datasetInfo.bbox, streetBufM));
@@ -725,7 +725,7 @@ const actions = {
       const needProfiles = Array.from(
         new Set(
           state.recipe.spatial_targets
-            .filter((t) => t.distance_modes === "network_dijkstra" || t.distance_modes === "both")
+            .filter((t) => t.source !== "csv_column" && (t.distance_modes === "network_dijkstra" || t.distance_modes === "both"))
             .map((t) => t.routing_profile || "walk")
         )
       );

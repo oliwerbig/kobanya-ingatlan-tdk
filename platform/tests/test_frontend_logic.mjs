@@ -425,5 +425,33 @@ test("Round-4: Antimeridian, Postpass abutment connectors, sanitizeRecipe harden
   } finally {
     setLang(prev);
   }
+
+  // 6. sanitizeRecipe preserves sparse_min_cell=0, adaptive_bisquare W & normalizes prevalence fraction
+  const repEdge = sanitizeRecipe({
+    guards_cfg: { sparse_min_cell: 0 },
+    spatial_engine: {
+      weights: [{ id: "ab", type: "adaptive_bisquare", k: 25 }],
+      gwr: { prevalence_min_pct: 15.0 },
+    },
+  }, createDefaultRecipe());
+  assert.equal(repEdge.guards_cfg.sparse_min_cell, 0);
+  assert.equal(repEdge.spatial_engine.weights[0].type, "adaptive_bisquare");
+  assert.equal(repEdge.spatial_engine.gwr.prevalence_min_pct, 0.15);
+
+  const giDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "geospec_input");
+  for (const rFile of [
+    "kobanya_paper_replication_recipe.json",
+    "leopoldstadt_paper_replication_recipe.json",
+    "kobanya_recipe.json",
+    "leopoldstadt_recipe.json",
+  ]) {
+    const absR = path.join(giDir, rFile);
+    if (!fs.existsSync(absR)) continue;
+    const rawR = JSON.parse(fs.readFileSync(absR, "utf8"));
+    const sanR = sanitizeRecipe(rawR, createDefaultRecipe());
+    assert.equal(sanR.guards_cfg.sparse_min_cell, rawR.guards_cfg.sparse_min_cell);
+    assert.equal(sanR.spatial_engine.gwr.prevalence_min_pct, rawR.spatial_engine.gwr.prevalence_min_pct);
+    assert.equal(sanR.spatial_targets.find((t) => t.id === "allomas").distance_modes, "network_dijkstra");
+  }
 });
 

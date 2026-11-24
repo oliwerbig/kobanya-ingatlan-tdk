@@ -769,8 +769,15 @@ function renderTargetRow(t, idx, numCols, previewInfo, filterQuery, hasRawSnapsh
       </div>
       ${
         t.source === "csv_column"
-          ? `<div class="field-row"><label>Meglévő távolságoszlop (méter)</label>
-             <select class="tgt-csv-col" aria-label="Meglévő távolságoszlop">${csvColOptions}</select></div>`
+          ? `<div class="grid-2">
+               <div class="field-row"><label>Meglévő távolságoszlop (méter)</label>
+               <select class="tgt-csv-col" aria-label="Meglévő távolságoszlop">${csvColOptions}</select></div>
+               <div class="field-row"><label>Távolság típusa</label>
+               <select class="tgt-mode" aria-label="Távolság típusa">
+                 <option value="euclidean" ${t.distance_modes === "euclidean" ? "selected" : ""}>Euklideszi (légvonal)</option>
+                 <option value="network_dijkstra" ${t.distance_modes === "network_dijkstra" ? "selected" : ""}>Hálózati (előszámított)</option>
+               </select></div>
+             </div>`
           : `<div class="grid-3">
                <div class="field-row">
                  <label>Geometria kezelése</label>

@@ -1114,25 +1114,65 @@ def test_golden_cross_city_replication_and_best_practice():
     assert kb_rep["guards_cfg"]["sparse_min_cell"] == 0
     assert kb_rep["default_cov_type"] == "HC3"
 
-    expected_m2 = {
-        "kobanya": {"n": 269, "k": 20, "r2": 0.6667, "adj_r2": 0.6413},
-        "leopoldstadt": {"n": 378, "k": 17, "r2": 0.7418, "adj_r2": 0.7304},
+    expected_paper = {
+        "kobanya": {
+            "m1_base": {"n": 269, "k": 13, "r2": 0.6223, "adj_r2": 0.6046},
+            "m2_rings": {"n": 269, "k": 20, "r2": 0.6667, "adj_r2": 0.6413},
+            "m3_log": {"n": 269, "k": 16, "r2": 0.6359, "adj_r2": 0.6143},
+            "m4_ad": {"n": 269, "k": 16, "r2": 0.6320, "adj_r2": 0.6102},
+        },
+        "leopoldstadt": {
+            "m1_base": {"n": 378, "k": 11, "r2": 0.6821, "adj_r2": 0.6735},
+            "m2_rings": {"n": 378, "k": 17, "r2": 0.7418, "adj_r2": 0.7304},
+            "m3_log": {"n": 378, "k": 14, "r2": 0.7365, "adj_r2": 0.7271},
+            "m4_ad": {"n": 378, "k": 14, "r2": 0.7580, "adj_r2": 0.7494},
+        },
     }
-    for city, exp in expected_m2.items():
+
+    for city, exp_models in expected_paper.items():
         cols = _load_csv_cols(_GI_DIR / f"{city}_dataset.csv")
         rep = json.loads((_GI_DIR / f"{city}_paper_replication_recipe.json").read_text(encoding="utf-8"))
+        bp = json.loads((_GI_DIR / f"{city}_recipe.json").read_text(encoding="utf-8"))
+
+        # Verify allomas uses pre-computed network distances across targets and spatial_terms in all 4 recipes
+        for r_chk in (rep, bp):
+            allm_tgt = next(t for t in r_chk["spatial_targets"] if t["id"] == "allomas")
+            assert allm_tgt["distance_modes"] == "network_dijkstra"
+            for m_chk in r_chk["models"]:
+                for st in m_chk.get("spatial_terms", []):
+                    if st["target_id"] == "allomas":
+                        assert st["metric"] == "net"
+
+        assert rep["guards_cfg"]["sparse_min_cell"] == 0
+        assert rep["default_cov_type"] == "HC3"
+        assert rep["spatial_engine"]["se_mode"] == "ml"
+        assert bp["guards_cfg"]["sparse_min_cell"] == 5
+        assert bp["default_cov_type"] == "cluster"
+        assert bp["dataset_schema"]["cluster_spec"]["mode"] == "coordinate_radius"
+        assert bp["spatial_engine"]["weights"][0]["dedup_colocated"] is True
+        assert bp["spatial_engine"]["se_mode"] == "qml"
+
+        # 1. Run Paper Replication recipe Stages 1-5 + assert M1-M4 exact parity
         sess = GeoSpecSession()
         sess.load_dataset(cols, "wgs84_lat", "wgs84_long")
         s1 = sess.run_stage_1_distances(rep)
         assert s1["ok"]
-        s3 = sess.run_stage_3_ols_workbench(rep)
+        allm_sum = next(x for x in s1["summary"] if x["target_id"] == "allomas")
+        assert allm_sum["median_eucl_m"] is None and allm_sum["median_net_m"] > 0
+        assert sess.run_stage_2_descriptives_and_composition(rep)["ok"]
+        s3 = sess.run_stage_3_ols_workbench(rep, cov_type=rep["default_cov_type"])
         assert s3["ok"]
-        m2 = next(m for m in s3["models"] if m["model_id"] == "m2_rings")
-        assert m2["n_obs"] == exp["n"]
-        assert m2["k_params"] == exp["k"]
-        assert m2["r2"] == pytest.approx(exp["r2"], abs=0.002)
-        assert m2["adj_r2"] == pytest.approx(exp["adj_r2"], abs=0.002)
-        assert m2["cov_type_used"] == "HC3"
+        for mid, exp in exp_models.items():
+            m_out = next(m for m in s3["models"] if m["model_id"] == mid)
+            assert m_out["n_obs"] == exp["n"]
+            assert m_out["k_params"] == exp["k"]
+            assert m_out["r2"] == pytest.approx(exp["r2"], abs=0.002)
+            assert m_out["adj_r2"] == pytest.approx(exp["adj_r2"], abs=0.002)
+            assert m_out["cov_type_used"] == "HC3"
+        s4_rep = sess.run_stage_4_spatial_econometrics(rep)
+        assert s4_rep["ok"] and s4_rep["se_mode"] == "ml"
+        s5_rep = sess.run_stage_5_gwr(rep)
+        assert s5_rep["ok"]
 
         # Verify live unclipped GeoJSON Euclidean distance parity vs CSV columns (<= 0.5 m median)
         for gj_name, csv_col in [(f"{city}_railways.geojson", "dist_vagany_m"), (f"{city}_roads.geojson", "dist_fout_m")]:
@@ -1146,19 +1186,28 @@ def test_golden_cross_city_replication_and_best_practice():
             med_err = float(np.median(np.abs(res["dist_eucl"][ok_m] - csv_v[ok_m])))
             assert med_err <= 0.5
 
-    # Full Best-Practice E2E on Kőbánya Stages 1-5 + ZIP bundle
-    kb_cols = _load_csv_cols(_GI_DIR / "kobanya_dataset.csv")
-    sess_bp = GeoSpecSession()
-    sess_bp.load_dataset(kb_cols, "wgs84_lat", "wgs84_long")
-    assert sess_bp.run_stage_1_distances(kb_bp)["ok"]
-    assert sess_bp.run_stage_2_descriptives_and_composition(kb_bp)["ok"]
-    assert sess_bp.run_stage_3_ols_workbench(kb_bp)["ok"]
-    assert sess_bp.run_stage_4_spatial_econometrics(kb_bp)["ok"]
-    assert sess_bp.run_stage_5_gwr(kb_bp)["ok"]
-    z_bp = sess_bp.export_publication_bundle(kb_bp)
-    assert z_bp["ok"]
-    with zipfile.ZipFile(io.BytesIO(z_bp["zip_bytes"]), "r") as zf:
-        assert "experiment_recipe.json" in zf.namelist()
-        assert "spatial/style_gwr_r2.qml" in zf.namelist()
+        # 2. Full Best-Practice E2E Stages 1-5 + Robustness Matrix + ZIP bundle
+        sess_bp = GeoSpecSession()
+        sess_bp.load_dataset(cols, "wgs84_lat", "wgs84_long")
+        assert sess_bp.run_stage_1_distances(bp)["ok"]
+        assert sess_bp.run_stage_2_descriptives_and_composition(bp)["ok"]
+        s3_bp = sess_bp.run_stage_3_ols_workbench(bp, cov_type=bp["default_cov_type"])
+        assert s3_bp["ok"] and all("cluster" in m["cov_type_used"].lower() for m in s3_bp["models"])
+        s4_bp = sess_bp.run_stage_4_spatial_econometrics(bp)
+        assert s4_bp["ok"] and s4_bp["se_mode"] == "qml"
+        assert s4_bp["weights_robustness"][0]["colocated_pairs_pct"] == 0.0
+        if city == "kobanya":
+            idw_row = next(w for w in s4_bp["weights_robustness"] if w["w_id"] == "idw_auto")
+            assert idw_row["islands"] == 0
+        s5_bp = sess_bp.run_stage_5_gwr(bp)
+        assert s5_bp["ok"]
+        rob_bp = sess_bp.run_robustness_matrix(bp)
+        assert rob_bp["ok"] and len(rob_bp["rows"]) == 6
+        z_bp = sess_bp.export_publication_bundle(bp)
+        assert z_bp["ok"]
+        with zipfile.ZipFile(io.BytesIO(z_bp["zip_bytes"]), "r") as zf:
+            assert "experiment_recipe.json" in zf.namelist()
+            assert "spatial/style_gwr_r2.qml" in zf.namelist()
+
 
 

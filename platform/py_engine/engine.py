@@ -276,12 +276,14 @@ class GeoSpecSession:
         """Build a standardized distance dict for a pre-computed CSV column target."""
         col_n = tgt.get("csv_col")
         arr = parse_numeric_array(self.columns[col_n]) if col_n in self.columns else np.full(self.n_rows, np.nan)
+        nan_arr = np.full(self.n_rows, np.nan, dtype=np.float64)
+        mode = str(tgt.get("distance_modes") or "euclidean")
         return {
-            "dist_eucl": arr,
-            "dist_net": np.full(self.n_rows, np.nan),
-            "travel_time_min": np.full(self.n_rows, np.nan),
-            "circuity_delta": np.full(self.n_rows, np.nan),
-            "circuity_ratio": np.full(self.n_rows, np.nan),
+            "dist_eucl": arr if mode in ("euclidean", "both") else nan_arr.copy(),
+            "dist_net": arr if mode in ("network_dijkstra", "both") else nan_arr.copy(),
+            "travel_time_min": nan_arr.copy(),
+            "circuity_delta": nan_arr.copy(),
+            "circuity_ratio": nan_arr.copy(),
             "snap_status": np.zeros(self.n_rows, dtype=np.int32),
             "n_active_features": 1,
             "n_excluded_features": 0,
@@ -701,7 +703,9 @@ class GeoSpecSession:
                 if recipe.get("spatial_targets"):
                     ftgt = recipe["spatial_targets"][0]["id"]
                     if ftgt in self.dist_results:
-                        focal_dist = (ftgt, self.dist_results[ftgt]["dist_eucl"][design["valid_mask"]])
+                        d_rec = self.dist_results[ftgt]
+                        f_arr = d_rec["dist_eucl"] if np.any(np.isfinite(d_rec["dist_eucl"])) else d_rec["dist_net"]
+                        focal_dist = (ftgt, f_arr[design["valid_mask"]])
 
                 diag = run_guard1_diagnostics(design["X"], design["y"], ols, design["col_meta"], proxy_sub, focal_dist)
 
