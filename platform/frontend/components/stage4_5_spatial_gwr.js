@@ -107,8 +107,8 @@ export function renderStage4(container, ctx) {
           <div style="padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-alt);">
             <div><strong>Elhorst Common-Factor (SDM):</strong> ${escapeHtml(s4.elhorst?.verdict)}</div>
             <div class="mono" style="font-size:11px;margin-top:4px;">
-              LR(H₀: θ=0 vs SAR)=${s4.elhorst?.lr_vs_sar} (p=${s4.elhorst?.p_vs_sar})<br/>
-              LR(H₀: θ+ρβ=0 vs SEM)=${s4.elhorst?.lr_vs_sem} (p=${s4.elhorst?.p_vs_sem})<br/>
+              LR(H₀: θ=0 vs SAR)=${s4.elhorst?.lr_vs_sar ?? "—"} (p=${s4.elhorst?.p_vs_sar ?? "—"})<br/>
+              LR(H₀: θ+ρβ=0 vs SEM)=${s4.elhorst?.lr_vs_sem ?? "—"} (p=${s4.elhorst?.p_vs_sem ?? "—"})<br/>
               LISA Klaszterek: HH=${s4.lisa_resid?.counts?.HH ?? 0} | LL=${s4.lisa_resid?.counts?.LL ?? 0} | HL=${s4.lisa_resid?.counts?.HL ?? 0} | LH=${s4.lisa_resid?.counts?.LH ?? 0}
             </div>
           </div>
@@ -127,9 +127,9 @@ export function renderStage4(container, ctx) {
                     <td><strong>${escapeHtml(r.model)}</strong></td>
                     <td class="num">${r.spatial_param ?? "—"}</td>
                     <td class="num">${r.spatial_se !== null ? `${r.spatial_se} (p=${r.spatial_p})` : "—"}</td>
-                    <td class="num">${r.r2_or_pseudo}</td>
-                    <td class="num">${r.llf}</td><td class="num">${r.aic}</td>
-                    <td class="num">${r.resid_moran_i} (${r.resid_moran_p})</td>
+                    <td class="num">${r.r2_or_pseudo ?? "—"}</td>
+                    <td class="num">${r.llf ?? "—"}</td><td class="num">${r.aic ?? "—"}</td>
+                    <td class="num">${r.resid_moran_i ?? "—"} ${r.resid_moran_p !== null && r.resid_moran_p !== undefined ? `(${r.resid_moran_p})` : ""}</td>
                   </tr>`
                 )
                 .join("")}

@@ -369,11 +369,16 @@ function renderStage3ResultsHTML(state, s3) {
   return `
     ${
       s3.conditional_boxcox
-        ? `<div class="alert-box info">
+        ? `<div class="alert-box ${s3.conditional_boxcox.p_vs_log < 0.05 && valid.some((m) => m.y_transform === "log" || m.y_transform === "log1p") ? "" : "info"}">
              <strong>Feltételes Box–Cox (${escapeHtml(s3.conditional_boxcox.model_id)} | X adott):</strong>
              λ̂ = <span class="mono">${escapeHtml(s3.conditional_boxcox.lambda_mle)}</span> |
              LR teszt ln(y) ellen: p = <span class="mono">${escapeHtml(s3.conditional_boxcox.p_vs_log)}</span> |
              lineáris y ellen: p = <span class="mono">${escapeHtml(s3.conditional_boxcox.p_vs_linear)}</span>
+             ${
+               s3.conditional_boxcox.p_vs_log < 0.05 && valid.some((m) => m.y_transform === "log" || m.y_transform === "log1p")
+                 ? `<div style="margin-top:4px;font-size:11px;">⚠️ A Box–Cox MLE statisztikailag elveti a tiszta ln(y) formát (p &lt; 0.05). Városközi összehasonlításnál a semi-log forma védhető, de célszerű lineáris vagy Box–Cox robusztussági futtatást is mellékelni.</div>`
+                 : ""
+             }
            </div>`
         : ""
     }

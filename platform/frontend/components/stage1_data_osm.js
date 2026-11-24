@@ -138,7 +138,7 @@ export function renderStage1(container, ctx) {
         </div>
       </div>
 
-      <div class="dropzone" id="csvDropzone">
+      <div class="dropzone" id="csvDropzone" tabindex="0" role="button" aria-label="Fájlok kiválasztása vagy áthúzása">
         <div style="font-weight:600;margin-bottom:4px;">📂 Húzd ide vagy válaszd ki a fájlokat (CSV, GeoJSON, Recept, OSM Bundle, .geospec.json)</div>
         <div class="card-subtitle">Egyszerre több fájl is kijelölhető (pl. adat + recept + GeoJSON célpontok) | Elválasztók: <code>,</code> <code>;</code> <code>Tab</code> | UTF-8 &amp; Windows-1250</div>
         <input type="file" id="csvFileInput" accept=".csv,.tsv,.txt,.geojson,.json" multiple style="display:none" />
@@ -187,6 +187,22 @@ export function renderStage1(container, ctx) {
           </div>
         </div>
       </div>
+
+      ${
+        headers.length > 0 && state.columns && state.nRows > 0
+          ? `<div style="margin-top:10px;">
+               <div class="card-subtitle" style="margin-bottom:4px;"><strong>Sorelőnézet</strong> (első ${Math.min(5, state.nRows)} sor a betöltött ${state.nRows} sorból — kódolás és tizedesjel ellenőrzéséhez):</div>
+               <div class="table-wrap" style="max-height:170px;overflow:auto;">
+                 <table class="academic" style="font-size:11px;">
+                   <thead><tr>${headers.map((h) => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>
+                   <tbody>
+                     ${Array.from({ length: Math.min(5, state.nRows) }, (_, rIdx) => `<tr>${headers.map((h) => `<td class="mono">${escapeHtml(state.columns[h]?.[rIdx] ?? "")}</td>`).join("")}</tr>`).join("")}
+                   </tbody>
+                 </table>
+               </div>
+             </div>`
+          : ""
+      }
 
       ${
         (state.datasetInfo?.warnings || []).length > 0
@@ -368,6 +384,12 @@ export function renderStage1(container, ctx) {
   const dropzone = container.querySelector("#csvDropzone");
   const fileInput = container.querySelector("#csvFileInput");
   dropzone.addEventListener("click", () => fileInput.click());
+  dropzone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      fileInput.click();
+    }
+  });
   dropzone.addEventListener("dragover", (e) => {
     e.preventDefault();
     dropzone.classList.add("dragover");

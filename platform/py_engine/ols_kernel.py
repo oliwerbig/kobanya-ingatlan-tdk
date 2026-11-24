@@ -88,9 +88,10 @@ def fit_ols_core(
     adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / df_resid if df_resid > 0 else 0.0
     sigma2 = rss / df_resid
     llf = -0.5 * n * (math.log(2.0 * math.pi) + math.log(max(rss / n, 1e-18)) + 1.0)
-    aic = 2.0 * k - 2.0 * llf
-    bic = k * math.log(n) - 2.0 * llf
-    aicc = aic + (2.0 * k * (k + 1)) / max(1, n - k - 1)
+    k_ml = k + 1  # Include residual variance sigma^2 for ML AIC/BIC parity with SAR/SEM/SDM
+    aic = 2.0 * k_ml - 2.0 * llf
+    bic = k_ml * math.log(n) - 2.0 * llf
+    aicc = aic + (2.0 * k_ml * (k_ml + 1)) / max(1, n - k_ml - 1)
 
     q, r = np.linalg.qr(X, mode="reduced")
     diag_r = np.abs(np.diag(r)) if k > 0 else np.array([1.0])

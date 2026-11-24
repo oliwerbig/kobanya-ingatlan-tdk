@@ -651,3 +651,121 @@ def test_round2_p0_regressions():
     assert "ols_fitted" not in p1 and p1["lisa_y_quad"] == "HH"
     assert p2["ols_fitted"] == 5.8 and p2["lisa_y_quad"] == "LL"
 
+
+def test_round3_best_practice_and_regressions():
+    """Verify Round-3 swarm audit fixes (ECON-01..03, ARCH-02/04, M3-04/05, and recipe split)."""
+    import io
+    import json
+    import pathlib
+    import zipfile
+    from py_engine.dag_cache import DAGCache
+    from py_engine.spatial_kernel import run_spatial_pipeline
+
+    # 1. ECON-01: SDM small-N underdetermined fallback without crash or SAR masquerade
+    rng = np.random.default_rng(77)
+    n_small, k_small = 10, 6  # K_sdm = 6 + 5 = 11 => n_small <= K_sdm + 2
+    X_s = np.column_stack([np.ones(n_small), rng.normal(size=(n_small, k_small - 1))])
+    y_s = rng.normal(10.0, 1.0, size=n_small)
+    coords_s = rng.uniform(0.0, 500.0, size=(n_small, 2))
+    sp_small = run_spatial_pipeline(
+        X_s, y_s, ["Intercept", "x1", "x2", "x3", "x4", "x5"], coords_s,
+        [{"id": "knn3", "type": "knn", "k": 3}], krinsky_robb_draws=200, lisa_fdr=False,
+    )
+    assert sp_small["ok"] is True
+    assert sp_small["sdm_underdetermined"] is True
+    assert sp_small["impacts_sdm"] == []
+    assert sp_small["elhorst"]["lr_vs_sar"] is None
+    sdm_row = sp_small["model_comparison"][-1]
+    assert sdm_row.get("underdetermined") is True
+    assert sdm_row["aic"] is None
+    assert any("SDM underdetermined" in msg for msg in sp_small["guard5_alerts"])
+
+    # 2. ARCH-04: DAGCache bounded LRU eviction
+    dc = DAGCache()
+    for i in range(12):
+        dc.set("dist", f"k_{i}", i)
+    assert len(dc._store["dist"]) == DAGCache.HEAVY_MAX_ENTRIES
+    assert dc.get("dist", "k_0") is None
+    assert dc.get("dist", "k_11") == 11
+
+    # 3. ECON-02, ECON-03, ARCH-02, M3-04, M3-05 via full GeoSpecSession
+    n = 55
+    lat = 47.48 + rng.uniform(-0.008, 0.008, n)
+    lon = 19.14 + rng.uniform(-0.008, 0.008, n)
+    area = rng.uniform(35.0, 95.0, n)
+    hood = ["A" if i % 2 == 0 else "B" for i in range(n)]
+    # Make y depend strongly on categorical + spatial proximity so unconditional vs full-design Box-Cox differ
+    y = np.exp(10.2 + 0.012 * area + np.where(np.array(hood) == "A", 0.35, 0.0) + rng.normal(0, 0.1, n))
+
+    sess = GeoSpecSession()
+    sess.load_dataset(
+        {"id": list(range(n)), "lat": lat.tolist(), "lon": lon.tolist(), "price": y.tolist(), "area": area.tolist(), "hood": hood},
+        "lat", "lon",
+    )
+    tgt1 = {
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "id": "st1", "geometry": {"type": "Point", "coordinates": [19.14, 47.48]}}],
+    }
+    tgt2 = {
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "id": "st1", "geometry": {"type": "Point", "coordinates": [19.15, 47.49]}}],
+    }
+    rec = {
+        "dataset_schema": {
+            "row_id_col": "id", "lat_col": "lat", "lon_col": "lon",
+            "y_spec": {"mode": "column", "num_col": "price", "transform": "boxcox", "boxcox_lambda": None},
+            "cluster_spec": {"mode": "none"}, "selection_spec": {"enabled": False},
+        },
+        "spatial_targets": [{"id": "st", "name": "Station", "source": "geojson", "geometry_handling": "point", "distance_modes": "euclidean"}],
+        "models": [{
+            "id": "m1", "name": "M1", "active": True,
+            "covariates": [{"col": "area", "type": "numeric", "transform": "raw"}, {"col": "hood", "type": "categorical"}],
+            "spatial_terms": [{"target_id": "st", "metric": "eucl", "transform": "log"}],
+            "interactions": [],
+        }],
+        "spatial_engine": {
+            "active_model_id": "m1",
+            "weights": [{"id": "knn5", "type": "knn", "k": 5, "dedup_colocated": True}],
+            "krinsky_robb_draws": 150,
+            "gwr": {"focal_model_id": "m1", "jitter_m": 1.0, "b_min_floor": 12, "kappa_thresh": 1000.0},
+        },
+    }
+
+    # ARCH-02: Same feature count (1) & same uid ('st1'), moved coordinates -> must recompute distances
+    sess.ingest_target_raw("st", tgt1, source_kind="geojson")
+    s1_a = sess.run_stage_1_distances(rec, run_id=1)
+    sess.ingest_target_raw("st", tgt2, source_kind="geojson")
+    s1_b = sess.run_stage_1_distances(rec, run_id=2)
+    assert s1_a["summary"][0]["median_eucl_m"] != s1_b["summary"][0]["median_eucl_m"]
+
+    # ECON-02 & ECON-03: Full-design Box-Cox lambda matches Stage 3 conditional_boxcox & OLS AIC matches Stage 4
+    s2 = sess.run_stage_2_descriptives_and_composition(rec, run_id=3)
+    s3 = sess.run_stage_3_ols_workbench(rec, cov_type="HC3", run_id=4)
+    s4 = sess.run_stage_4_spatial_econometrics(rec, run_id=5)
+    s5 = sess.run_stage_5_gwr(rec, run_id=6)
+    assert s2["ok"] and s3["ok"] and s4["ok"] and s5["ok"]
+    assert s2["descriptives"]["boxcox_info"]["mode"] == "conditional_on_X"
+    assert abs(s2["descriptives"]["boxcox_info"]["lambda_mle"] - s3["conditional_boxcox"]["lambda_mle"]) <= 1e-4
+    assert s3["models"][0]["aic"] == s4["model_comparison"][0]["aic"]
+
+    # M3-04 & M3-05: Publication bundle has Stage 4/5 LaTeX tables, Box-Cox note, and gwr_fdr_sig_*
+    bundle = sess.export_publication_bundle(rec)
+    with zipfile.ZipFile(io.BytesIO(bundle["zip_bytes"]), "r") as zf:
+        names = set(zf.namelist())
+        assert "latex/spatial_models_comparison.tex" in names
+        assert "latex/gwr_summary.tex" in names
+        tex_main = zf.read("latex/regression_comparison.tex").decode("utf-8")
+        assert "Box--Cox" in tex_main
+    props0 = bundle["geojson"]["features"][0]["properties"]
+    assert any(k.startswith("gwr_fdr_sig_") for k in props0)
+
+    # 4. Best-practice vs paper-replication study recipes exist with expected settings
+    gi = pathlib.Path(__file__).resolve().parents[2] / "geospec_input"
+    kb_bp = json.loads((gi / "kobanya_recipe.json").read_text(encoding="utf-8"))
+    kb_rep = json.loads((gi / "kobanya_paper_replication_recipe.json").read_text(encoding="utf-8"))
+    assert kb_bp["guards_cfg"]["sparse_min_cell"] == 5
+    assert kb_bp["dataset_schema"]["cluster_spec"]["mode"] == "coordinate_radius"
+    assert kb_bp["spatial_engine"]["weights"][0]["dedup_colocated"] is True
+    assert kb_rep["guards_cfg"]["sparse_min_cell"] == 0
+    assert kb_rep["default_cov_type"] == "HC3"
+

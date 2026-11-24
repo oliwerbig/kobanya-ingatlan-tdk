@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import { buildOsmBundle, parseOsmBundle } from "../frontend/gis/osm_idb_cache.js";
 import {
+  buildStreetGraphOverpassQL,
+  buildStreetGraphPostpassSQL,
   buildTargetCacheKey,
   buildTargetOverpassQL,
   buildTargetPostpassSQL,
@@ -325,4 +327,27 @@ test("Universal file classification, UTF-8 BOM JSON/GeoJSON, deterministic batch
   assert.equal(Object.prototype.hasOwnProperty.call(safeBundle.targets, "__proto__"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(safeBundle.street_graphs, "constructor"), false);
   assert.ok(Object.prototype.hasOwnProperty.call(safeBundle.targets, "park"));
+});
+
+test("GIS-1, GIS-2, GIS-3: street graph filters, Postpass unclipped geom & antimeridian wrapping", () => {
+  const padded = padBbox({ south: 0.0, west: -179.995, north: 0.1, east: 179.995 }, 5000);
+  assert.ok(padded.west > 179.0 && padded.west < 180.0);
+  assert.ok(padded.east < -179.0 && padded.east > -180.0);
+
+  const studyPad = padBbox({ south: 47.47, west: 19.12, north: 47.50, east: 19.18 }, 800);
+  const walkQl = buildStreetGraphOverpassQL(studyPad, "walk");
+  const walkSql = buildStreetGraphPostpassSQL(studyPad, "walk");
+  assert.match(walkQl, /\["access"!="private"\]/);
+  assert.match(walkQl, /parking_aisle\|driveway/);
+  assert.match(walkSql, /geom AS geom FROM postpass_line/);
+  assert.doesNotMatch(walkSql, /ST_Intersection/i);
+  assert.match(walkSql, /NOT IN \('parking_aisle','driveway'\)/);
+
+  const bikeSql = buildStreetGraphPostpassSQL(studyPad, "bike");
+  assert.match(bikeSql, /COALESCE\(tags->>'access','yes'\) <> 'private'/);
+  assert.doesNotMatch(bikeSql, /ST_Intersection/i);
+
+  const defRec = createDefaultRecipe();
+  assert.equal(defRec.dataset_schema.cluster_spec.mode, "coordinate_radius");
+  assert.equal(defRec.spatial_engine.weights[0].dedup_colocated, true);
 });

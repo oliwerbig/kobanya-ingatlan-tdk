@@ -94,6 +94,7 @@ export function sanitizeRecipe(loaded, defaults) {
 
   return {
     schema_version: cleanStr(loaded.schema_version, defaults.schema_version),
+    ...( ["HC3", "cluster", "OLS"].includes(loaded.default_cov_type) ? { default_cov_type: loaded.default_cov_type } : {} ),
     recipe_meta: {
       title: cleanStr(loaded.recipe_meta?.title, defaults.recipe_meta.title),
       created_utc: cleanStr(loaded.recipe_meta?.created_utc, new Date().toISOString()),

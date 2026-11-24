@@ -47,7 +47,7 @@ const state = {
   stage4Res: null,
   stage5Res: null,
   activeSpecId: "spec_a",
-  covType: "HC3",
+  covType: "cluster",
   showPct: false,
   stage3AdKey: "",
   stage3DiagModelId: "",
@@ -397,7 +397,10 @@ const actions = {
   },
 
   toggleOsmFeature(targetId, uid, fromMap = false) {
-    if (fromMap && state.activeStage !== 1) return;
+    if (fromMap && state.activeStage !== 1) {
+      setLog("OSM elemek ki/bekapcsolása a térképen csak az 1. fázisban érhető el.");
+      return;
+    }
     const tgt = state.recipe.spatial_targets.find((t) => t.id === targetId);
     if (!tgt) return;
     tgt.excluded_osm_ids = tgt.excluded_osm_ids || [];
@@ -589,6 +592,12 @@ const actions = {
       const res = await dag.call("run_stage_1", { recipe: state.recipe, run_id: dag.nextRunId() });
       if (mySeq !== s1Seq) return false;
       state.stage1Res = res;
+      state.stage2Res = null;
+      state.stage3Res = null;
+      state.stage4Res = null;
+      state.stage5Res = null;
+      renderGuardStrip();
+      restyleMap();
       setLog(`1. Fázis kész (${res.summary.length} célpont távolságmátrixai frissítve).`);
       this.render();
       return true;
@@ -610,6 +619,11 @@ const actions = {
       const res = await dag.call("run_stage_2", { recipe: state.recipe, run_id: dag.nextRunId() });
       if (mySeq !== s2Seq) return false;
       state.stage2Res = res;
+      state.stage3Res = null;
+      state.stage4Res = null;
+      state.stage5Res = null;
+      renderGuardStrip();
+      restyleMap();
       setLog("2. Fázis kész.");
       this.render();
       return true;
@@ -635,9 +649,13 @@ const actions = {
       });
       if (mySeq !== s3Seq) return false;
       state.stage3Res = res;
+      state.stage4Res = null;
+      state.stage5Res = null;
       if (!res.ok) {
         setLog(`3. Fázis figyelmeztetés: ${res.reason || "Ismeretlen hiba"}`);
         if (!patchResultsOnly) alert(res.reason || "3. Fázis nem futtatható.");
+        renderGuardStrip();
+        restyleMap();
         this.render();
         return false;
       }
@@ -695,11 +713,15 @@ const actions = {
       const res = await dag.call("run_stage_4", { recipe: state.recipe, run_id: dag.nextRunId() });
       if (mySeq !== s4Seq) return false;
       state.stage4Res = res;
+      state.stage5Res = null;
       if (res.ok) {
         setLog(`4. Fázis kész (${res.anselin?.verdict || ""}).`);
+        renderGuardStrip();
         restyleMap();
       } else {
         setLog(`Stage 4 figyelmeztetés: ${res.reason || "Nem futtatható"}`);
+        renderGuardStrip();
+        restyleMap();
       }
       this.render();
       return Boolean(res.ok);
@@ -919,6 +941,8 @@ const actions = {
       preferredSpec && modelIds.has(preferredSpec)
         ? preferredSpec
         : clean.models?.[0]?.id || "spec_a";
+    const clMode = clean.dataset_schema?.cluster_spec?.mode;
+    state.covType = clean.default_cov_type || (clMode && clMode !== "none" ? "cluster" : "HC3");
 
     resetAnalysisResults();
     state.targetPreviews = {};
@@ -1212,14 +1236,6 @@ window.addEventListener("DOMContentLoaded", () => {
   const fileTopLoadAny = document.getElementById("fileTopLoadAny");
   document.getElementById("btnTopLoadAny")?.addEventListener("click", () => fileTopLoadAny?.click());
   fileTopLoadAny?.addEventListener("change", (e) => {
-    const files = Array.from(e.target.files || []);
-    e.target.value = "";
-    if (files.length) actions.handleIncomingFiles(files);
-  });
-
-  const fileTopRecipeImport = document.getElementById("fileTopRecipeImport");
-  document.getElementById("btnTopRecipeImport")?.addEventListener("click", () => fileTopRecipeImport?.click());
-  fileTopRecipeImport?.addEventListener("change", (e) => {
     const files = Array.from(e.target.files || []);
     e.target.value = "";
     if (files.length) actions.handleIncomingFiles(files);

@@ -29,7 +29,9 @@ from .exporters import (
     build_qgis_geojson,
     build_zip_bundle,
     dict_rows_to_csv,
+    generate_gwr_summary_latex,
     generate_multi_model_latex,
+    generate_spatial_comparison_latex,
 )
 from .gwr_kernel import fit_adaptive_gwr
 from .ols_kernel import (
@@ -202,6 +204,21 @@ class GeoSpecSession:
             "n_edges": graph.get("n_edges", 0),
         }
 
+    def _hydrate_csv_column_target(self, tgt: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a standardized distance dict for a pre-computed CSV column target."""
+        col_n = tgt.get("csv_col")
+        arr = parse_numeric_array(self.columns[col_n]) if col_n in self.columns else np.full(self.n_rows, np.nan)
+        return {
+            "dist_eucl": arr,
+            "dist_net": np.full(self.n_rows, np.nan),
+            "circuity_delta": np.full(self.n_rows, np.nan),
+            "circuity_ratio": np.full(self.n_rows, np.nan),
+            "snap_status": np.zeros(self.n_rows, dtype=np.int32),
+            "n_active_features": 1,
+            "n_excluded_features": 0,
+            "warnings": [],
+        }
+
     def run_stage_1_distances(self, recipe: Dict[str, Any], run_id: int = 1) -> Dict[str, Any]:
         """Stage 1: Compute Euclidean/Dijkstra distances & circuity for all configured spatial targets."""
         if self.proj is None:
@@ -215,25 +232,25 @@ class GeoSpecSession:
             self.cache.check_cancelled(run_id)
             tid = tgt["id"]
             if tgt.get("source") == "csv_column":
-                col_n = tgt.get("csv_col")
-                arr = parse_numeric_array(self.columns[col_n]) if col_n in self.columns else np.full(self.n_rows, np.nan)
-                d_res = {
-                    "dist_eucl": arr,
-                    "dist_net": np.full(self.n_rows, np.nan),
-                    "circuity_delta": np.full(self.n_rows, np.nan),
-                    "circuity_ratio": np.full(self.n_rows, np.nan),
-                    "snap_status": np.zeros(self.n_rows, dtype=np.int32),
-                    "n_active_features": 1,
-                    "n_excluded_features": 0,
-                    "warnings": [],
-                }
+                d_res = self._hydrate_csv_column_target(tgt)
             else:
                 feats = self.target_features.get(tid, [])
                 prof = tgt.get("routing_profile", "walk")
                 graph = self.street_graphs.get(prof) if tgt.get("distance_modes") in ("network_dijkstra", "both") else None
+                feats_sig = [
+                    (
+                        f.get("uid"),
+                        f.get("geom_type"),
+                        f.get("center"),
+                        [len(r) for r in f.get("rings", [])],
+                        f["rings"][0][0] if f.get("rings") and f["rings"][0] else None,
+                    )
+                    for f in feats
+                ]
                 d_key = hash_payload({
                     "tid": tid,
                     "n_feats": len(feats),
+                    "feats_sig": feats_sig,
                     "excl": sorted(tgt.get("excluded_osm_ids", []) or []),
                     "geom": tgt.get("geometry_handling"),
                     "inside_is_zero": tgt.get("inside_is_zero", True),
@@ -298,18 +315,7 @@ class GeoSpecSession:
         for tgt in recipe.get("spatial_targets", []):
             tid = tgt.get("id")
             if tid and tgt.get("source") == "csv_column" and tid not in self.dist_results:
-                col_n = tgt.get("csv_col")
-                arr = parse_numeric_array(self.columns[col_n]) if col_n in self.columns else np.full(self.n_rows, np.nan)
-                self.dist_results[tid] = {
-                    "dist_eucl": arr,
-                    "dist_net": np.full(self.n_rows, np.nan),
-                    "circuity_delta": np.full(self.n_rows, np.nan),
-                    "circuity_ratio": np.full(self.n_rows, np.nan),
-                    "snap_status": np.zeros(self.n_rows, dtype=np.int32),
-                    "n_active_features": 1,
-                    "n_excluded_features": 0,
-                    "warnings": [],
-                }
+                self.dist_results[tid] = self._hydrate_csv_column_target(tgt)
         ds = recipe.get("dataset_schema", {})
         sel_cfg = ds.get("selection_spec", {})
         excl_col = sel_cfg.get("excluded_flag_col")
@@ -325,28 +331,25 @@ class GeoSpecSession:
         if y_spec.get("transform") == "boxcox" and y_spec.get("boxcox_lambda") is None:
             active_specs = [m for m in recipe.get("models", []) if m.get("active", True)]
             if active_specs:
+                guards_cfg = recipe.get("guards_cfg", {})
+                tau = int(guards_cfg.get("sparse_min_cell", 5))
                 sp_mid = recipe.get("spatial_engine", {}).get("active_model_id")
                 ref_spec = next((m for m in active_specs if m.get("id") == sp_mid), active_specs[-1])
-                cols_list = [np.ones(self.n_rows, dtype=np.float64)]
-                c_mask = analytic_base.copy()
-                for cov in ref_spec.get("covariates", []):
-                    c_name = cov.get("col")
-                    if c_name in self.columns and cov.get("type", "numeric") != "categorical":
-                        arr_c = parse_numeric_array(self.columns[c_name])
-                        tr_c = cov.get("transform", "raw")
-                        if tr_c == "log":
-                            c_mask &= np.isfinite(arr_c) & (arr_c > 0.0)
-                            arr_t = np.where(c_mask, np.log(np.maximum(arr_c, 1e-12)), 0.0)
-                        elif tr_c == "log1p":
-                            c_mask &= np.isfinite(arr_c) & (arr_c > -1.0)
-                            arr_t = np.where(c_mask, np.log1p(np.maximum(arr_c, -1.0 + 1e-12)), 0.0)
-                        else:
-                            c_mask &= np.isfinite(arr_c)
-                            arr_t = np.where(c_mask, arr_c, 0.0)
-                        cols_list.append(arr_t)
-                if len(cols_list) > 1:
-                    x_cond_mat = np.column_stack(cols_list)
-                    cond_mask = c_mask
+                raw_y_spec = {**y_spec, "transform": "raw"}
+                y_probe = build_dependent_variable(self.columns, raw_y_spec)
+                y_probe["valid_mask"] = y_probe["valid_mask"] & (y_probe["y_raw"] > 0.0)
+                common_probe = (
+                    compute_common_sample_mask(self.columns, self.dist_results, active_specs, y_probe, analytic_base, tau)
+                    if guards_cfg.get("common_sample_lock", True)
+                    else None
+                )
+                ref_design = build_model_design(
+                    self.columns, self.dist_results, ref_spec, y_probe, analytic_base, tau, common_probe
+                )
+                if ref_design["n_obs"] >= max(10, ref_design["k_params"] + 5) and ref_design["k_params"] >= 1:
+                    x_cond_mat = np.zeros((self.n_rows, ref_design["k_params"]), dtype=np.float64)
+                    x_cond_mat[ref_design["valid_mask"]] = ref_design["X"]
+                    cond_mask = ref_design["valid_mask"]
 
         y_info = build_dependent_variable(self.columns, y_spec, X_cond=x_cond_mat, cond_mask=cond_mask)
         return {
@@ -575,7 +578,7 @@ class GeoSpecSession:
                     })
 
                 llf_y_scale = float(ols["llf"]) + float(design.get("jacobian_log_sum", 0.0))
-                aic_y_scale = 2.0 * design["k_params"] - 2.0 * llf_y_scale
+                aic_y_scale = 2.0 * (design["k_params"] + 1) - 2.0 * llf_y_scale
 
                 return {
                     "model_id": spec_cur["id"],
@@ -945,8 +948,21 @@ class GeoSpecSession:
 
         latex_tables = {}
         if ols_models:
-            latex_tables["regression_comparison"] = generate_multi_model_latex(ols_models)
-            latex_tables["regression_comparison_pct"] = generate_multi_model_latex(ols_models, show_pct_for_dummies=True)
+            latex_tables["regression_comparison"] = generate_multi_model_latex(
+                ols_models,
+                conditional_boxcox=s3.get("conditional_boxcox"),
+                boxcox_info=y_info.get("boxcox_info"),
+            )
+            latex_tables["regression_comparison_pct"] = generate_multi_model_latex(
+                ols_models,
+                show_pct_for_dummies=True,
+                conditional_boxcox=s3.get("conditional_boxcox"),
+                boxcox_info=y_info.get("boxcox_info"),
+            )
+        if s4.get("ok"):
+            latex_tables["spatial_models_comparison"] = generate_spatial_comparison_latex(s4)
+        if s5.get("ok"):
+            latex_tables["gwr_summary"] = generate_gwr_summary_latex(s5)
 
         manifest = {
             "tool": "GeoSpec Parametric Spatial Econometric Workbench",

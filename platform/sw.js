@@ -1,7 +1,7 @@
 /* GeoSpec Service Worker — caches Pyodide WASM + CDN assets (cache-first),
  * and full same-origin app shell + py_engine (network-first with offline fallback).
  */
-const CACHE_NAME = "geospec-wasm-v6";
+const CACHE_NAME = "geospec-wasm-v7";
 
 const CORE_SHELL_ASSETS = [
   "./",
@@ -33,7 +33,15 @@ const CORE_SHELL_ASSETS = [
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(CORE_SHELL_ASSETS).catch(() => {}))
+    caches.open(CACHE_NAME).then((cache) =>
+      Promise.allSettled(
+        CORE_SHELL_ASSETS.map((url) =>
+          cache.add(url).catch((err) => {
+            console.warn("SW precache skip:", url, err);
+          })
+        )
+      )
+    )
   );
   self.skipWaiting();
 });

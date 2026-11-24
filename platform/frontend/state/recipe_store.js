@@ -22,7 +22,7 @@ export function createDefaultRecipe() {
         log1p_shift: 1.0,
       },
       cluster_spec: {
-        mode: "auto_or_column",
+        mode: "coordinate_radius",
         col: "",
         regex: "",
         radius_m: 15.0,
@@ -55,7 +55,7 @@ export function createDefaultRecipe() {
     spatial_engine: {
       active_model_id: "spec_a",
       weights: [
-        { id: "knn5", type: "knn", k: 5, dedup_colocated: false },
+        { id: "knn5", type: "knn", k: 5, dedup_colocated: true },
         { id: "idw_auto", type: "idw", power: 1.0, cutoff_mode: "auto_connectivity", cutoff_m: null },
       ],
       models: ["SAR", "SEM", "SDM"],

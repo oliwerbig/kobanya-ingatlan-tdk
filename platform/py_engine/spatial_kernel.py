@@ -880,39 +880,53 @@ def run_spatial_pipeline(
     k_no_int = X_no_int.shape[1]
     WX_no_int = W_prim @ X_no_int
     X_sdm = np.column_stack([X, WX_no_int])
-    if X.shape[0] <= X_sdm.shape[1] + 2:
-        sdm_res = dict(sar_res)
-        sdm_res["betas"] = np.concatenate([sar_res["betas"], np.zeros(k_no_int)])
-        sdm_res["se"] = np.concatenate([sar_res["se"], np.zeros(k_no_int)])
-        sdm_res["t_stats"] = np.concatenate([sar_res["t_stats"], np.zeros(k_no_int)])
-        sdm_res["p_vals"] = np.concatenate([sar_res["p_vals"], np.ones(k_no_int)])
-        sdm_res["sdm_underdetermined_fallback"] = True
+    sdm_underdetermined = X.shape[0] <= X_sdm.shape[1] + 2
+    guard5_alerts = []
+
+    if sdm_underdetermined:
+        sdm_res = None
+        lr_sar = None
+        p_lr_sar = None
+        lr_sem = None
+        p_lr_sem = None
+        elhorst_verdict = (
+            f"SDM underdetermined (N={X.shape[0]} <= K_sdm+2={X_sdm.shape[1] + 2}); "
+            f"rely on Anselin LM ({anselin['recommended_model']})."
+        )
+        impacts_sar = compute_lesage_pace_impacts(
+            sar_res, primary_w, col_names, is_sdm=False, krinsky_robb_draws=krinsky_robb_draws
+        )
+        impacts_sdm: List[Dict[str, Any]] = []
+        guard5_alerts.append(
+            f"SDM underdetermined for N={X.shape[0]} and K_sdm={X_sdm.shape[1]}; "
+            "SDM estimation and SDM LeSage-Pace impacts were skipped."
+        )
     else:
         sdm_res = _fit_ml_sar_core(X_sdm, y, primary_w)
 
-    # Elhorst Common-Factor Tests on SDM:
-    # 1) H0: theta = 0 (SDM vs SAR) -> LR test (and Wald)
-    lr_sar = max(0.0, 2.0 * (sdm_res["llf"] - sar_res["llf"]))
-    p_lr_sar = float(stats.chi2.sf(lr_sar, df=max(1, k_no_int)))
-    # 2) H0: theta + rho * beta = 0 (SDM vs SEM) -> LR test (and Wald)
-    lr_sem = max(0.0, 2.0 * (sdm_res["llf"] - sem_res["llf"]))
-    p_lr_sem = float(stats.chi2.sf(lr_sem, df=max(1, k_no_int)))
+        # Elhorst Common-Factor Tests on SDM:
+        # 1) H0: theta = 0 (SDM vs SAR) -> LR test (and Wald)
+        lr_sar = max(0.0, 2.0 * (sdm_res["llf"] - sar_res["llf"]))
+        p_lr_sar = float(stats.chi2.sf(lr_sar, df=max(1, k_no_int)))
+        # 2) H0: theta + rho * beta = 0 (SDM vs SEM) -> LR test (and Wald)
+        lr_sem = max(0.0, 2.0 * (sdm_res["llf"] - sem_res["llf"]))
+        p_lr_sem = float(stats.chi2.sf(lr_sem, df=max(1, k_no_int)))
 
-    elhorst_verdict = "SDM (Neither SAR nor SEM restriction accepted)"
-    if p_lr_sar >= 0.05 and p_lr_sem < 0.05:
-        elhorst_verdict = "SAR accepted (H0: θ = 0 not rejected)"
-    elif p_lr_sem >= 0.05 and p_lr_sar < 0.05:
-        elhorst_verdict = "SEM accepted (H0: θ + ρβ = 0 not rejected)"
-    elif p_lr_sar >= 0.05 and p_lr_sem >= 0.05:
-        elhorst_verdict = f"Either SAR/SEM acceptable ({anselin['recommended_model']} via LM)"
+        elhorst_verdict = "SDM (Neither SAR nor SEM restriction accepted)"
+        if p_lr_sar >= 0.05 and p_lr_sem < 0.05:
+            elhorst_verdict = "SAR accepted (H0: θ = 0 not rejected)"
+        elif p_lr_sem >= 0.05 and p_lr_sar < 0.05:
+            elhorst_verdict = "SEM accepted (H0: θ + ρβ = 0 not rejected)"
+        elif p_lr_sar >= 0.05 and p_lr_sem >= 0.05:
+            elhorst_verdict = f"Either SAR/SEM acceptable ({anselin['recommended_model']} via LM)"
 
-    # LeSage & Pace impacts on SAR and SDM
-    impacts_sar = compute_lesage_pace_impacts(
-        sar_res, primary_w, col_names, is_sdm=False, krinsky_robb_draws=krinsky_robb_draws
-    )
-    impacts_sdm = compute_lesage_pace_impacts(
-        sdm_res, primary_w, col_names, is_sdm=True, n_x_no_int=k_no_int, krinsky_robb_draws=krinsky_robb_draws
-    )
+        # LeSage & Pace impacts on SAR and SDM
+        impacts_sar = compute_lesage_pace_impacts(
+            sar_res, primary_w, col_names, is_sdm=False, krinsky_robb_draws=krinsky_robb_draws
+        )
+        impacts_sdm = compute_lesage_pace_impacts(
+            sdm_res, primary_w, col_names, is_sdm=True, n_x_no_int=k_no_int, krinsky_robb_draws=krinsky_robb_draws
+        )
 
     # Multi-W Robustness Comparison across all configured W matrices
     weights_robustness: List[Dict[str, Any]] = []
@@ -950,8 +964,6 @@ def run_spatial_pipeline(
     rho_p = float(2.0 * stats.norm.sf(abs(rho_z)))
     lam_z = sem_res["lambda"] / max(1e-12, sem_res["se_lambda"])
     lam_p = float(2.0 * stats.norm.sf(abs(lam_z)))
-    sdm_rho_z = sdm_res["rho"] / max(1e-12, sdm_res["se_rho"])
-    sdm_rho_p = float(2.0 * stats.norm.sf(abs(sdm_rho_z)))
 
     n_obs_comp = X.shape[0]
     k_ols_ml = X.shape[1] + 1  # Include sigma^2 for exact AIC/BIC parity with SAR/SEM/SDM
@@ -994,7 +1006,12 @@ def run_spatial_pipeline(
             "resid_moran_i": compute_moran_i(sem_res["resid"], primary_w)["moran_i"],
             "resid_moran_p": compute_moran_i(sem_res["resid"], primary_w)["p"],
         },
-        {
+    ]
+
+    if sdm_res is not None:
+        sdm_rho_z = sdm_res["rho"] / max(1e-12, sdm_res["se_rho"])
+        sdm_rho_p = float(2.0 * stats.norm.sf(abs(sdm_rho_z)))
+        model_comparison.append({
             "model": f"SDM (ML, {primary_w['id']})",
             "spatial_param": round(float(sdm_res["rho"]), 4),
             "spatial_se": round(float(sdm_res["se_rho"]), 4),
@@ -1005,11 +1022,23 @@ def run_spatial_pipeline(
             "bic": round(float(sdm_res["bic"]), 2),
             "resid_moran_i": compute_moran_i(sdm_res["resid"], primary_w)["moran_i"],
             "resid_moran_p": compute_moran_i(sdm_res["resid"], primary_w)["p"],
-        },
-    ]
+        })
+    else:
+        model_comparison.append({
+            "model": f"SDM (ML, {primary_w['id']}) — Underdetermined (N <= K+2)",
+            "spatial_param": None,
+            "spatial_se": None,
+            "spatial_p": None,
+            "r2_or_pseudo": None,
+            "llf": None,
+            "aic": None,
+            "bic": None,
+            "resid_moran_i": None,
+            "resid_moran_p": None,
+            "underdetermined": True,
+        })
 
     # Guard #5 alerts (co-located condo k-NN artifact & IDW outlier connectivity cap)
-    guard5_alerts = []
     if primary_w["colocated_pairs_pct"] > 5.0:
         guard5_alerts.append(
             f"Co-located coordinates: {primary_w['colocated_pairs_pct']:.1f}% of {primary_w['id']} neighbor links have d_ij <= 0.5m "
@@ -1023,16 +1052,17 @@ def run_spatial_pipeline(
     return {
         "ok": True,
         "primary_w_id": primary_w["id"],
+        "sdm_underdetermined": sdm_underdetermined,
         "moran_y": moran_y,
         "moran_resid": moran_resid,
         "lisa_y": lisa_y,
         "lisa_resid": lisa_resid,
         "anselin": anselin,
         "elhorst": {
-            "lr_vs_sar": round(lr_sar, 3),
-            "p_vs_sar": round(p_lr_sar, 5),
-            "lr_vs_sem": round(lr_sem, 3),
-            "p_vs_sem": round(p_lr_sem, 5),
+            "lr_vs_sar": round(lr_sar, 3) if lr_sar is not None else None,
+            "p_vs_sar": round(p_lr_sar, 5) if p_lr_sar is not None else None,
+            "lr_vs_sem": round(lr_sem, 3) if lr_sem is not None else None,
+            "p_vs_sem": round(p_lr_sem, 5) if p_lr_sem is not None else None,
             "verdict": elhorst_verdict,
         },
         "model_comparison": model_comparison,

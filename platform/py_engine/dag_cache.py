@@ -6,6 +6,7 @@ editing model specifications or dragging Andersson-Day threshold sliders.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import hashlib
 import json
 import math
@@ -47,12 +48,15 @@ def hash_payload(obj: Any) -> str:
 
 
 class DAGCache:
-    """Layered content-addressed memoization cache for GeoSpec computation nodes."""
+    """Layered content-addressed LRU memoization cache for GeoSpec computation nodes."""
 
     LAYERS = ("geo", "osm", "graph", "dist", "weights", "design", "ols", "spatial", "gwr")
+    HEAVY_LAYERS = frozenset({"dist", "weights", "spatial", "gwr"})
+    DEFAULT_MAX_ENTRIES = 16
+    HEAVY_MAX_ENTRIES = 8
 
     def __init__(self) -> None:
-        self._store: Dict[str, Dict[str, Any]] = {layer: {} for layer in self.LAYERS}
+        self._store: Dict[str, OrderedDict[str, Any]] = {layer: OrderedDict() for layer in self.LAYERS}
         self._active_run_id: int = 0
 
     def start_run(self, run_id: int) -> None:
@@ -60,19 +64,33 @@ class DAGCache:
         self._active_run_id = int(run_id)
 
     def check_cancelled(self, run_id: Optional[int]) -> None:
-        """Raise CancellationError if run_id has been superseded."""
+        """Raise CancellationError if run_id has been superseded.
+
+        Note: In synchronous Pyodide Web Worker RPC execution, ``dag_client.js``
+        also performs post-hoc stale-response filtering by ``run_id`` when a newer
+        RPC finishes before or supersedes an older queued call.
+        """
         if run_id is not None and int(run_id) < self._active_run_id:
             raise CancellationError(f"Run {run_id} superseded by {self._active_run_id}")
 
     def get(self, layer: str, key: str) -> Optional[Any]:
-        """Retrieve cached artifact if present."""
-        return self._store.get(layer, {}).get(key)
+        """Retrieve cached artifact if present and refresh its LRU recency."""
+        bucket = self._store.get(layer)
+        if bucket is None or key not in bucket:
+            return None
+        bucket.move_to_end(key)
+        return bucket[key]
 
     def set(self, layer: str, key: str, value: Any) -> Any:
-        """Store artifact under layer and key, returning value."""
+        """Store artifact under layer and key with bounded LRU eviction."""
         if layer not in self._store:
-            self._store[layer] = {}
-        self._store[layer][key] = value
+            self._store[layer] = OrderedDict()
+        bucket = self._store[layer]
+        bucket[key] = value
+        bucket.move_to_end(key)
+        cap = self.HEAVY_MAX_ENTRIES if layer in self.HEAVY_LAYERS else self.DEFAULT_MAX_ENTRIES
+        while len(bucket) > cap:
+            bucket.popitem(last=False)
         return value
 
     def get_or_compute(

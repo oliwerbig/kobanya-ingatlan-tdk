@@ -8,10 +8,10 @@
     content="default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval' https://unpkg.com https://cdn.plot.ly https://cdn.jsdelivr.net blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com https://tiles.openfreemap.org; img-src 'self' data: blob: https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://tiles.openfreemap.org; connect-src 'self' data: blob: https://cdn.jsdelivr.net https://unpkg.com https://cdn.plot.ly https://postpass.geofabrik.de https://overpass-api.de https://lz4.overpass-api.de https://overpass.private.coffee https://maps.mail.ru https://tiles.openfreemap.org https://tile.openstreetmap.org https://*.tile.openstreetmap.org; object-src 'none'; base-uri 'self';"
   />
   <title>GeoSpec — Parametrikus Térökonometriai &amp; OSM Kutatói Munkaállomás</title>
-  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" integrity="sha384-MinO0mNliZ3vwppuPOUnGa+iq619pfMhLVUXfC4LHwSCvF9H+6P/KO4Q7qBOYV5V" crossorigin="anonymous" referrerpolicy="no-referrer" />
   <link rel="stylesheet" href="./frontend/styles/theme.css" />
-  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js" integrity="sha384-SYKAG6cglRMN0RVvhNeBY0r3FYKNOJtznwA0v7B5Vp9tr31xAHsZC0DqkQ/pZDmj" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" integrity="sha384-cCVCZkAjYNxaYKbM8lsArLznDF/SvMFr1jcZrvOpSTCa0W40ZAdLzHCEulnUa5i7" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 </head>
 <body>
   <div class="app-shell">
@@ -32,12 +32,10 @@
         <button class="btn btn-primary btn-sm" id="btnRunAll" disabled>▶ Teljes Pipeline Futtatása (1–5)</button>
         <button class="btn btn-sm" id="btnTopLoadAny" title="CSV, GeoJSON, Recept (_recipe.json), OSM bundle vagy Projekt (.geospec.json) betöltése — több fájl is kijelölhető">📥 Betöltés</button>
         <input type="file" id="fileTopLoadAny" accept=".csv,.tsv,.txt,.geojson,.json" multiple style="display:none" />
-        <button class="btn btn-sm" id="btnTopRecipeImport" title="Recept (.json) betöltése">📥 Recept</button>
-        <input type="file" id="fileTopRecipeImport" accept=".json" multiple style="display:none" />
         <button class="btn btn-sm" id="btnTopRecipeExport" title="Recept (_recipe.json) mentése nyers adatok nélkül">💾 Recept Mentés</button>
         <button class="btn btn-sm" id="btnTopProjectExport" title="Teljes projekt / munkamenet mentése (&lt;slug&gt;.geospec.json: adat + recept + OSM rétegek)">💾 Projekt Mentés</button>
         <button class="btn btn-sm" id="btnTopZipExport" title="Publikációs csomag exportálása (.zip)">📦 .ZIP Export</button>
-        <button class="btn btn-sm" id="btnThemeToggle" title="Világos / Sötét nézet váltása">🌗</button>
+        <button class="btn btn-sm" id="btnThemeToggle" title="Világos / Sötét nézet váltása" aria-label="Világos vagy sötét téma váltása">🌗</button>
       </div>
     </header>
 
@@ -69,7 +67,7 @@
         <div class="map-toolbar">
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
             <strong style="font-size:12px;">Térképi réteg:</strong>
-            <select id="selMapLayer">
+            <select id="selMapLayer" aria-label="Térképi színezési réteg">
               <option value="y_raw">Megfigyelt célváltozó (y)</option>
               <option value="ols_resid">OLS Reziduumok (aktív modell)</option>
               <option value="lisa">LISA Klaszterek (HH/LL/HL/LH)</option>
@@ -84,7 +82,7 @@
           </div>
           <div style="display:flex;align-items:center;gap:6px;">
             <span class="card-subtitle">Útvonal célpont:</span>
-            <select id="selRouteTarget" style="max-width:130px;"></select>
+            <select id="selRouteTarget" aria-label="Útvonal célpont kiválasztása" style="max-width:130px;"></select>
           </div>
         </div>
 
