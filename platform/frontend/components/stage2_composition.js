@@ -54,6 +54,15 @@ export function renderStage2(container, ctx) {
         </div>
       </div>
 
+      ${
+        !spatialTerms.length
+          ? `<div class="alert-box info" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+               <span>ℹ️ A Gelbach (2016) összetételi dekompozíció a <strong>3. fázisban</strong> definiált térbeli távolsági változóra épül. Jelenleg nincs aktív térbeli tag a referenciamodellben (a leíró statisztika és a minta-vízesés ettől függetlenül lefut).</span>
+               <button class="btn btn-sm" id="btnGoStage3FromS2">→ 3. Fázis: Térbeli változó megadása</button>
+             </div>`
+          : ""
+      }
+
       <div id="blocksArea">
         ${(chain.blocks || [])
           .map(
@@ -189,7 +198,10 @@ export function renderStage2(container, ctx) {
                }
              </div>`
           : s2.composition?.reason || s2.composition?.error
-            ? `<div class="alert-box">⚠️ Összetételi dekompozíció nem futott le: ${escapeHtml(s2.composition.reason || s2.composition.error)}</div>`
+            ? `<div class="alert-box" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+                 <span>⚠️ Összetételi dekompozíció nem futott le: ${escapeHtml(s2.composition.reason || s2.composition.error)}</span>
+                 ${!spatialTerms.length ? `<button class="btn btn-sm" id="btnGoStage3FromComp">→ 3. Fázis</button>` : ""}
+               </div>`
             : ""
       }
 
@@ -240,6 +252,12 @@ export function renderStage2(container, ctx) {
   `;
 
   container.querySelector("#btnRunStage2").addEventListener("click", () => actions.runStage2());
+  const goS3 = () => {
+    ctx.state.activeStage = 3;
+    actions.render();
+  };
+  container.querySelector("#btnGoStage3FromS2")?.addEventListener("click", goS3);
+  container.querySelector("#btnGoStage3FromComp")?.addEventListener("click", goS3);
   container.querySelector("#selFocalTerm")?.addEventListener("change", (e) => {
     chain.focal_term_ref = e.target.value;
   });

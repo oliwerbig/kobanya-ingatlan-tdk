@@ -758,14 +758,43 @@ def test_round3_best_practice_and_regressions():
         assert "Box--Cox" in tex_main
     props0 = bundle["geojson"]["features"][0]["properties"]
     assert any(k.startswith("gwr_fdr_sig_") for k in props0)
+    assert any(k.startswith("gwr_se_") for k in props0)
+    assert "gwr_kappa" in props0
+    assert "lisa_resid_i" in props0 and "lisa_resid_p" in props0
+    assert s4["moran_resid"]["moments_mode"] == "ols_mx_exact"
 
-    # 4. Best-practice vs paper-replication study recipes exist with expected settings
+    # 3b. Exact M_X residual Moran's I vs dense matrix trace formula
+    from py_engine.ols_kernel import fit_ols_core
+    from py_engine.spatial_kernel import build_spatial_weight_matrix, compute_moran_i
+    n_mx = 35
+    x_mx = np.column_stack([np.ones(n_mx), np.linspace(-2.0, 2.0, n_mx), np.sin(np.linspace(0.0, 3.0, n_mx))])
+    y_mx = 5.0 + 0.8 * x_mx[:, 1] + rng.normal(0.0, 0.5, n_mx)
+    coords_mx = np.column_stack([np.linspace(0.0, 1000.0, n_mx), np.linspace(0.0, 400.0, n_mx)])
+    w_mx = build_spatial_weight_matrix(coords_mx, {"id": "knn4", "type": "knn", "k": 4})
+    ols_mx = fit_ols_core(x_mx, y_mx, cov_type="OLS")
+    mor_mx = compute_moran_i(ols_mx["resid"], w_mx, X=x_mx)
+    assert mor_mx["moments_mode"] == "ols_mx_exact"
+    W_d = w_mx["W"].toarray()
+    M_d = np.eye(n_mx) - x_mx @ np.linalg.pinv(x_mx)
+    s0_d = float(np.sum(W_d))
+    df_d = n_mx - x_mx.shape[1]
+    A_d = 0.5 * (W_d + W_d.T)
+    tr_mw_d = float(np.trace(M_d @ W_d))
+    tr_mama_d = float(np.trace((M_d @ A_d) @ (M_d @ A_d)))
+    ei_dense = (n_mx / (s0_d * df_d)) * tr_mw_d
+    ei2_dense = ((n_mx / s0_d) ** 2) * (tr_mw_d ** 2 + 2.0 * tr_mama_d) / (df_d * (df_d + 2.0))
+    se_dense = float(np.sqrt(ei2_dense - ei_dense ** 2))
+    assert abs(mor_mx["expected_i"] - round(ei_dense, 4)) <= 1e-4
+    assert abs(mor_mx["se"] - round(se_dense, 4)) <= 1e-4
+
+    # 4. Best-practice vs paper-replication study recipes exist with expected settings (if local dataset present)
     gi = pathlib.Path(__file__).resolve().parents[2] / "geospec_input"
-    kb_bp = json.loads((gi / "kobanya_recipe.json").read_text(encoding="utf-8"))
-    kb_rep = json.loads((gi / "kobanya_paper_replication_recipe.json").read_text(encoding="utf-8"))
-    assert kb_bp["guards_cfg"]["sparse_min_cell"] == 5
-    assert kb_bp["dataset_schema"]["cluster_spec"]["mode"] == "coordinate_radius"
-    assert kb_bp["spatial_engine"]["weights"][0]["dedup_colocated"] is True
-    assert kb_rep["guards_cfg"]["sparse_min_cell"] == 0
-    assert kb_rep["default_cov_type"] == "HC3"
+    if (gi / "kobanya_recipe.json").exists():
+        kb_bp = json.loads((gi / "kobanya_recipe.json").read_text(encoding="utf-8"))
+        kb_rep = json.loads((gi / "kobanya_paper_replication_recipe.json").read_text(encoding="utf-8"))
+        assert kb_bp["guards_cfg"]["sparse_min_cell"] == 5
+        assert kb_bp["dataset_schema"]["cluster_spec"]["mode"] == "coordinate_radius"
+        assert kb_bp["spatial_engine"]["weights"][0]["dedup_colocated"] is True
+        assert kb_rep["guards_cfg"]["sparse_min_cell"] == 0
+        assert kb_rep["default_cov_type"] == "HC3"
 

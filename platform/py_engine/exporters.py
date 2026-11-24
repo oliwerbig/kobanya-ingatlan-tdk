@@ -278,19 +278,35 @@ def build_qgis_geojson(
 
         pos_sp = sp_pos_map.get(idx)
         if pos_sp is not None and spatial_res and spatial_res.get("ok"):
-            if pos_sp < len(spatial_res.get("lisa_y", {}).get("quadrants", [])):
-                props["lisa_y_quad"] = spatial_res["lisa_y"]["quadrants"][pos_sp]
-                props["lisa_resid_quad"] = spatial_res["lisa_resid"]["quadrants"][pos_sp]
+            ly = spatial_res.get("lisa_y", {})
+            lr = spatial_res.get("lisa_resid", {})
+            if pos_sp < len(ly.get("quadrants", [])):
+                props["lisa_y_quad"] = ly["quadrants"][pos_sp]
+                if pos_sp < len(ly.get("lisa_i", [])):
+                    props["lisa_y_i"] = ly["lisa_i"][pos_sp]
+                if pos_sp < len(ly.get("p_vals", [])):
+                    props["lisa_y_p"] = ly["p_vals"][pos_sp]
+                props["lisa_resid_quad"] = lr["quadrants"][pos_sp]
+                if pos_sp < len(lr.get("lisa_i", [])):
+                    props["lisa_resid_i"] = lr["lisa_i"][pos_sp]
+                if pos_sp < len(lr.get("p_vals", [])):
+                    props["lisa_resid_p"] = lr["p_vals"][pos_sp]
 
         pos_gwr = gwr_pos_map.get(idx)
         if pos_gwr is not None and gwr_res and gwr_res.get("ok"):
             if pos_gwr < len(gwr_res.get("local_r2", [])):
                 props["gwr_local_r2"] = gwr_res["local_r2"][pos_gwr]
                 props["gwr_resid"] = gwr_res["resid_native"][pos_gwr]
+                kappas = gwr_res.get("local_kappas", [])
+                if pos_gwr < len(kappas):
+                    props["gwr_kappa"] = kappas[pos_gwr]
+                se_mat = gwr_res.get("se_native", [])
                 fdr_mat = gwr_res.get("fdr_sig_mask")
                 for c_idx, cname in enumerate(gwr_res["col_names"]):
                     safe_c = "".join(ch if ch.isalnum() else "_" for ch in cname).strip("_")
                     props[f"gwr_beta_{safe_c}"] = gwr_res["betas_native"][pos_gwr][c_idx]
+                    if pos_gwr < len(se_mat) and c_idx < len(se_mat[pos_gwr]):
+                        props[f"gwr_se_{safe_c}"] = se_mat[pos_gwr][c_idx]
                     props[f"gwr_t_{safe_c}"] = gwr_res["t_vals"][pos_gwr][c_idx]
                     if fdr_mat and pos_gwr < len(fdr_mat) and c_idx < len(fdr_mat[pos_gwr]):
                         props[f"gwr_fdr_sig_{safe_c}"] = int(bool(fdr_mat[pos_gwr][c_idx]))

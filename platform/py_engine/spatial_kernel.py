@@ -276,16 +276,63 @@ def build_spatial_weight_matrix(
     }
 
 
-def compute_moran_i(vec: np.ndarray, w_obj: Dict[str, Any]) -> Dict[str, Any]:
-    """Compute Global Moran's I with analytical randomization variance."""
+def compute_moran_i(
+    vec: np.ndarray,
+    w_obj: Dict[str, Any],
+    X: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Compute Global Moran's I with analytical Cliff-Ord or exact OLS M_X residual moments."""
     W: csr_matrix = w_obj["W"]
-    n = float(w_obj["n"])
+    n_int = int(w_obj["n"])
+    n = float(n_int)
+    s0 = float(W.sum())
+
+    if X is not None and X.shape[0] == n_int and n_int > X.shape[1] + 2:
+        z = np.asarray(vec, dtype=np.float64)
+        z_ss = float(z @ z)
+        if z_ss < 1e-18 or s0 <= 1e-12:
+            return {"moran_i": 0.0, "expected_i": 0.0, "se": 0.0, "z": 0.0, "p": 1.0, "sig": "", "moments_mode": "ols_mx_exact"}
+        u, s_vals, _ = np.linalg.svd(X, full_matrices=False)
+        tol = 1e-10 * (s_vals[0] if len(s_vals) > 0 else 1.0)
+        q_mat = u[:, s_vals > tol]
+        r_rank = q_mat.shape[1]
+        df = max(1, n_int - r_rank)
+
+        wz = W @ z
+        moran_i = (n / s0) * float(z @ wz) / z_ss
+
+        wq = W @ q_mat
+        tr_w = float(W.diagonal().sum())
+        tr_mw = tr_w - float(np.sum(q_mat * wq))
+        ei = (n / (s0 * df)) * tr_mw
+
+        a_mat = 0.5 * (W + W.T)
+        aq = a_mat @ q_mat
+        tr_a2 = float(a_mat.multiply(a_mat).sum())
+        tr_qa2q = float(np.sum(aq * aq))
+        qaq = q_mat.T @ aq
+        tr_qaq2 = float(np.sum(qaq * qaq))
+        tr_mama = tr_a2 - 2.0 * tr_qa2q + tr_qaq2
+        ei2 = ((n / s0) ** 2) * (tr_mw * tr_mw + 2.0 * tr_mama) / (df * (df + 2.0))
+        var_i = max(1e-15, ei2 - ei * ei)
+        z_stat = (moran_i - ei) / math.sqrt(var_i)
+        p_val = float(2.0 * stats.norm.sf(abs(z_stat)))
+
+        return {
+            "moran_i": round(float(moran_i), 4),
+            "expected_i": round(float(ei), 4),
+            "se": round(math.sqrt(var_i), 4),
+            "z": round(float(z_stat), 3),
+            "p": round(p_val, 5),
+            "sig": _sig_stars(p_val),
+            "moments_mode": "ols_mx_exact",
+        }
+
     z = vec - float(np.mean(vec))
     z_ss = float(z @ z)
     if z_ss < 1e-18:
-        return {"moran_i": 0.0, "expected_i": -1.0 / max(1.0, n - 1.0), "z": 0.0, "p": 1.0, "sig": ""}
+        return {"moran_i": 0.0, "expected_i": -1.0 / max(1.0, n - 1.0), "z": 0.0, "p": 1.0, "sig": "", "moments_mode": "cliff_ord_randomization"}
 
-    s0 = float(W.sum())
     wz = W @ z
     moran_i = (n / max(1e-12, s0)) * float(z @ wz) / z_ss
     ei = -1.0 / (n - 1.0)
@@ -312,6 +359,7 @@ def compute_moran_i(vec: np.ndarray, w_obj: Dict[str, Any]) -> Dict[str, Any]:
         "z": round(float(z_stat), 3),
         "p": round(p_val, 5),
         "sig": _sig_stars(p_val),
+        "moments_mode": "cliff_ord_randomization",
     }
 
 
@@ -863,9 +911,9 @@ def run_spatial_pipeline(
     w_objs = [build_spatial_weight_matrix(coords_xy, cfg) for cfg in w_configs]
     primary_w = w_objs[0]
 
-    # Moran's I on y and OLS residuals
+    # Moran's I on y and OLS residuals (using exact Cliff-Ord M_X moments for OLS residuals)
     moran_y = compute_moran_i(y, primary_w)
-    moran_resid = compute_moran_i(ols["resid"], primary_w)
+    moran_resid = compute_moran_i(ols["resid"], primary_w, X=X)
     lisa_y = compute_lisa(y, primary_w, use_fdr=lisa_fdr)
     lisa_resid = compute_lisa(ols["resid"], primary_w, use_fdr=lisa_fdr)
     anselin = compute_anselin_lm_tests(X, y, primary_w)
@@ -934,7 +982,7 @@ def run_spatial_pipeline(
         sar_w = sar_res if w_o["id"] == primary_w["id"] else _fit_ml_sar_core(X, y, w_o)
         sem_w = sem_res if w_o["id"] == primary_w["id"] else fit_ml_sem(X, y, w_o)
         ans_w = anselin if w_o["id"] == primary_w["id"] else compute_anselin_lm_tests(X, y, w_o)
-        mor_w = moran_resid if w_o["id"] == primary_w["id"] else compute_moran_i(ols["resid"], w_o)
+        mor_w = moran_resid if w_o["id"] == primary_w["id"] else compute_moran_i(ols["resid"], w_o, X=X)
         rho_se = max(1e-12, sar_w["se_rho"])
         lam_se = max(1e-12, sem_w["se_lambda"])
         rho_p = float(2.0 * stats.norm.sf(abs(sar_w["rho"] / rho_se)))
