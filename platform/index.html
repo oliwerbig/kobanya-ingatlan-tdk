@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta
     http-equiv="Content-Security-Policy"
-    content="default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval' https://unpkg.com https://cdn.plot.ly https://cdn.jsdelivr.net blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com https://tiles.openfreemap.org; img-src 'self' data: blob: https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://tiles.openfreemap.org; connect-src 'self' data: blob: https://cdn.jsdelivr.net https://unpkg.com https://cdn.plot.ly https://postpass.geofabrik.de https://overpass-api.de https://lz4.overpass-api.de https://overpass.private.coffee https://maps.mail.ru https://tiles.openfreemap.org https://tile.openstreetmap.org https://*.tile.openstreetmap.org; object-src 'none'; base-uri 'self';"
+    content="default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval' https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js https://cdn.plot.ly/plotly-2.35.2.min.js https://cdn.jsdelivr.net/pyodide/v0.27.4/full/ blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com https://tiles.openfreemap.org; img-src 'self' data: blob: https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://tiles.openfreemap.org; connect-src 'self' data: blob: https://cdn.jsdelivr.net/pyodide/v0.27.4/full/ https://unpkg.com/maplibre-gl@4.7.1/dist/ https://cdn.plot.ly/plotly-2.35.2.min.js https://postpass.geofabrik.de https://overpass-api.de https://lz4.overpass-api.de https://overpass.private.coffee https://maps.mail.ru https://tiles.openfreemap.org https://tile.openstreetmap.org https://*.tile.openstreetmap.org; object-src 'none'; base-uri 'self';"
   />
   <title>GeoSpec — Parametrikus Térökonometriai &amp; OSM Kutatói Munkaállomás</title>
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" integrity="sha384-MinO0mNliZ3vwppuPOUnGa+iq619pfMhLVUXfC4LHwSCvF9H+6P/KO4Q7qBOYV5V" crossorigin="anonymous" referrerpolicy="no-referrer" />
@@ -14,48 +14,65 @@
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" integrity="sha384-cCVCZkAjYNxaYKbM8lsArLznDF/SvMFr1jcZrvOpSTCa0W40ZAdLzHCEulnUa5i7" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 </head>
 <body>
+  <div id="toastStack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
+
   <div class="app-shell">
     <!-- Top Header -->
     <header class="top-bar">
       <div class="brand-group">
         <div class="brand-logo">
           <span>GeoSpec</span>
-          <span class="badge">Parametric Spatial Workbench</span>
+          <span class="badge" data-i18n="app.brand_sub">Parametrikus Térökonometriai Munkaállomás</span>
         </div>
         <div class="status-pill" title="Böngészőbeli Pyodide WebAssembly motor állapota">
           <span class="dot busy" id="wasmDot"></span>
-          <span id="wasmStatusText">Pyodide indítása...</span>
+          <span id="wasmStatusText" data-i18n="worker.booting">Pyodide indítása...</span>
         </div>
       </div>
 
       <div class="top-actions">
-        <button class="btn btn-primary btn-sm" id="btnRunAll" disabled>▶ Teljes Pipeline Futtatása (1–5)</button>
-        <button class="btn btn-sm" id="btnTopLoadAny" title="CSV, GeoJSON, Recept (_recipe.json), OSM bundle vagy Projekt (.geospec.json) betöltése — több fájl is kijelölhető">📥 Betöltés</button>
+        <button class="btn btn-primary btn-sm" id="btnRunAll" data-i18n="nav.run_all" disabled>▶ Teljes Pipeline Futtatása (1–5)</button>
+        <button class="btn btn-sm" id="btnTopLoadAny" title="CSV, GeoJSON, Recept (_recipe.json), OSM bundle vagy Projekt (.geospec.json) betöltése" data-i18n="nav.load">📥 Betöltés</button>
         <input type="file" id="fileTopLoadAny" accept=".csv,.tsv,.txt,.geojson,.json" multiple style="display:none" />
-        <button class="btn btn-sm" id="btnTopRecipeExport" title="Recept (_recipe.json) mentése nyers adatok nélkül">💾 Recept Mentés</button>
-        <button class="btn btn-sm" id="btnTopProjectExport" title="Teljes projekt / munkamenet mentése (&lt;slug&gt;.geospec.json: adat + recept + OSM rétegek)">💾 Projekt Mentés</button>
-        <button class="btn btn-sm" id="btnTopZipExport" title="Publikációs csomag exportálása (.zip)">📦 .ZIP Export</button>
-        <button class="btn btn-sm" id="btnThemeToggle" title="Világos / Sötét nézet váltása" aria-label="Világos vagy sötét téma váltása">🌗</button>
+        <div class="dropdown-wrap">
+          <button type="button" class="btn btn-sm" id="btnTopSaveMenu" aria-haspopup="true" aria-expanded="false" data-i18n="nav.save">💾 Mentés ▾</button>
+          <div class="dropdown-menu" id="saveDropdownMenu" hidden role="menu">
+            <button type="button" class="dropdown-item" id="menuSaveRecipe" role="menuitem" data-i18n="nav.save_recipe">💾 Recept (_recipe.json)</button>
+            <button type="button" class="dropdown-item" id="menuSaveProject" role="menuitem" data-i18n="nav.save_project">💾 Teljes Projekt (.geospec.json)</button>
+            <button type="button" class="dropdown-item" id="menuSaveOsmBundle" role="menuitem" data-i18n="nav.save_osm">🌐 Offline OSM Csomag (.osm_bundle.json)</button>
+            <hr style="border:none;border-top:1px solid var(--border);margin:4px 0;" />
+            <button type="button" class="dropdown-item" id="menuSaveLatexMain" role="menuitem" data-i18n="nav.save_latex">📋 Overleaf LaTeX Másolása</button>
+            <button type="button" class="dropdown-item" id="menuSaveGeojson" role="menuitem" data-i18n="nav.save_geojson">🗺️ QGIS Gazdagított GeoJSON</button>
+            <button type="button" class="dropdown-item" id="menuSaveZip" role="menuitem" data-i18n="nav.save_zip">📦 Publikációs .ZIP Csomag</button>
+          </div>
+        </div>
+        <button type="button" class="btn btn-sm" id="btnLangToggle" aria-label="Nyelv váltása HU / EN" data-i18n="nav.lang_btn">HU | EN</button>
+        <button type="button" class="btn btn-sm" id="btnThemeToggle" title="Világos / Sötét nézet váltása" aria-label="Világos vagy sötét téma váltása">🌗</button>
       </div>
     </header>
+
+    <div id="workerCrashBanner" class="worker-crash-banner" hidden role="alert">
+      <span id="workerCrashMsg" data-i18n="worker.crash_msg">A Pyodide WASM számítási motor leállt vagy hibára futott.</span>
+      <button type="button" class="btn btn-sm btn-primary" id="btnRestartWorker" data-i18n="worker.restart">↻ WASM Újraindítása</button>
+    </div>
 
     <!-- 5-Stage Pipeline Rail & 6-Guard Status Strip -->
     <div class="sub-header">
       <nav class="stage-rail" aria-label="Pipeline fázisok">
-        <button class="stage-tab active" data-stage="1"><span class="step-dot"></span>1. Adat &amp; OSM Célpontok</button>
-        <button class="stage-tab" data-stage="2"><span class="step-dot"></span>2. Leíró &amp; Gelbach</button>
-        <button class="stage-tab" data-stage="3"><span class="step-dot"></span>3. Modell-Műhely &amp; Diagnosztika</button>
-        <button class="stage-tab" data-stage="4"><span class="step-dot"></span>4. Térökonometria (SAR/SEM/SDM)</button>
-        <button class="stage-tab" data-stage="5"><span class="step-dot"></span>5. Adaptív GWR &amp; Export</button>
+        <button type="button" class="stage-tab active" data-stage="1"><span class="step-dot"></span><span data-i18n="stage.1">1. Adat &amp; OSM Célpontok</span><span class="stale-badge" hidden data-i18n="tab.stale">Elavult</span></button>
+        <button type="button" class="stage-tab" data-stage="2"><span class="step-dot"></span><span data-i18n="stage.2">2. Leíró &amp; Gelbach</span><span class="stale-badge" hidden data-i18n="tab.stale">Elavult</span></button>
+        <button type="button" class="stage-tab" data-stage="3"><span class="step-dot"></span><span data-i18n="stage.3">3. Modell-Műhely &amp; Diagnosztika</span><span class="stale-badge" hidden data-i18n="tab.stale">Elavult</span></button>
+        <button type="button" class="stage-tab" data-stage="4"><span class="step-dot"></span><span data-i18n="stage.4">4. Térökonometria (SAR/SEM/SDM)</span><span class="stale-badge" hidden data-i18n="tab.stale">Elavult</span></button>
+        <button type="button" class="stage-tab" data-stage="5"><span class="step-dot"></span><span data-i18n="stage.5">5. Adaptív GWR/MGWR &amp; Export</span><span class="stale-badge" hidden data-i18n="tab.stale">Elavult</span></button>
       </nav>
 
       <div class="guard-strip" aria-label="Módszertani Őrszemek">
-        <span class="guard-pill" id="g1Pill">G1 Diagnosztika</span>
-        <span class="guard-pill" id="g2Pill">G2 Ritka cellák</span>
-        <span class="guard-pill" id="g3Pill">G3 Gelbach/Step</span>
-        <span class="guard-pill" id="g4Pill">G4 Heckman/SE</span>
-        <span class="guard-pill" id="g5Pill">G5 Térbeli W</span>
-        <span class="guard-pill" id="g6Pill">G6 GWR Ridge</span>
+        <button type="button" class="guard-pill" id="g1Pill" aria-expanded="false" aria-controls="advancedDrawer">G1 Diagnosztika</button>
+        <button type="button" class="guard-pill" id="g2Pill" aria-expanded="false" aria-controls="advancedDrawer">G2 Ritka cellák</button>
+        <button type="button" class="guard-pill" id="g3Pill" aria-expanded="false" aria-controls="advancedDrawer">G3 Gelbach/Step</button>
+        <button type="button" class="guard-pill" id="g4Pill" aria-expanded="false" aria-controls="advancedDrawer">G4 Heckman/SE</button>
+        <button type="button" class="guard-pill" id="g5Pill" aria-expanded="false" aria-controls="advancedDrawer">G5 Térbeli W</button>
+        <button type="button" class="guard-pill" id="g6Pill" aria-expanded="false" aria-controls="advancedDrawer">G6 GWR Ridge</button>
       </div>
     </div>
 
@@ -66,22 +83,23 @@
       <aside class="map-pane">
         <div class="map-toolbar">
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-            <strong style="font-size:12px;">Térképi réteg:</strong>
+            <strong style="font-size:12px;" data-i18n="map.layer_lbl">Térképi réteg:</strong>
             <select id="selMapLayer" aria-label="Térképi színezési réteg">
-              <option value="y_raw">Megfigyelt célváltozó (y)</option>
-              <option value="ols_resid">OLS Reziduumok (aktív modell)</option>
-              <option value="lisa">LISA Klaszterek (HH/LL/HL/LH)</option>
-              <option value="gwr_beta">GWR Lokális β̂ᵢ (halványított nem-szign.)</option>
-              <option value="gwr_r2">GWR Lokális R²</option>
+              <option value="y_raw" data-i18n="map.layer_y">Megfigyelt célváltozó (y)</option>
+              <option value="ols_resid" data-i18n="map.layer_resid">OLS Reziduumok (aktív modell)</option>
+              <option value="lisa" data-i18n="map.layer_lisa">LISA Klaszterek (HH/LL/HL/LH)</option>
+              <option value="gwr_beta" data-i18n="map.layer_gwr_beta">GWR Lokális β̂ᵢ (halványított nem-szign.)</option>
+              <option value="gwr_r2" data-i18n="map.layer_gwr_r2">GWR Lokális R²</option>
+              <option value="snap_status" data-i18n="map.layer_snap">Hálózati illesztés (Snap / OSM BBox)</option>
             </select>
-            <select id="selGwrVarLayer" style="display:none;"></select>
-            <select id="selGwrMaskMode" style="display:none;" title="GWR szignifikancia-maszkolás módja">
-              <option value="fdr">BY-FDR (p_adj &lt; 0.05)</option>
-              <option value="nominal">Nominális (|t| ≥ t_crit)</option>
+            <select id="selGwrVarLayer" aria-label="GWR lokális térképi változó" style="display:none;"></select>
+            <select id="selGwrMaskMode" aria-label="GWR szignifikancia-maszkolás módja" style="display:none;" title="GWR szignifikancia-maszkolás módja">
+              <option value="fdr" data-i18n="map.gwr_mask_fdr">BY-FDR (p_adj &lt; 0.05)</option>
+              <option value="nominal" data-i18n="map.gwr_mask_nom">Nominális (|t| ≥ t_crit)</option>
             </select>
           </div>
           <div style="display:flex;align-items:center;gap:6px;">
-            <span class="card-subtitle">Útvonal célpont:</span>
+            <span class="card-subtitle" data-i18n="map.route_tgt">Útvonal célpont:</span>
             <select id="selRouteTarget" aria-label="Útvonal célpont kiválasztása" style="max-width:130px;"></select>
           </div>
         </div>
@@ -94,9 +112,25 @@
       </aside>
     </main>
 
+    <!-- Guard & Recipe Advanced Slide-Over Drawer -->
+    <aside id="advancedDrawer" class="advanced-drawer" hidden role="dialog" aria-label="Módszertani Guard & Haladó Beállítások">
+      <div class="drawer-header">
+        <strong data-i18n="drawer.title">Módszertani Őrszemek &amp; Haladó Beállítások (G1–G6)</strong>
+        <button type="button" class="btn btn-sm" id="btnCloseAdvancedDrawer" aria-label="Panel bezárása">✕</button>
+      </div>
+      <div class="drawer-presets">
+        <button type="button" class="btn btn-sm btn-primary" id="btnPresetBestPractice" data-i18n="preset.best">Best-Practice (QML + Helyi GWR szűrés)</button>
+        <button type="button" class="btn btn-sm" id="btnPresetReplication" data-i18n="preset.replication">Replication (HC3 + Tanulmány replikáció)</button>
+      </div>
+      <div id="advancedDrawerBody" class="drawer-body"></div>
+      <div class="drawer-footer">
+        <button type="button" class="btn btn-primary btn-sm" id="btnApplyDrawerConfig" data-i18n="drawer.apply">✓ Beállítások alkalmazása</button>
+      </div>
+    </aside>
+
     <footer class="console-strip">
       <span id="consoleText">Készen áll.</span>
-      <span class="mono">Pure NumPy + SciPy WASM | Zero-Upload Client-Side</span>
+      <span class="mono" data-i18n="footer.tech">Pure NumPy + SciPy WASM | 100% kliensoldali (nincs feltöltés)</span>
     </footer>
   </div>
 

@@ -13,7 +13,9 @@ import {
   buildTargetPostpassSQL,
   padBbox,
   parseTagShorthand,
+  postpassToOverpassStreetGraph,
   postpassToOverpassTarget,
+  splitAntimeridianBbox,
 } from "../frontend/gis/overpass_client.js";
 import * as recipeStore from "../frontend/state/recipe_store.js";
 import {
@@ -31,7 +33,8 @@ import {
   slugifyTitle,
   validateGeojsonObject,
 } from "../frontend/state/recipe_store.js";
-import { escapeHtml, parseJsonText, parseNumericScalar, sanitizeRecipe, stripBom } from "../frontend/utils/sanitize.js";
+import { escapeHtml, getPlotlyThemeLayout, parseJsonText, parseNumericScalar, sanitizeRecipe, stripBom } from "../frontend/utils/sanitize.js";
+import { getLang, setLang, t, translateVerdict } from "../frontend/utils/i18n.js";
 
 test("Overpass vs Postpass parity, unclipped geom, element_types & cache keys", () => {
   const bbox = { south: 47.4, west: 19.0, north: 47.5, east: 19.1 };
@@ -337,17 +340,90 @@ test("GIS-1, GIS-2, GIS-3: street graph filters, Postpass unclipped geom & antim
   const studyPad = padBbox({ south: 47.47, west: 19.12, north: 47.50, east: 19.18 }, 800);
   const walkQl = buildStreetGraphOverpassQL(studyPad, "walk");
   const walkSql = buildStreetGraphPostpassSQL(studyPad, "walk");
-  assert.match(walkQl, /\["access"!="private"\]/);
+  assert.match(walkQl, /\["access"!~"\^\(private\|no\)\$"\]/);
+  assert.match(walkQl, /\["foot"~"\^\(yes\|designated\|permissive\)\$"\]/);
   assert.match(walkQl, /parking_aisle\|driveway/);
-  assert.match(walkSql, /geom AS geom FROM postpass_line/);
+  assert.match(walkSql, /ST_ClipByBox2D\(/);
+  assert.match(walkSql, /NOT IN \('private','no'\)/);
   assert.doesNotMatch(walkSql, /ST_Intersection/i);
   assert.match(walkSql, /NOT IN \('parking_aisle','driveway'\)/);
 
   const bikeSql = buildStreetGraphPostpassSQL(studyPad, "bike");
-  assert.match(bikeSql, /COALESCE\(tags->>'access','yes'\) <> 'private'/);
+  assert.match(bikeSql, /COALESCE\(tags->>'access','yes'\) NOT IN \('private','no'\)/);
   assert.doesNotMatch(bikeSql, /ST_Intersection/i);
 
   const defRec = createDefaultRecipe();
   assert.equal(defRec.dataset_schema.cluster_spec.mode, "coordinate_radius");
   assert.equal(defRec.spatial_engine.weights[0].dedup_colocated, true);
 });
+
+test("Round-4: Antimeridian, Postpass abutment connectors, sanitizeRecipe hardening, atomic batch & i18n", () => {
+  // 1. Antimeridian split & padBbox wrap
+  const split = splitAntimeridianBbox({ south: -17.0, west: 179.5, north: -16.5, east: -179.5 });
+  assert.equal(split.length, 2);
+  assert.equal(split[0].east, 180.0);
+  assert.equal(split[1].west, -180.0);
+  const wrapped = padBbox({ south: 10.0, west: 179.99, north: 10.01, east: 179.995 }, 3000);
+  assert.ok(wrapped.east >= -180 && wrapped.east <= 180);
+
+  // 2. Postpass degree-1 bridge abutment vs grade-separated underpass isolation
+  const osmGraph = postpassToOverpassStreetGraph({
+    type: "FeatureCollection",
+    features: [
+      {
+        type: "Feature",
+        properties: { tags: { highway: "residential" } },
+        geometry: { type: "LineString", coordinates: [[19.000, 47.500], [19.002, 47.500]] },
+      },
+      {
+        type: "Feature",
+        properties: { tags: { highway: "footway", bridge: "yes", layer: "1" } },
+        geometry: { type: "LineString", coordinates: [[19.002, 47.500], [19.003, 47.501]] },
+      },
+      {
+        type: "Feature",
+        properties: { tags: { highway: "footway", tunnel: "yes", layer: "-1" } },
+        geometry: { type: "LineString", coordinates: [[19.001, 47.499], [19.001, 47.500], [19.001, 47.501]] },
+      },
+    ],
+  });
+  const ways = osmGraph.elements.filter((e) => e.type === "way");
+  const abutments = ways.filter((w) => w.role === "abutment");
+  assert.equal(abutments.length, 1);
+  assert.equal(abutments[0].nodes.length, 2);
+
+  // 3. sanitizeRecipe prototype stripping, clamping & getPlotlyThemeLayout override merge
+  const poison = JSON.parse('{"__proto__":{"polluted":true},"guards_cfg":{"sparse_min_cell":9999,"hc3_leverage_warn":2.5}}');
+  const cleanRec = sanitizeRecipe(poison, createDefaultRecipe());
+  assert.equal(({}).polluted, undefined);
+  assert.ok(cleanRec.guards_cfg.sparse_min_cell <= 200);
+  assert.ok(cleanRec.guards_cfg.hc3_leverage_warn <= 0.999);
+  const lay = getPlotlyThemeLayout({ font: { size: 14 }, xaxis: { title: "Dist" }, yaxis2: { overlaying: "y" } });
+  assert.equal(lay.font.size, 14);
+  assert.equal(lay.xaxis.title, "Dist");
+  assert.ok(lay.xaxis.gridcolor);
+  assert.equal(lay.yaxis2.overlaying, "y");
+
+  // 4. prepareIncomingBatch atomic rejection on mixed valid + broken files
+  assert.throws(() => {
+    prepareIncomingBatch([
+      { fileName: "ok_ws.json", text: JSON.stringify({ kind: "geospec_workspace", version: 1, recipe: createDefaultRecipe() }) },
+      { fileName: "broken.json", text: "{malformed json" },
+    ]);
+  });
+
+  // 5. i18n language switching, interpolation & verdict translation
+  const prev = getLang();
+  try {
+    setLang("en");
+    assert.equal(getLang(), "en");
+    assert.match(t("map.layer_snap"), /Network/i);
+    assert.equal(translateVerdict("Classic OLS (No spatial dependence)"), "Classic OLS (No spatial dependence)");
+    setLang("hu");
+    assert.equal(getLang(), "hu");
+    assert.notEqual(translateVerdict("Classic OLS (No spatial dependence)"), "Classic OLS (No spatial dependence)");
+  } finally {
+    setLang(prev);
+  }
+});
+

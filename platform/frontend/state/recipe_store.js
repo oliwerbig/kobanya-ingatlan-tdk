@@ -5,6 +5,7 @@ import { parseJsonText, parseNumericScalar, sanitizeRecipe, stripBom } from "../
 export function createDefaultRecipe() {
   return {
     schema_version: "1.0.0",
+    default_cov_type: "HC3",
     recipe_meta: {
       title: "GeoSpec Spatial Study",
       created_utc: new Date().toISOString(),
@@ -54,6 +55,7 @@ export function createDefaultRecipe() {
     },
     spatial_engine: {
       active_model_id: "spec_a",
+      se_mode: "qml",
       weights: [
         { id: "knn5", type: "knn", k: 5, dedup_colocated: true },
         { id: "idw_auto", type: "idw", power: 1.0, cutoff_mode: "auto_connectivity", cutoff_m: null },
@@ -63,6 +65,7 @@ export function createDefaultRecipe() {
       lisa_fdr: true,
       gwr: {
         enabled: true,
+        mode: "gwr",
         focal_model_id: "spec_a",
         kernel: "adaptive_bisquare",
         jitter_m: 1.0,
@@ -586,6 +589,24 @@ export function prepareIncomingBatch(entries, { hasDataset = false } = {}) {
     const pb = BATCH_PRIORITY[b.kind] ?? 99;
     return pa !== pb ? pa - pb : a.idx - b.idx;
   });
+
+  // Pre-parse and validate every batch entry atomically before any UI/session mutation
+  for (const item of resolved) {
+    if (item.kind === "dataset_csv") {
+      item.parsed = parseCSVText(item.text);
+    } else if (item.kind === "dataset_geojson") {
+      item.parsed = parseGeoJSONDataset(item.data);
+    } else if (item.kind === "workspace") {
+      item.parsed = parseWorkspaceBundle(item.data);
+    } else if (item.kind === "osm_bundle") {
+      item.parsed = parseOsmBundle(item.data);
+    } else if (item.kind === "recipe") {
+      item.parsed = sanitizeRecipe(item.data, createDefaultRecipe());
+    } else if (item.kind === "target_geojson") {
+      validateGeojsonObject(item.data, item.fileName || "GeoJSON");
+      item.parsed = item.data;
+    }
+  }
 
   return resolved;
 }

@@ -300,7 +300,7 @@ def test_gwr_native_intercept_se_no_15pct_floor_symmetric_bw_fdr():
     # Verify native intercept SE matches exact unstandardized bisquare WLS covariance at i=0
     bw = gwr["optimal_bw"]
     dists = np.linalg.norm(coords - coords[0], axis=1)
-    d_bw = np.sort(dists)[bw - 1]
+    d_bw = np.sort(dists)[bw]  # bw_radii = dists_sorted[:, bw] matches gwr_kernel.py
     u = dists / (d_bw + 1e-12)
     w = np.where(u < 1.0, (1.0 - u ** 2) ** 2, 0.0)
     W_sqrt = np.sqrt(w)[:, None]
@@ -308,7 +308,7 @@ def test_gwr_native_intercept_se_no_15pct_floor_symmetric_bw_fdr():
     C0 = np.linalg.pinv(Xw.T @ Xw) @ (X * w[:, None]).T  # (p, n) projection row at i=0
     # gwr sigma^2 = RSS / eff_df (where sigma_hat matches RSS / (n - tr(S)) or RSS / eff_df)
     se0_expected = math.sqrt(float((C0[0] ** 2).sum()) * float(np.sum(np.array(gwr["resid_native"]) ** 2) / gwr["eff_df"]))
-    assert gwr["se_native"][0][0] == pytest.approx(se0_expected, rel=0.05)
+    assert gwr["se_native"][0][0] == pytest.approx(se0_expected, rel=1e-4)
 
     # Optimal bw in bw_curve has minimal raw aicc
     best_curve_pt = min(gwr["bw_curve"], key=lambda p: p["aicc"])
@@ -462,8 +462,8 @@ def test_p2_knn_dedup_and_idw_outlier_guard():
     rng = np.random.default_rng(99)
     n = 100
     coords = rng.uniform(0, 300, (n, 2))
-    # Inject colocated group at indices 0..5 + 1 extreme 50km outlier at index 99
-    coords[:6] = [100.0, 100.0]
+    # Inject colocated group at indices 0..17 (>= k + 12 = 16 to exercise still_pending) + 1 extreme 50km outlier at index 99
+    coords[:18] = [100.0, 100.0]
     coords[99] = [50000.0, 50000.0]
 
     w_knn_raw = build_spatial_weight_matrix(coords[:99], {"id": "knn4r", "type": "knn", "k": 4, "dedup_colocated": False})
@@ -552,7 +552,7 @@ def test_round2_p0_regressions():
             },
         }],
     }
-    feats = parse_geojson_features(unclosed_poly, proj)
+    feats = parse_geojson_features(unclosed_poly, "sq")
     # Point just west of the 4th edge (lon=18.9999, lat=47.501 -> ~7.5m from west edge, >110m from north/south edges)
     px, py = proj.forward(np.array([47.501]), np.array([18.9999]))
     obs_xy = np.column_stack([px, py])
@@ -787,14 +787,378 @@ def test_round3_best_practice_and_regressions():
     assert abs(mor_mx["expected_i"] - round(ei_dense, 4)) <= 1e-4
     assert abs(mor_mx["se"] - round(se_dense, 4)) <= 1e-4
 
-    # 4. Best-practice vs paper-replication study recipes exist with expected settings (if local dataset present)
-    gi = pathlib.Path(__file__).resolve().parents[2] / "geospec_input"
-    if (gi / "kobanya_recipe.json").exists():
-        kb_bp = json.loads((gi / "kobanya_recipe.json").read_text(encoding="utf-8"))
-        kb_rep = json.loads((gi / "kobanya_paper_replication_recipe.json").read_text(encoding="utf-8"))
-        assert kb_bp["guards_cfg"]["sparse_min_cell"] == 5
-        assert kb_bp["dataset_schema"]["cluster_spec"]["mode"] == "coordinate_radius"
-        assert kb_bp["spatial_engine"]["weights"][0]["dedup_colocated"] is True
-        assert kb_rep["guards_cfg"]["sparse_min_cell"] == 0
-        assert kb_rep["default_cov_type"] == "HC3"
+
+def test_round4_all_fixes_and_roadmap():
+    """Verify every Round-4 econometric, GIS, DAG, and exporter fix & roadmap feature."""
+    import csv
+    import io
+    import json
+    import zipfile
+    from py_engine.design_matrix import _boxcox_profile_mle
+    from py_engine.exporters import (
+        _latex_escape,
+        generate_robustness_matrix_latex,
+        generate_spatial_params_latex,
+    )
+    from py_engine.spatial_gis import compute_pairwise_network_distances
+    from py_engine.spatial_kernel import (
+        compute_anselin_kelejian_test,
+        fit_ml_sem,
+        run_spatial_pipeline,
+    )
+    from py_engine.ols_kernel import run_wild_cluster_bootstrap
+
+    rng = np.random.default_rng(202611)
+
+    # 1. GWR: local zero-variance dummy auto-exclusion, native raw_aicc, MGWR backfitting, mc_nonstat_p, progress_cb
+    n_gwr = 70
+    gx = np.linspace(0.0, 1000.0, n_gwr)
+    gy = rng.uniform(0.0, 200.0, n_gwr)
+    coords_g = np.column_stack([gx, gy])
+    x1_g = rng.normal(0.0, 1.0, n_gwr)
+    # Binary dummy is 1 across half the study strip (gx < 450) -> invariant locally around left interior points
+    dummy_g = (gx < 450.0).astype(np.float64)
+    y_g = 5.0 + (1.2 + 0.001 * gx) * x1_g + 0.8 * dummy_g + rng.normal(0.0, 0.25, n_gwr)
+    X_g = np.column_stack([np.ones(n_gwr), x1_g, dummy_g])
+    meta_g = [
+        {"name": "const", "label": "Intercept", "kind": "intercept", "is_binary": False},
+        {"name": "x1", "label": "x1", "kind": "continuous", "is_binary": False},
+        {"name": "dummy", "label": "dummy", "kind": "categorical", "is_binary": True},
+    ]
+    gwr_drop = fit_adaptive_gwr(X_g, y_g, meta_g, coords_g, gwr_cfg={"mode": "gwr", "b_min_floor": 10, "jitter_m": 0.5, "mc_iters": 19})
+    assert gwr_drop["ok"] is True
+    assert gwr_drop["n_local_dropped_locs"] > 0
+    assert gwr_drop["gwr_aicc"] == pytest.approx(min(p["aicc"] for p in gwr_drop["bw_curve"]), rel=0.05)
+
+    prog_events = []
+    mgwr_res = fit_adaptive_gwr(
+        X_g[:, :2],
+        y_g,
+        meta_g[:2],
+        coords_g,
+        gwr_cfg={"mode": "mgwr", "b_min_floor": 10, "jitter_m": 0.5, "mc_iters": 19},
+        progress_cb=lambda frac, msg: prog_events.append((frac, msg)),
+    )
+    assert mgwr_res["ok"] is True and mgwr_res["mode"] == "mgwr"
+    assert len(prog_events) >= 1
+    assert all(0.0 <= s["mc_nonstat_p"] <= 1.0 for s in mgwr_res["param_summaries"])
+
+    # 2. Design Matrix: scale-invariant Box-Cox, sparse reference fallback, Gram-Schmidt poly, DiD & RDD
+    y_bc = np.exp(2.0 + 0.5 * x1_g + rng.normal(0.0, 0.15, n_gwr))
+    X_bc = np.column_stack([np.ones(n_gwr), x1_g])
+    lam1, _, p_log1, _ = _boxcox_profile_mle(y_bc, X_bc)
+    lam2, _, p_log2, _ = _boxcox_profile_mle(y_bc * 1e9, X_bc)
+    assert abs(lam1 - lam2) < 1e-3 and abs(p_log1 - p_log2) < 1e-3
+
+    # Build synthetic dataset columns for Session + Design checks
+    n_s = 80
+    lat_s = 47.500 + np.linspace(-0.003, 0.003, n_s) + rng.normal(0.0, 0.0002, n_s)
+    lon_s = 19.050 + np.linspace(-0.004, 0.004, n_s) + rng.normal(0.0, 0.0002, n_s)
+    proj_s = LocalMetricProjection(float(np.mean(lat_s)), float(np.mean(lon_s)))
+    sx_arr, sy_arr = proj_s.forward(lat_s, lon_s)
+    obs_s = np.column_stack([sx_arr, sy_arr])
+    x_cont_s = rng.normal(50.0, 12.0, n_s)
+    cat_vals = ["Panel"] * 45 + ["Brick"] * 33 + ["RareCastle"] * 2
+    post_vals = [0 if i < 40 else 1 for i in range(n_s)]
+    clust_vals = [f"C{i % 8}" for i in range(n_s)]  # G = 8 < 30 -> Webb WCB!
+    dist_fake = np.abs(sx_arr) + 50.0
+    y_raw_s = np.exp(12.0 + 0.015 * x_cont_s - 0.0008 * dist_fake + rng.normal(0.0, 0.25, n_s))
+    cols_s = {
+        "id": list(range(n_s)),
+        "lat": lat_s.tolist(),
+        "lon": lon_s.tolist(),
+        "price": y_raw_s.tolist(),
+        "area": x_cont_s.tolist(),
+        "btype": cat_vals,
+        "post": post_vals,
+        "clust": clust_vals,
+        "ext_flag": [0] * (n_s - 10) + [1] * 10,
+    }
+    dist_map_s = {"hub": {"dist_eucl": dist_fake, "dist_net": dist_fake * 1.15}}
+    y_inf_s = build_dependent_variable(cols_s, {"mode": "column", "num_col": "price", "transform": "log"})
+    analytic_s = np.ones(n_s, dtype=bool)
+    spec_fallback = {
+        "id": "m_fb",
+        "name": "Fallback & Poly & Causal",
+        "covariates": [
+            {"col": "area", "type": "continuous", "transform": "poly"},
+            {"col": "btype", "type": "categorical", "reference_level": "RareCastle"},
+        ],
+        "spatial_terms": [],
+        "interactions": [],
+        "causal_spec": {"mode": "spatial_did", "treat_target_id": "hub", "treat_cutoff_m": 200.0, "post_col": "post"},
+    }
+    d_did = build_model_design(cols_s, dist_map_s, spec_fallback, y_inf_s, analytic_s, sparse_min_cell=5)
+    assert any(ev["type"] == "sparse_reference_fallback" for ev in d_did["guard2_events"])
+    names_did = [m["name"] for m in d_did["col_meta"]]
+    assert any(nm.startswith("did_att(") for nm in names_did)
+    idx_a = names_did.index("area")
+    idx_a2 = names_did.index("area^2")
+    a_c = d_did["X"][:, idx_a] - np.mean(d_did["X"][:, idx_a])
+    assert abs(float(np.corrcoef(a_c, d_did["X"][:, idx_a2])[0, 1])) < 1e-10
+
+    spec_rdd = {**spec_fallback, "causal_spec": {"mode": "boundary_rdd", "treat_target_id": "hub", "treat_cutoff_m": 200.0, "bandwidth_m": 150.0}}
+    d_rdd = build_model_design(cols_s, dist_map_s, spec_rdd, y_inf_s, analytic_s, sparse_min_cell=5)
+    assert any(nm.startswith("rdd_treat(") for nm in [m["name"] for m in d_rdd["col_meta"]])
+
+    # 3. OLS Kernel: rank-deficient df_resid, Koenker studentized BP, Wild Cluster Bootstrap, Heckman categorical Z
+    x_dup = np.column_stack([np.ones(n_gwr), x1_g, 2.0 * x1_g])
+    ols_rd = fit_ols_core(x_dup, y_g, cov_type="HC3")
+    assert ols_rd["rank"] == 2 and ols_rd["df_resid"] == n_gwr - 2
+
+    y_het = 2.0 + 1.5 * x1_g + rng.normal(0.0, 0.05 + 1.5 * (x1_g - float(np.min(x1_g))))
+    ols_h = fit_ols_core(np.column_stack([np.ones(n_gwr), x1_g]), y_het, cov_type="HC3")
+    diag_h = run_guard1_diagnostics(np.column_stack([np.ones(n_gwr), x1_g]), y_het, ols_h, meta_g[:2])
+    assert diag_h["koenker_lm"] > 0.0 and diag_h["koenker_p"] < 0.05 and diag_h["het_detected"] is True
+
+    wcb_res = run_wild_cluster_bootstrap(d_did["X"][:, :3], d_did["y"], np.asarray(clust_vals), n_boot=99, seed=7)
+    assert wcb_res["triggered"] is True and wcb_res["n_clusters"] == 8 and wcb_res["weight_dist"] == "webb"
+    assert len(wcb_res["p_values"]) == 3 and all(0.0 < pv <= 1.0 for pv in wcb_res["p_values"])
+
+    sel_ind = (np.asarray(cols_s["ext_flag"]) < 0.5).astype(np.float64)
+    a_idx = np.where(sel_ind >= 0.5)[0]
+    heck = run_heckman_two_step(
+        cols_s, sel_ind, a_idx, np.column_stack([np.ones(len(a_idx)), x_cont_s[a_idx]]),
+        np.log(y_raw_s[a_idx]), meta_g[:2], first_stage_covs=["btype", "area"], exclusion_cols=[],
+    )
+    assert "activated" in heck
+    if heck["activated"]:
+        assert isinstance(heck["imr_unreliable"], bool) and isinstance(heck["rho_clamped"], bool)
+
+    # 4. GIS: drive vs bike contraflow/maxspeed, GeometryCollection, bridge abutment connectivity, segment-vs-route parity
+    n_map = [
+        {"type": "node", "id": 1, "lat": 47.500, "lon": 19.000},
+        {"type": "node", "id": 2, "lat": 47.500, "lon": 19.002},
+        {"type": "node", "id": 3, "lat": 47.500, "lon": 19.004},
+        {"type": "node", "id": 10, "lat": 47.500, "lon": 19.002},   # co-located non-ground node at abutment!
+        {"type": "node", "id": 11, "lat": 47.4995, "lon": 19.002},
+    ]
+    ways_map = [
+        {"type": "way", "id": 10, "nodes": [1, 2, 3], "tags": {"highway": "residential", "oneway": "yes", "oneway:bicycle": "no", "maxspeed": "50"}},
+        # Underpass layer=-1 crossing node 2 visually without connecting in street graph, EXCEPT via explicit abutment
+        {"type": "way", "id": 11, "nodes": [10, 11], "tags": {"highway": "footway", "tunnel": "yes", "layer": "-1"}},
+    ]
+    g_drive = build_street_graph({"elements": n_map + ways_map}, proj_s, "drive")
+    g_bike = build_street_graph({"elements": n_map + ways_map}, proj_s, "bike")
+    assert g_drive["edge_speed_kmh"][0] >= 40.0
+    # Bike can travel reverse 2 -> 1 because of oneway:bicycle=no, while drive cannot
+    assert g_drive["g_fwd"][1, 0] == 0.0 and g_bike["g_fwd"][1, 0] > 0.0
+
+    # Grade-separated way is disconnected unless bridged by an explicit top-level role='abutment' connector
+    abut_ways = ways_map + [
+        {"type": "way", "id": 12, "role": "abutment", "nodes": [2, 10], "tags": {"highway": "footway"}},
+    ]
+    g_no_abut = build_street_graph({"elements": n_map + ways_map}, proj_s, "walk")
+    g_with_abut = build_street_graph({"elements": n_map + abut_ways}, proj_s, "walk")
+    from scipy.sparse.csgraph import connected_components
+    n_cc_iso, _ = connected_components(g_no_abut["g_fwd"], directed=False)
+    n_cc_ab, _ = connected_components(g_with_abut["g_fwd"], directed=False)
+    assert n_cc_iso == 2 and n_cc_ab == 1
+
+    # GeometryCollection & unified segment-vs-route parity + travel_time_min + W_net
+    gc_gj = {
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "id": "gc1",
+            "properties": {"name": "GC Hub"},
+            "geometry": {
+                "type": "GeometryCollection",
+                "geometries": [{"type": "Point", "coordinates": [19.004, 47.500]}],
+            },
+        }],
+    }
+    gc_feats = parse_geojson_features(gc_gj, "gc")
+    assert len(gc_feats) == 1
+    p_orig_x, p_orig_y = proj_s.forward(47.500, 19.001)  # midpoint on segment 1-2
+    tgt_gc_cfg = {"id": "gc", "geometry_handling": "point", "inside_is_zero": False, "distance_modes": "both", "max_snap_distance_m": 250.0}
+    b_res = compute_target_distances(np.array([[float(p_orig_x), float(p_orig_y)]]), np.array([True]), gc_feats, tgt_gc_cfg, proj_s, g_bike)
+    s_rt = compute_single_route((float(p_orig_x), float(p_orig_y)), gc_feats, tgt_gc_cfg, proj_s, g_bike)
+    assert round(float(b_res["dist_net"][0]), 2) == pytest.approx(round(float(s_rt["dist_net_m"]), 2), abs=1e-6)
+    assert math.isfinite(float(b_res["travel_time_min"][0])) and s_rt["snap_reason"] == "OK" and s_rt["travel_time_min"] is not None
+
+    pts_wn = np.column_stack([
+        [float(proj_s.forward(47.500, 19.0005)[0]), float(proj_s.forward(47.500, 19.0020)[0]), float(proj_s.forward(47.500, 19.0035)[0])],
+        [float(proj_s.forward(47.500, 19.0005)[1]), float(proj_s.forward(47.500, 19.0020)[1]), float(proj_s.forward(47.500, 19.0035)[1])],
+    ])
+    nd_mat = compute_pairwise_network_distances(pts_wn, np.ones(3, dtype=bool), g_bike, cutoff_m=600.0)
+    assert nd_mat.nnz >= 4
+
+    # 5. Spatial Kernel: QML SE, Anselin-Kelejian, SAR/SEM/SDM param tables, adaptive_bisquare, network_idw, fit_ml_sem
+    sp_res = run_spatial_pipeline(
+        d_did["X"][:, :3], d_did["y"], ["const", "area", "area^2"], obs_s,
+        [{"id": "knn5", "type": "knn", "k": 5}, {"id": "ab15", "type": "adaptive_bisquare", "k": 15}],
+        krinsky_robb_draws=60, se_mode="qml",
+    )
+    assert sp_res["ok"] is True and sp_res["se_mode"] == "qml"
+    assert len(sp_res["sar_params"]) >= 2 and len(sp_res["sem_params"]) >= 2 and len(sp_res["sdm_params"]) >= 2
+    assert any(r.get("resid_moran_method") == "anselin_kelejian_1997" for r in sp_res["model_comparison"])
+    sem_ml = fit_ml_sem(d_did["X"][:, :3], d_did["y"], build_spatial_weight_matrix(obs_s, {"id": "ab15", "type": "adaptive_bisquare", "k": 15}), se_mode="ml")
+    assert sem_ml["se_mode"] == "ml"
+
+    # 6. Exporters & Engine DAG E2E: invalidation, remove_target, reset_session, robustness_matrix, lightweight exports, ZIP QML/SVG
+    assert _latex_escape("a\nb<=c—d") == r"a b$\le$c---d"
+    sp_tex = generate_spatial_params_latex(sp_res)
+    assert "\\begin{tablenotes}" in sp_tex and "QML" in sp_tex
+
+    sess = GeoSpecSession()
+    sess.load_dataset(cols_s, "lat", "lon")
+    assert sess.ingest_target_raw("hub", {"type": "FeatureCollection", "features": [{"type": "Feature", "id": "h1", "geometry": {"type": "Point", "coordinates": [19.05, 47.50]}}]}, "geojson")["n_features"] == 1
+    e2e_osm = {
+        "elements": [
+            {"type": "node", "id": i + 1, "lat": float(lat_s[i]), "lon": float(lon_s[i])} for i in range(n_s)
+        ] + [{"type": "way", "id": 999, "nodes": list(range(1, n_s + 1)), "tags": {"highway": "residential"}}]
+    }
+    sess.ingest_street_graph("walk", e2e_osm)
+    recipe_s = {
+        "title": "Round4 Test",
+        "dataset_schema": {
+            "row_id_col": "id",
+            "lat_col": "lat",
+            "lon_col": "lon",
+            "y_spec": {"mode": "column", "num_col": "price", "transform": "log"},
+            "cluster_spec": {"mode": "column", "col": "clust"},
+        },
+        "spatial_targets": [{
+            "id": "hub", "name": "Hub", "source": "osm", "geometry_handling": "point",
+            "distance_modes": "both", "route_profile": "walk", "max_snap_distance_m": 2000.0,
+        }],
+        "guards_cfg": {"sparse_min_cell": 5, "common_sample_lock": True, "auto_exclude_missing_stage1": True},
+        "default_cov_type": "cluster",
+        "models": [
+            {"id": "m1", "name": "M1", "active": True, "covariates": [{"col": "area", "type": "continuous", "transform": "raw"}], "spatial_terms": [], "interactions": []},
+            {"id": "m2", "name": "M2", "active": True, "covariates": [{"col": "area", "type": "continuous", "transform": "raw"}], "spatial_terms": [{"target_id": "hub", "transform": "ln_d", "metric": "eucl"}], "interactions": []},
+        ],
+        "spatial_engine": {
+            "active_model_id": "m2",
+            "se_mode": "qml",
+            "krinsky_robb_draws": 60,
+            "weights": [
+                {"id": "knn5", "type": "knn", "k": 5, "dedup_colocated": False},
+                {"id": "wnet", "type": "network_idw", "power": 1.0, "cutoff_mode": "fixed", "cutoff_m": 5000.0, "profile": "walk"},
+            ],
+            "gwr": {"mode": "gwr", "focal_model_id": "m2", "b_min_floor": 12, "mc_iters": 19},
+        },
+    }
+    r1 = sess.run_stage_1_distances(recipe_s)
+    assert r1["ok"] and "hub" in r1["snap_status_by_target"] and "median_time_min" in r1["summary"][0]
+    r2 = sess.run_stage_2_descriptives_and_composition(recipe_s)
+    assert r2["ok"]
+    r3 = sess.run_stage_3_ols_workbench(recipe_s, cov_type="cluster")
+    assert r3["ok"] and r3["models"][1]["wild_bootstrap"]["triggered"] is True
+    r4 = sess.run_stage_4_spatial_econometrics(recipe_s)
+    assert r4["ok"] and any(w["w_id"] == "wnet" for w in r4["weights_robustness"])
+    gwr_prog_a, gwr_prog_b = [], []
+    r5a = sess.run_stage_5_gwr(recipe_s, progress_cb=lambda f, m: gwr_prog_a.append(f))
+    r5b = sess.run_stage_5_gwr(recipe_s, progress_cb=lambda f, m: gwr_prog_b.append(f))
+    assert r5a["ok"] and r5b["ok"]
+    assert len(gwr_prog_a) >= 5 and len(gwr_prog_b) <= 1 and len(sess.cache._store["gwr"]) == 1
+
+    # Running Stage 2 preserves downstream Stage 3-5 outputs!
+    sess.run_stage_2_descriptives_and_composition(recipe_s)
+    assert "stage4" in sess.last_outputs and "stage5" in sess.last_outputs
+
+    rob = sess.run_robustness_matrix(recipe_s)
+    assert rob["ok"] and len(rob["rows"]) == 6
+    assert "\\begin{tablenotes}" in generate_robustness_matrix_latex(rob)
+
+    assert "\\begin{table}" in sess.export_latex_only(recipe_s, "robustness")["latex"]
+    assert "\\begin{table}" in sess.export_latex_only(recipe_s, "stage4_params")["latex"]
+    assert sess.export_geojson_only(recipe_s)["geojson"]["type"] == "FeatureCollection"
+
+    zip_res = sess.export_publication_bundle(recipe_s, svg_figures={"test_svg": "<svg xmlns='http://www.w3.org/2000/svg'></svg>"})
+    assert zip_res["ok"]
+    with zipfile.ZipFile(io.BytesIO(zip_res["zip_bytes"]), "r") as zf:
+        names = set(zf.namelist())
+        assert "spatial/style_lisa.qml" in names
+        assert "spatial/style_gwr_r2.qml" in names
+        assert "figures/test_svg.svg" in names
+        assert "latex/spatial_params.tex" in names
+        assert "latex/robustness_matrix.tex" in names
+
+    # Invalidation lifecycle: remove_target & reset_session
+    sess.remove_target("hub")
+    assert "stage3" not in sess.last_outputs and "hub" not in sess.dist_results
+    sess.reset_session()
+    assert sess.n_rows == 0 and sess.proj is None
+
+
+_GI_DIR = Path(__file__).resolve().parents[2] / "geospec_input"
+
+
+@pytest.mark.skipif(
+    not (_GI_DIR / "kobanya_dataset.csv").exists() or not (_GI_DIR / "leopoldstadt_dataset.csv").exists(),
+    reason="Local gitignored geospec_input city assets not present in environment",
+)
+def test_golden_cross_city_replication_and_best_practice():
+    """Golden Cross-City Suite: Kőbánya & Leopoldstadt M2 paper parity, live GeoJSON parity, Best-Practice E2E."""
+    import csv
+    import io
+    import json
+    import zipfile
+
+    def _load_csv_cols(csv_path: Path):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            cols = {h: [] for h in (reader.fieldnames or [])}
+            for row in reader:
+                for h in cols:
+                    cols[h].append(row[h])
+            return cols
+
+    kb_bp = json.loads((_GI_DIR / "kobanya_recipe.json").read_text(encoding="utf-8"))
+    kb_rep = json.loads((_GI_DIR / "kobanya_paper_replication_recipe.json").read_text(encoding="utf-8"))
+    assert kb_bp["guards_cfg"]["sparse_min_cell"] == 5
+    assert kb_bp["dataset_schema"]["cluster_spec"]["mode"] == "coordinate_radius"
+    assert kb_bp["spatial_engine"]["weights"][0]["dedup_colocated"] is True
+    assert kb_rep["guards_cfg"]["sparse_min_cell"] == 0
+    assert kb_rep["default_cov_type"] == "HC3"
+
+    expected_m2 = {
+        "kobanya": {"n": 269, "k": 20, "r2": 0.6667, "adj_r2": 0.6413},
+        "leopoldstadt": {"n": 378, "k": 17, "r2": 0.7418, "adj_r2": 0.7304},
+    }
+    for city, exp in expected_m2.items():
+        cols = _load_csv_cols(_GI_DIR / f"{city}_dataset.csv")
+        rep = json.loads((_GI_DIR / f"{city}_paper_replication_recipe.json").read_text(encoding="utf-8"))
+        sess = GeoSpecSession()
+        sess.load_dataset(cols, "wgs84_lat", "wgs84_long")
+        s1 = sess.run_stage_1_distances(rep)
+        assert s1["ok"]
+        s3 = sess.run_stage_3_ols_workbench(rep)
+        assert s3["ok"]
+        m2 = next(m for m in s3["models"] if m["model_id"] == "m2_rings")
+        assert m2["n_obs"] == exp["n"]
+        assert m2["k_params"] == exp["k"]
+        assert m2["r2"] == pytest.approx(exp["r2"], abs=0.002)
+        assert m2["adj_r2"] == pytest.approx(exp["adj_r2"], abs=0.002)
+        assert m2["cov_type_used"] == "HC3"
+
+        # Verify live unclipped GeoJSON Euclidean distance parity vs CSV columns (<= 0.5 m median)
+        for gj_name, csv_col in [(f"{city}_railways.geojson", "dist_vagany_m"), (f"{city}_roads.geojson", "dist_fout_m")]:
+            feats = parse_geojson_features(json.loads((_GI_DIR / gj_name).read_text(encoding="utf-8")), csv_col)
+            vm = sess.valid_coord_mask
+            res = compute_target_distances(
+                sess.obs_xy, vm, feats, {"id": csv_col, "geometry_handling": "line", "distance_modes": "euclidean"}, sess.proj, None
+            )
+            csv_v = np.array([float(v) if str(v).strip() != "" else np.nan for v in cols[csv_col]])
+            ok_m = vm & np.isfinite(csv_v)
+            med_err = float(np.median(np.abs(res["dist_eucl"][ok_m] - csv_v[ok_m])))
+            assert med_err <= 0.5
+
+    # Full Best-Practice E2E on Kőbánya Stages 1-5 + ZIP bundle
+    kb_cols = _load_csv_cols(_GI_DIR / "kobanya_dataset.csv")
+    sess_bp = GeoSpecSession()
+    sess_bp.load_dataset(kb_cols, "wgs84_lat", "wgs84_long")
+    assert sess_bp.run_stage_1_distances(kb_bp)["ok"]
+    assert sess_bp.run_stage_2_descriptives_and_composition(kb_bp)["ok"]
+    assert sess_bp.run_stage_3_ols_workbench(kb_bp)["ok"]
+    assert sess_bp.run_stage_4_spatial_econometrics(kb_bp)["ok"]
+    assert sess_bp.run_stage_5_gwr(kb_bp)["ok"]
+    z_bp = sess_bp.export_publication_bundle(kb_bp)
+    assert z_bp["ok"]
+    with zipfile.ZipFile(io.BytesIO(z_bp["zip_bytes"]), "r") as zf:
+        assert "experiment_recipe.json" in zf.namelist()
+        assert "spatial/style_gwr_r2.qml" in zf.namelist()
+
 

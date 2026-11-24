@@ -55,19 +55,35 @@ export async function getCachedOSM(key) {
   }
 }
 
+async function _putRecord(db, key, payload) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).put({ key, savedAt: Date.now(), payload });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("IndexedDB write failed"));
+    tx.onabort = () => reject(tx.error || new Error("IndexedDB write aborted"));
+  });
+}
+
 export async function setCachedOSM(key, payload) {
   let db = null;
   try {
     db = await openDB();
-    await new Promise((resolve) => {
-      const tx = db.transaction(STORE_NAME, "readwrite");
-      tx.objectStore(STORE_NAME).put({ key, savedAt: Date.now(), payload });
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-      tx.onabort = () => resolve();
-    });
+    try {
+      await _putRecord(db, key, payload);
+    } catch (writeErr) {
+      db.close();
+      db = null;
+      await pruneExpiredOSM();
+      try {
+        db = await openDB();
+        await _putRecord(db, key, payload);
+      } catch {
+        // Ignore storage quota errors cleanly after pruning
+      }
+    }
   } catch {
-    // Ignore storage quota errors silently
+    // Ignore IndexedDB unavailability
   } finally {
     if (db) {
       try {

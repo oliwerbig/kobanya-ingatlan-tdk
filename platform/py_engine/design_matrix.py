@@ -94,22 +94,43 @@ def _boxcox_transform(y: np.ndarray, lam: float) -> np.ndarray:
 
 def _boxcox_profile_mle(y: np.ndarray, X: Optional[np.ndarray] = None) -> Tuple[float, float, float, float]:
     """
-    Estimate profile-MLE Box-Cox lambda on strictly positive y (conditional on X if provided,
+    Scale-invariant profile-MLE Box-Cox lambda on strictly positive y (conditional on X if provided,
     otherwise intercept-only unconditional Jacobian LL), returning (lambda_hat, ll_hat, p_vs_log, p_vs_linear).
+    Normalizes y by its geometric mean internally so var stays O(1) across any currency scale (e.g. 1e6-1e11 HUF).
     """
     n = len(y)
-    sum_log_y = float(np.sum(np.log(y)))
+    log_y = np.log(y)
+    mean_log_y = float(np.mean(log_y))
+    sum_log_y = float(np.sum(log_y))
+    geom_mean = math.exp(mean_log_y)
+    y_scaled = y / geom_mean
+
+    use_X = X is not None and len(X) == n and X.shape[1] >= 1 and n > X.shape[1]
+    has_intercept = True
+    if use_X and X is not None:
+        ones = np.ones(n, dtype=np.float64)
+        b_c, _, _, _ = np.linalg.lstsq(X, ones, rcond=None)
+        has_intercept = float(np.linalg.norm(ones - X @ b_c)) <= 1e-6 * math.sqrt(n)
 
     def _neg_ll(lam: float) -> float:
-        yt = _boxcox_transform(y, lam)
-        if X is not None and len(X) == n and X.shape[1] >= 1 and n > X.shape[1]:
+        if has_intercept:
+            yt = _boxcox_transform(y_scaled, lam)
+            if use_X and X is not None:
+                beta, _, _, _ = np.linalg.lstsq(X, yt, rcond=None)
+                resid = yt - X @ beta
+                var = float(np.mean(resid * resid))
+            else:
+                var = float(np.mean((yt - np.mean(yt)) ** 2))
+            var = max(var, 1e-300)
+            # Exact Box-Cox profile LL identity under geometric-mean scaling when X spans intercept:
+            # -n/2*(log(2pi)+1) - n/2*log(var_tilde) - sum(log(y))
+            ll = -0.5 * n * (math.log(2.0 * math.pi) + 1.0) - 0.5 * n * math.log(var) - sum_log_y
+        else:
+            yt = _boxcox_transform(y, lam)
             beta, _, _, _ = np.linalg.lstsq(X, yt, rcond=None)
             resid = yt - X @ beta
-            var = float(np.mean(resid * resid))
-        else:
-            var = float(np.mean((yt - np.mean(yt)) ** 2))
-        var = max(var, 1e-18)
-        ll = -0.5 * n * (math.log(2.0 * math.pi) + 1.0) - 0.5 * n * math.log(var) + (lam - 1.0) * sum_log_y
+            var = max(float(np.mean(resid * resid)), 1e-300)
+            ll = -0.5 * n * (math.log(2.0 * math.pi) + 1.0) - 0.5 * n * math.log(var) + (lam - 1.0) * sum_log_y
         return -ll
 
     res = optimize.minimize_scalar(_neg_ll, bounds=(-2.0, 2.0), method="bounded")
@@ -482,9 +503,20 @@ def _evaluate_covariate(
         for i in non_null_indices:
             counts[str_vals[i]] = counts.get(str_vals[i], 0) + 1  # type: ignore[index]
 
-        ref_level = cov_spec.get("reference_level")
-        if not ref_level or ref_level not in counts:
-            ref_level = max(counts.keys(), key=lambda k: counts[k])
+        req_ref = cov_spec.get("reference_level")
+        modal_ref = max(counts.keys(), key=lambda k: counts[k])
+        if not req_ref or req_ref not in counts:
+            ref_level = modal_ref
+        elif sparse_min_cell > 0 and counts[req_ref] < sparse_min_cell and modal_ref != req_ref:
+            msg = (
+                f"Guard #2 sparse reference fallback on '{col}': requested reference '{req_ref}' "
+                f"(N={counts[req_ref]} < {sparse_min_cell}) replaced by modal level '{modal_ref}' (N={counts[modal_ref]})."
+            )
+            guard2_events.append({"term": col, "type": "sparse_reference_fallback", "detail": msg})
+            footnotes.append(msg)
+            ref_level = modal_ref
+        else:
+            ref_level = req_ref
 
         # Guard #2: Pool sparse non-reference levels (< sparse_min_cell)
         sparse_levels = [lvl for lvl, cnt in counts.items() if lvl != ref_level and cnt < sparse_min_cell]
@@ -572,13 +604,19 @@ def _evaluate_covariate(
         mu = float(np.mean(valid_vals))
         sd = max(1e-12, float(np.std(valid_vals, ddof=1)))
         c1 = (num_arr - mu) / sd
+        fin_sub = check_mask & np.isfinite(num_arr)
+        c1_v = c1[fin_sub]
+        sq_v = c1_v * c1_v
+        a0 = float(np.mean(sq_v))
+        a1 = float(np.dot(sq_v, c1_v)) / max(1e-18, float(np.dot(c1_v, c1_v)))
+        c2 = (c1 * c1) - a0 - a1 * c1
         cols_out.append({
             "name": col, "ref": col, "base_col": col, "label": col,
-            "values": num_arr, "kind": "continuous", "is_binary": False, "meta": {},
+            "values": num_arr, "kind": "continuous", "is_binary": False, "meta": {"transform": "poly_lin"},
         })
         cols_out.append({
             "name": f"{col}^2", "ref": f"{col}^2", "base_col": col, "label": f"{col}² (orth)",
-            "values": c1 * c1, "kind": "continuous", "is_binary": False, "meta": {},
+            "values": c2, "kind": "continuous", "is_binary": False, "meta": {"transform": "poly_quad_orth"},
         })
         return cols_out, guard2_events, footnotes
     else:
@@ -598,6 +636,23 @@ def _evaluate_covariate(
     return cols_out, guard2_events, footnotes
 
 
+def _lookup_causal_distance(
+    dist_dict: Dict[str, Dict[str, np.ndarray]],
+    columns: Dict[str, List[Any]],
+    causal_spec: Dict[str, Any],
+    n_rows: int,
+) -> np.ndarray:
+    tid = str(causal_spec.get("treat_target_id", "") or "")
+    metric = str(causal_spec.get("metric", "eucl"))
+    if metric == "csv_col":
+        cname = causal_spec.get("csv_col") or tid
+        return parse_numeric_array(columns[cname]) if cname in columns else np.full(n_rows, np.nan)
+    tres = dist_dict.get(tid, {})
+    k_map = {"eucl": "dist_eucl", "net": "dist_net"}
+    arr_k = k_map.get(metric, "dist_eucl")
+    return np.asarray(tres.get(arr_k, np.full(n_rows, np.nan)), dtype=np.float64)
+
+
 def build_model_design(
     columns: Dict[str, List[Any]],
     dist_dict: Dict[str, Dict[str, np.ndarray]],
@@ -609,7 +664,7 @@ def build_model_design(
 ) -> Dict[str, Any]:
     """
     Assemble complete design matrix X, y, column metadata, and Guard #2 audit trail
-    for a single ModelSpec.
+    for a single ModelSpec (with fixed-point post-intersection pruning & optional Spatial DiD / RDD).
     """
     n_rows = len(y_info["y"])
     pre_mask = base_valid_mask & y_info["valid_mask"]
@@ -619,6 +674,57 @@ def build_model_design(
     all_cols: List[Dict[str, Any]] = []
     guard2_events: List[Dict[str, Any]] = []
     footnotes: List[str] = []
+    causal_meta: Optional[Dict[str, Any]] = None
+
+    causal_spec = model_spec.get("causal_spec") or {}
+    c_mode = str(causal_spec.get("mode", "none") or "none").lower()
+    if c_mode == "boundary_rdd":
+        d_rdd = _lookup_causal_distance(dist_dict, columns, causal_spec, n_rows)
+        c_rdd = float(causal_spec.get("treat_cutoff_m", 500.0))
+        bw_rdd = max(10.0, float(causal_spec.get("bandwidth_m", 300.0)))
+        in_bw = np.isfinite(d_rdd) & (np.abs(d_rdd - c_rdd) <= bw_rdd)
+        pre_mask = pre_mask & in_bw
+        treat_arr = np.where(np.isfinite(d_rdd), (d_rdd <= c_rdd).astype(np.float64), np.nan)
+        run_r = d_rdd - c_rdd
+        dxr = treat_arr * run_r
+        tid_r = str(causal_spec.get("treat_target_id", "target"))
+        all_cols.extend([
+            {"name": f"rdd_treat({tid_r}<={c_rdd:g}m)", "ref": "causal::rdd_treat", "label": f"RDD Kezelt (d<={c_rdd:g}m)", "values": treat_arr, "kind": "causal_rdd", "is_binary": True, "meta": {"mode": "boundary_rdd"}},
+            {"name": f"rdd_dist_c({c_rdd:g}m)", "ref": "causal::rdd_run", "label": f"Futó változó (d-{c_rdd:g}m)", "values": run_r, "kind": "causal_rdd", "is_binary": False, "meta": {"mode": "boundary_rdd"}},
+            {"name": f"rdd_treat_x_dist", "ref": "causal::rdd_int", "label": "RDD Kezelt × Távolság", "values": dxr, "kind": "causal_rdd", "is_binary": False, "meta": {"mode": "boundary_rdd"}},
+        ])
+        causal_meta = {
+            "mode": "boundary_rdd",
+            "treat_target_id": tid_r,
+            "cutoff_m": c_rdd,
+            "bandwidth_m": bw_rdd,
+            "n_treated_window": int(np.sum(pre_mask & (d_rdd <= c_rdd))),
+            "n_control_window": int(np.sum(pre_mask & (d_rdd > c_rdd))),
+        }
+    elif c_mode == "spatial_did":
+        d_did = _lookup_causal_distance(dist_dict, columns, causal_spec, n_rows)
+        c_did = float(causal_spec.get("treat_cutoff_m", 500.0))
+        post_col = str(causal_spec.get("post_col", "") or "")
+        tid_d = str(causal_spec.get("treat_target_id", "target"))
+        if post_col in columns:
+            post_raw = parse_numeric_array(columns[post_col])
+            post_arr = np.where(np.isfinite(post_raw), (post_raw >= 0.5).astype(np.float64), np.nan)
+        else:
+            post_arr = np.full(n_rows, np.nan)
+            guard2_events.append({"term": post_col, "type": "missing_column", "detail": f"Spatial DiD post column '{post_col}' missing."})
+        treat_arr = np.where(np.isfinite(d_did), (d_did <= c_did).astype(np.float64), np.nan)
+        did_int = treat_arr * post_arr
+        all_cols.extend([
+            {"name": f"did_treat({tid_d}<={c_did:g}m)", "ref": "causal::did_treat", "label": f"DiD Kezelt Zóna (<={c_did:g}m)", "values": treat_arr, "kind": "causal_did", "is_binary": True, "meta": {"mode": "spatial_did"}},
+            {"name": f"did_post({post_col})", "ref": "causal::did_post", "label": f"DiD Post ({post_col})", "values": post_arr, "kind": "causal_did", "is_binary": True, "meta": {"mode": "spatial_did"}},
+            {"name": f"did_att({tid_d}x{post_col})", "ref": "causal::did_att", "label": f"DiD ATT (Kezelt × Post)", "values": did_int, "kind": "causal_did", "is_binary": True, "meta": {"mode": "spatial_did"}},
+        ])
+        causal_meta = {
+            "mode": "spatial_did",
+            "treat_target_id": tid_d,
+            "cutoff_m": c_did,
+            "post_col": post_col,
+        }
 
     for cov in model_spec.get("covariates", []):
         c_list, g_ev, fnotes = _evaluate_covariate(columns, cov, n_rows, sparse_min_cell, pre_mask)
@@ -680,19 +786,57 @@ def build_model_design(
                     "meta": {"left": lc["name"], "right": rc["name"]},
                 })
 
-    # Compute final valid mask across y and all active X columns
+    # Fixed-point Guard #2 pruning on intersected valid_mask across ALL columns
+    final_cols = list(all_cols)
     valid_mask = pre_mask.copy()
-    for c in all_cols:
-        valid_mask &= np.isfinite(c["values"])
+    while True:
+        valid_mask = pre_mask.copy()
+        for c in final_cols:
+            valid_mask &= np.isfinite(c["values"])
+        if not np.any(valid_mask):
+            break
+        kept: List[Dict[str, Any]] = []
+        changed = False
+        dropped_refs: set = set()
+        for c in final_cols:
+            # Cascade drop interactions whose parent was just removed
+            if c.get("kind") == "interaction":
+                l_name = c.get("meta", {}).get("left")
+                r_name = c.get("meta", {}).get("right")
+                if l_name in dropped_refs or r_name in dropped_refs:
+                    changed = True
+                    msg = f"Guard #2 cascaded interaction drop '{c['name']}' after post-intersection parent removal."
+                    guard2_events.append({"term": c["name"], "type": "interaction_cascade", "detail": msg})
+                    footnotes.append(msg)
+                    continue
+            vals_v = c["values"][valid_mask]
+            if len(vals_v) == 0 or np.ptp(vals_v) <= 1e-12:
+                changed = True
+                dropped_refs.add(c["name"])
+                guard2_events.append({"term": c["name"], "type": "zero_variance", "detail": f"Term '{c['name']}' has zero variance on valid sample and was omitted."})
+                continue
+            if sparse_min_cell > 0 and c.get("is_binary", False):
+                n1_v = int(np.sum(vals_v == 1.0))
+                n0_v = int(np.sum(vals_v == 0.0))
+                if n1_v < sparse_min_cell or n0_v < sparse_min_cell:
+                    changed = True
+                    dropped_refs.add(c["name"])
+                    msg = (
+                        f"Guard #2 dropped post-intersection sparse cell '{c['name']}' "
+                        f"(N1={n1_v}, N0={n0_v} < {sparse_min_cell} on common sample)."
+                    )
+                    guard2_events.append({"term": c["name"], "type": "post_intersection_sparse_dropped", "detail": msg})
+                    footnotes.append(msg)
+                    continue
+            kept.append(c)
+        final_cols = kept
+        if not changed:
+            break
 
-    # Drop any column that became constant on the final valid mask
-    final_cols: List[Dict[str, Any]] = []
-    for c in all_cols:
-        vals_v = c["values"][valid_mask]
-        if len(vals_v) > 0 and np.ptp(vals_v) > 1e-12:
-            final_cols.append(c)
-        else:
-            guard2_events.append({"term": c["name"], "type": "zero_variance", "detail": f"Term '{c['name']}' has zero variance on valid sample and was omitted."})
+    # Final pass ensuring valid_mask reflects exact surviving columns
+    valid_mask = pre_mask.copy()
+    for c in final_cols:
+        valid_mask &= np.isfinite(c["values"])
 
     idx_valid = np.where(valid_mask)[0]
     y_vec = y_info["y"][valid_mask]
@@ -722,6 +866,7 @@ def build_model_design(
         "col_meta": col_meta,
         "guard2_events": guard2_events,
         "footnotes": footnotes,
+        "causal_meta": causal_meta,
         "is_log_scale": y_info["is_log_scale"],
         "y_label": y_info["label"],
         "y_transform": y_info.get("transform", "raw"),

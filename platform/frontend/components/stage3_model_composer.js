@@ -1,12 +1,11 @@
-/* Stage 3: Visual Pill Formula Composer, Cloneable Spec Tabs, M1-M4 Starter,
- * Live Andersson-Day Cutoff Slider + Multi-Target Profile-MLE Curve,
- * Residual/QQ Diagnostics, Per-Variable VIF & Heckman 2-Step
+/* Stage 3: Visual Pill Formula Composer (Clickable Covariates, Interaction Builder, Causal DiD/RDD),
+ * Wild Cluster Bootstrap (G<30), 3x2 Robustness Matrix, Editable AD Scan + c* Apply, & Plot->Map Focus
  */
 
+import { translateVerdict } from "../utils/i18n.js";
 import { escapeHtml, getPlotlyThemeLayout } from "../utils/sanitize.js";
 
 function normalQuantile(p) {
-  // Peter J. Acklam inverse standard normal CDF approximation
   if (p <= 0) return -6;
   if (p >= 1) return 6;
   const a = [-3.969683028665376e1, 2.209460984245205e2, -2.759285104469687e2, 1.38357751867269e2, -3.066479806614716e1, 2.506628277459239];
@@ -28,6 +27,8 @@ function normalQuantile(p) {
   return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
 }
 
+const NUM_TRANS_CYCLE = ["raw", "log", "centered", "zscore", "poly"];
+
 export function renderStage3(container, ctx) {
   const { state, actions } = ctx;
   if (!state.datasetInfo) {
@@ -45,19 +46,44 @@ export function renderStage3(container, ctx) {
   const colProfile = state.colProfile || {};
   const excludedCols = new Set([ds.lat_col, ds.lon_col, ds.row_id_col, ds.y_spec.num_col, ds.y_spec.den_col].filter(Boolean));
   const availCovCols = headers.filter((h) => !excludedCols.has(h));
+  const numCols = availCovCols.filter((h) => colProfile[h]?.isNumeric);
   const targets = state.recipe.spatial_targets || [];
   const s3 = state.stage3Res;
+
+  const yPillLabel =
+    ds.y_spec.transform === "log"
+      ? "ln(y)"
+      : ds.y_spec.transform === "log1p"
+        ? "ln(y+shift)"
+        : ds.y_spec.transform === "boxcox"
+          ? "BoxCox(y)"
+          : "y";
+
+  const activeTermChoices = [];
+  if (activeSpec) {
+    for (const c of activeSpec.covariates || []) {
+      activeTermChoices.push(c.col);
+    }
+    for (const st of activeSpec.spatial_terms || []) {
+      activeTermChoices.push(`${st.target_id}::${st.transform}`);
+    }
+  }
+  for (const h of availCovCols) {
+    if (!activeTermChoices.includes(h)) activeTermChoices.push(h);
+  }
+
+  const causal = activeSpec?.causal_spec || { type: "none", target_id: targets[0]?.id || "", time_col: "", post_value: "", treat_cutoff_m: 300, bandwidth_m: 600, signed_dist_col: "" };
 
   container.innerHTML = `
     <div id="stage3ComposerCard" class="card">
       <div class="card-header">
         <div>
           <h3 class="card-title">3A. Vizuális Modell-Összeállító (Formula Composer)</h3>
-          <div class="card-subtitle">Szerkeszthető kovariánsok, térbeli transzformációk és klónozható specifikációk közös N<sub>common</sub> mintán</div>
+          <div class="card-subtitle">Kattints egy kovariáns kapszulára a transzformáció / referencia-szint módosításához (közös N<sub>common</sub> minta)</div>
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap;">
-          <button class="btn btn-sm" id="btnGenM1M4" title="M1 Fizikai, M2 Sávos, M3 Log, M4 Andersson–Day generálása a jelenlegi kovariánsokból">⚡ M1–M4 Alapsorozat</button>
-          <button class="btn btn-primary btn-sm" id="btnRunStage3">▶ Becslés Futtatása</button>
+          <button type="button" class="btn btn-sm" id="btnGenM1M4" title="M1 Fizikai, M2 Sávos, M3 Log, M4 Andersson–Day generálása">⚡ M1–M4 Alapsorozat</button>
+          <button type="button" class="btn btn-primary btn-sm" id="btnRunStage3">▶ Becslés Futtatása</button>
         </div>
       </div>
 
@@ -65,48 +91,48 @@ export function renderStage3(container, ctx) {
         ${models
           .map(
             (m) => `
-          <button class="spec-tab ${m.id === state.activeSpecId ? "active" : ""}" data-spec-id="${escapeHtml(m.id)}">
+          <button type="button" class="spec-tab ${m.id === state.activeSpecId ? "active" : ""}" data-spec-id="${escapeHtml(m.id)}">
             ${escapeHtml(m.name)}
           </button>`
           )
           .join("")}
-        <button class="btn btn-sm" id="btnCloneSpec">+ Klónozás</button>
-        <button class="btn btn-sm" id="btnNewSpec">+ Új Spec</button>
+        <button type="button" class="btn btn-sm" id="btnCloneSpec">+ Klónozás</button>
+        <button type="button" class="btn btn-sm" id="btnNewSpec">+ Új Spec</button>
       </div>
 
       ${
         activeSpec
           ? `
         <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;">
-          <input type="text" id="txtSpecName" value="${escapeHtml(activeSpec.name)}" style="width:220px;font-weight:600;" />
+          <input type="text" id="txtSpecName" aria-label="Specifikáció neve" value="${escapeHtml(activeSpec.name)}" style="width:220px;font-weight:600;" />
           <label style="display:inline-flex;align-items:center;gap:4px;font-size:11px;">
             <input type="checkbox" id="chkSpecActive" ${activeSpec.active ? "checked" : ""} /> Aktív az összehasonlításban
           </label>
-          ${models.length > 1 ? `<button class="btn btn-sm" id="btnDelSpec" style="color:var(--fail);">✕ Spec törlése</button>` : ""}
+          ${models.length > 1 ? `<button type="button" class="btn btn-sm" id="btnDelSpec" style="color:var(--fail);">✕ Spec törlése</button>` : ""}
         </div>
 
         <div class="formula-box" style="margin-bottom:10px;">
-          <span class="pill y-pill">${ds.y_spec.transform === "log" ? "ln(y)" : ds.y_spec.transform === "boxcox" ? "BoxCox(y)" : "y"}</span>
+          <span class="pill y-pill">${yPillLabel}</span>
           <span class="mono" style="font-weight:700;">~</span>
           ${(activeSpec.covariates || [])
-            .map(
-              (c, cidx) => `
-            <span class="pill">
-              ${
-                c.type === "categorical"
-                  ? `${escapeHtml(c.col)} [ref:${escapeHtml(c.reference_level || "auto")}]`
-                  : `${escapeHtml(c.transform && c.transform !== "raw" ? `${c.transform}(${c.col})` : c.col)}`
-              }
-              <button class="remove-x" data-rm-cov="${cidx}">×</button>
-            </span>`
-            )
+            .map((c, cidx) => {
+              const titleTip = c.type === "categorical" ? "Kattints a referencia-szint cseréjéhez" : "Kattints a transzformáció léptetéséhez (nyers→ln→közép→zscore→poly)";
+              return `<span class="pill clickable-pill cov-pill" data-cov-idx="${cidx}" title="${titleTip}" role="button" tabindex="0">
+                ${
+                  c.type === "categorical"
+                    ? `${escapeHtml(c.col)} [ref:${escapeHtml(c.reference_level || "auto")}]`
+                    : `${escapeHtml(c.transform && c.transform !== "raw" ? `${c.transform}(${c.col})` : c.col)}`
+                }
+                <button type="button" class="remove-x" data-rm-cov="${cidx}" aria-label="${escapeHtml(c.col)} eltávolítása">×</button>
+              </span>`;
+            })
             .join("")}
           ${(activeSpec.spatial_terms || [])
             .map(
               (st, sidx) => `
             <span class="pill spatial-pill">
               <span class="sp-pill-text" data-sp-pill-idx="${sidx}">${escapeHtml(formatSpatialPill(st))}</span>
-              <button class="remove-x" data-rm-sp="${sidx}">×</button>
+              <button type="button" class="remove-x" data-rm-sp="${sidx}" aria-label="${escapeHtml(st.target_id)} eltávolítása">×</button>
             </span>`
             )
             .join("")}
@@ -115,7 +141,7 @@ export function renderStage3(container, ctx) {
               (it, iidx) => `
             <span class="pill inter-pill">
               ${escapeHtml(it.left)} × ${escapeHtml(it.right)}
-              <button class="remove-x" data-rm-int="${iidx}">×</button>
+              <button type="button" class="remove-x" data-rm-int="${iidx}" aria-label="Interakció eltávolítása">×</button>
             </span>`
             )
             .join("")}
@@ -123,12 +149,12 @@ export function renderStage3(container, ctx) {
 
         <div class="grid-3" style="margin-bottom:8px;">
           <div class="field-row">
-            <label>Kovariáns oszlop hozzáadása</label>
+            <label for="selAddCov">Kovariáns hozzáadása</label>
             <div style="display:flex;gap:4px;">
-              <select id="selAddCov" style="flex:1;">
+              <select id="selAddCov" aria-label="Kovariáns oszlop kiválasztása" style="flex:1;">
                 ${availCovCols.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)} (${colProfile[c]?.isNumeric ? "num" : "kat"})</option>`).join("")}
               </select>
-              <select id="selCovTrans" style="width:92px;">
+              <select id="selCovTrans" aria-label="Kovariáns transzformáció" style="width:92px;">
                 <option value="raw">nyers</option>
                 <option value="log">ln(x)</option>
                 <option value="centered">közép</option>
@@ -136,21 +162,21 @@ export function renderStage3(container, ctx) {
                 <option value="poly">x + x²</option>
                 <option value="categorical">kategória</option>
               </select>
-              <button class="btn btn-sm" id="btnAddCov">+</button>
+              <button type="button" class="btn btn-sm" id="btnAddCov" aria-label="Kovariáns hozzáadása">+</button>
             </div>
           </div>
 
           <div class="field-row">
-            <label>Térbeli transzformáció hozzáadása</label>
+            <label for="selAddSpTgt">Térbeli transzformáció hozzáadása</label>
             <div style="display:flex;gap:4px;">
-              <select id="selAddSpTgt" style="flex:1;">
+              <select id="selAddSpTgt" aria-label="Térbeli célpont" style="flex:1;">
                 ${
                   targets.length
                     ? targets.map((t) => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.id)}</option>`).join("")
                     : `<option value="">— nincs célpont —</option>`
                 }
               </select>
-              <select id="selAddSpTrans" style="width:125px;">
+              <select id="selAddSpTrans" aria-label="Térbeli transzformáció módja" style="width:125px;">
                 <option value="andersson_day">Andersson–Day</option>
                 <option value="rings">Távolsági sávok</option>
                 <option value="ln_d">ln(d) folytonos</option>
@@ -159,21 +185,78 @@ export function renderStage3(container, ctx) {
                 <option value="circuity_delta">Δd Kanyargósság</option>
                 <option value="circuity_ratio">τ Kanyargósság</option>
               </select>
-              <button class="btn btn-sm" id="btnAddSp" ${targets.length ? "" : "disabled"}>+</button>
+              <button type="button" class="btn btn-sm" id="btnAddSp" ${targets.length ? "" : "disabled"} aria-label="Térbeli tag hozzáadása">+</button>
             </div>
           </div>
 
           <div class="field-row">
-            <label>Interakció (x₁ × x₂)</label>
+            <label for="selIntLeft">Interakció (x₁ × x₂)</label>
             <div style="display:flex;gap:4px;">
-              <input type="text" id="txtIntLeft" placeholder="x₁ (pl. area)" style="width:45%;" />
-              <input type="text" id="txtIntRight" placeholder="x₂ (pl. rail::andersson_day)" style="width:45%;" />
-              <button class="btn btn-sm" id="btnAddInt">+</button>
+              <select id="selIntLeft" aria-label="Interakció bal tagja" style="flex:1;">
+                <option value="">— x₁ —</option>
+                ${activeTermChoices.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}
+              </select>
+              <select id="selIntRight" aria-label="Interakció jobb tagja" style="flex:1;">
+                <option value="">— x₂ —</option>
+                ${activeTermChoices.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}
+              </select>
+              <button type="button" class="btn btn-sm" id="btnAddInt" aria-label="Interakció hozzáadása">+</button>
             </div>
           </div>
         </div>
 
         ${renderSpatialTermInspectors(activeSpec)}
+
+        <details style="margin-top:8px;padding:6px 8px;border:1px dashed var(--border);border-radius:6px;background:var(--surface-alt);">
+          <summary style="cursor:pointer;font-size:11.5px;font-weight:600;">🧭 Opcionális Kauzális Térbeli Specifikáció (Spatial DiD / Boundary RDD) — aktuális: ${escapeHtml(causal.type)}</summary>
+          <div class="grid-3" style="margin-top:8px;">
+            <div class="field-row">
+              <label for="selCausalType">Kauzális design</label>
+              <select id="selCausalType">
+                <option value="none" ${causal.type === "none" ? "selected" : ""}>Nincs (Hagyományos keresztmetszet)</option>
+                <option value="spatial_did" ${causal.type === "spatial_did" ? "selected" : ""}>Spatial DiD (Treated × Post)</option>
+                <option value="boundary_rdd" ${causal.type === "boundary_rdd" ? "selected" : ""}>Boundary RDD (Határvonal folytonosság)</option>
+              </select>
+            </div>
+            <div class="field-row">
+              <label for="selCausalTarget">Célpont (Treat távolság)</label>
+              <select id="selCausalTarget">
+                ${targets.map((t) => `<option value="${escapeHtml(t.id)}" ${t.id === causal.target_id ? "selected" : ""}>${escapeHtml(t.id)}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field-row">
+              <label for="inpCausalCutoff">Kezelési küszöb / sávszél (m)</label>
+              <input type="number" id="inpCausalCutoff" value="${Number(causal.type === "boundary_rdd" ? (causal.bandwidth_m ?? 600) : (causal.treat_cutoff_m ?? 300))}" min="10" max="50000" step="25" />
+            </div>
+          </div>
+          ${
+            causal.type === "spatial_did"
+              ? `<div class="grid-2" style="margin-top:6px;">
+                   <div class="field-row">
+                     <label for="selCausalTimeCol">Idő / Periódus oszlop</label>
+                     <select id="selCausalTimeCol">
+                       <option value="">— válassz —</option>
+                       ${availCovCols.map((c) => `<option value="${escapeHtml(c)}" ${c === causal.time_col ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+                     </select>
+                   </div>
+                   <div class="field-row">
+                     <label for="txtCausalPostVal">Post periódus értéke (pl. 2024)</label>
+                     <input type="text" id="txtCausalPostVal" value="${escapeHtml(causal.post_value || "")}" placeholder="pl. 1 vagy 2024" />
+                   </div>
+                 </div>`
+              : causal.type === "boundary_rdd"
+                ? `<div class="grid-2" style="margin-top:6px;">
+                     <div class="field-row">
+                       <label for="selCausalSignedCol">Előjeles határtávolság oszlop (negatív=kontroll, pozitív=kezelt)</label>
+                       <select id="selCausalSignedCol">
+                         <option value="">— vagy használd a célpont távolságát —</option>
+                         ${numCols.map((c) => `<option value="${escapeHtml(c)}" ${c === causal.signed_dist_col ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+                       </select>
+                     </div>
+                   </div>`
+                : ""
+          }
+        </details>
       `
           : ""
       }
@@ -193,13 +276,6 @@ export function renderStage3(container, ctx) {
   });
 
   container.querySelector("#btnGenM1M4").addEventListener("click", () => {
-    const hasCustom =
-      models.length > 4 ||
-      models.some((m) => !["m1_base", "m2_rings", "m3_log", "m4_ad"].includes(m.id)) ||
-      models.some((m) => (m.covariates?.length || 0) > 0 || (m.spatial_terms?.length || 0) > 0);
-    if (hasCustom && !window.confirm("Ez felülírja a jelenlegi modell-specifikációkat az M1–M4 alapsorozattal. Folytatod?")) {
-      return;
-    }
     actions.generateM1M4Specs();
   });
   container.querySelector("#btnRunStage3").addEventListener("click", () => actions.runStage3());
@@ -211,12 +287,14 @@ export function renderStage3(container, ctx) {
     clone.name = `${activeSpec.name} (Klón)`;
     models.push(clone);
     state.activeSpecId = clone.id;
+    actions.invalidateFromStage?.(3);
     actions.render();
   });
   container.querySelector("#btnNewSpec").addEventListener("click", () => {
     const id = `spec_${Date.now().toString(36).slice(-4)}`;
     models.push({ id, name: `Spec ${models.length + 1}`, active: true, covariates: [], spatial_terms: [], interactions: [] });
     state.activeSpecId = id;
+    actions.invalidateFromStage?.(3);
     actions.render();
   });
 
@@ -225,32 +303,76 @@ export function renderStage3(container, ctx) {
       activeSpec.name = e.target.value;
       const tabBtn = container.querySelector(`.spec-tab[data-spec-id="${CSS.escape(activeSpec.id)}"]`);
       if (tabBtn) tabBtn.textContent = e.target.value;
+      actions.invalidateFromStage?.(3);
     });
     container.querySelector("#chkSpecActive")?.addEventListener("change", (e) => {
       activeSpec.active = e.target.checked;
+      actions.invalidateFromStage?.(3);
     });
     container.querySelector("#btnDelSpec")?.addEventListener("click", () => {
       const idx = models.findIndex((m) => m.id === activeSpec.id);
       if (idx >= 0) models.splice(idx, 1);
       state.activeSpecId = models[0]?.id;
+      const activeFallback = models.find((m) => m.active)?.id || models[0]?.id;
+      if (state.recipe.spatial_engine.active_model_id === activeSpec.id) {
+        state.recipe.spatial_engine.active_model_id = activeFallback;
+      }
+      if (state.recipe.spatial_engine.gwr?.focal_model_id === activeSpec.id) {
+        state.recipe.spatial_engine.gwr.focal_model_id = activeFallback;
+      }
+      actions.invalidateFromStage?.(3);
       actions.render();
     });
 
+    container.querySelectorAll(".cov-pill").forEach((pillEl) => {
+      const cycleCov = (e) => {
+        if (e.target.closest("button.remove-x")) return;
+        const cidx = Number(pillEl.getAttribute("data-cov-idx"));
+        const cov = activeSpec.covariates[cidx];
+        if (!cov) return;
+        if (cov.type === "categorical") {
+          const levels = colProfile[cov.col]?.sampleLevels || [];
+          if (levels.length) {
+            const curPos = levels.indexOf(cov.reference_level);
+            cov.reference_level = levels[(curPos + 1) % levels.length];
+            actions.showToast?.(`${cov.col} referencia-szint: ${cov.reference_level}`, "info");
+          }
+        } else {
+          const curT = cov.transform || "raw";
+          const nextIdx = (NUM_TRANS_CYCLE.indexOf(curT) + 1) % NUM_TRANS_CYCLE.length;
+          cov.transform = NUM_TRANS_CYCLE[nextIdx];
+        }
+        actions.invalidateFromStage?.(3);
+        actions.render();
+      };
+      pillEl.addEventListener("click", cycleCov);
+      pillEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          cycleCov(e);
+        }
+      });
+    });
+
     container.querySelectorAll("[data-rm-cov]").forEach((btn) =>
-      btn.addEventListener("click", () => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
         activeSpec.covariates.splice(Number(btn.getAttribute("data-rm-cov")), 1);
+        actions.invalidateFromStage?.(3);
         actions.render();
       })
     );
     container.querySelectorAll("[data-rm-sp]").forEach((btn) =>
       btn.addEventListener("click", () => {
         activeSpec.spatial_terms.splice(Number(btn.getAttribute("data-rm-sp")), 1);
+        actions.invalidateFromStage?.(3);
         actions.render();
       })
     );
     container.querySelectorAll("[data-rm-int]").forEach((btn) =>
       btn.addEventListener("click", () => {
         activeSpec.interactions.splice(Number(btn.getAttribute("data-rm-int")), 1);
+        actions.invalidateFromStage?.(3);
         actions.render();
       })
     );
@@ -264,6 +386,7 @@ export function renderStage3(container, ctx) {
       } else {
         activeSpec.covariates.push({ col, type: "numeric", transform: tr });
       }
+      actions.invalidateFromStage?.(3);
       actions.render();
     });
 
@@ -275,8 +398,8 @@ export function renderStage3(container, ctx) {
         tr === "circuity_delta" || tr === "circuity_ratio"
           ? tr
           : tgtObj?.distance_modes === "network_dijkstra"
-          ? "net"
-          : "eucl";
+            ? "net"
+            : "eucl";
       activeSpec.spatial_terms.push({
         target_id: tid,
         metric,
@@ -288,18 +411,45 @@ export function renderStage3(container, ctx) {
         half_life_m: 250.0,
         scale: 100.0,
       });
+      actions.invalidateFromStage?.(3);
       actions.render();
     });
 
     container.querySelector("#btnAddInt")?.addEventListener("click", () => {
-      const l = container.querySelector("#txtIntLeft").value.trim();
-      const r = container.querySelector("#txtIntRight").value.trim();
+      const l = container.querySelector("#selIntLeft").value.trim();
+      const r = container.querySelector("#selIntRight").value.trim();
       if (!l || !r) return;
       activeSpec.interactions.push({ left: l, right: r, center_continuous: true });
+      actions.invalidateFromStage?.(3);
       actions.render();
     });
 
-    // Live AD Cutoff slider (<15 ms DAG incremental OLS update without breaking slider drag)
+    const syncCausal = (reRender = false) => {
+      const cType = container.querySelector("#selCausalType")?.value || "none";
+      if (cType === "none") {
+        delete activeSpec.causal_spec;
+      } else {
+        const tgtId = container.querySelector("#selCausalTarget")?.value || targets[0]?.id || "";
+        const cutVal = Number(container.querySelector("#inpCausalCutoff")?.value) || (cType === "boundary_rdd" ? 600 : 300);
+        activeSpec.causal_spec = {
+          ...(activeSpec.causal_spec || {}),
+          type: cType,
+          target_id: tgtId,
+          time_col: container.querySelector("#selCausalTimeCol")?.value || activeSpec.causal_spec?.time_col || "",
+          post_value: container.querySelector("#txtCausalPostVal")?.value ?? activeSpec.causal_spec?.post_value ?? "",
+          treat_cutoff_m: cType === "spatial_did" ? cutVal : (activeSpec.causal_spec?.treat_cutoff_m || 300),
+          bandwidth_m: cType === "boundary_rdd" ? cutVal : (activeSpec.causal_spec?.bandwidth_m || 600),
+          signed_dist_col: container.querySelector("#selCausalSignedCol")?.value || activeSpec.causal_spec?.signed_dist_col || "",
+        };
+      }
+      actions.invalidateFromStage?.(3);
+      if (reRender) actions.render();
+    };
+    container.querySelector("#selCausalType")?.addEventListener("change", () => syncCausal(true));
+    ["#selCausalTarget", "#inpCausalCutoff", "#selCausalTimeCol", "#txtCausalPostVal", "#selCausalSignedCol"].forEach((s) => {
+      container.querySelector(s)?.addEventListener("change", () => syncCausal(false));
+    });
+
     container.querySelectorAll("[data-sp-edit-idx]").forEach((box) => {
       const sidx = Number(box.getAttribute("data-sp-edit-idx"));
       const st = activeSpec.spatial_terms[sidx];
@@ -307,6 +457,7 @@ export function renderStage3(container, ctx) {
         st.metric = e.target.value;
         const pillTxt = container.querySelector(`.sp-pill-text[data-sp-pill-idx="${sidx}"]`);
         if (pillTxt) pillTxt.textContent = formatSpatialPill(st);
+        actions.invalidateFromStage?.(3);
       });
       const slider = box.querySelector(".sp-ad-slider");
       const valLbl = box.querySelector(".sp-ad-val");
@@ -329,12 +480,14 @@ export function renderStage3(container, ctx) {
           st.breakpoints_m = arr;
           const pillTxt = container.querySelector(`.sp-pill-text[data-sp-pill-idx="${sidx}"]`);
           if (pillTxt) pillTxt.textContent = formatSpatialPill(st);
+          actions.invalidateFromStage?.(3);
         }
       });
       box.querySelector(".sp-hl-inp")?.addEventListener("change", (e) => {
         st.half_life_m = Math.max(1, Number(e.target.value) || 250);
         const pillTxt = container.querySelector(`.sp-pill-text[data-sp-pill-idx="${sidx}"]`);
         if (pillTxt) pillTxt.textContent = formatSpatialPill(st);
+        actions.invalidateFromStage?.(3);
       });
     });
   }
@@ -367,6 +520,7 @@ function renderStage3ResultsHTML(state, s3) {
   const diagModel = valid.find((m) => m.model_id === state.stage3DiagModelId) || valid[0];
 
   return `
+    ${(s3.warnings || []).map((w) => `<div class="alert-box">⚠️ ${escapeHtml(w)}</div>`).join("")}
     ${
       s3.conditional_boxcox
         ? `<div class="alert-box ${s3.conditional_boxcox.p_vs_log < 0.05 && valid.some((m) => m.y_transform === "log" || m.y_transform === "log1p") ? "" : "info"}">
@@ -376,7 +530,7 @@ function renderStage3ResultsHTML(state, s3) {
              lineáris y ellen: p = <span class="mono">${escapeHtml(s3.conditional_boxcox.p_vs_linear)}</span>
              ${
                s3.conditional_boxcox.p_vs_log < 0.05 && valid.some((m) => m.y_transform === "log" || m.y_transform === "log1p")
-                 ? `<div style="margin-top:4px;font-size:11px;">⚠️ A Box–Cox MLE statisztikailag elveti a tiszta ln(y) formát (p &lt; 0.05). Városközi összehasonlításnál a semi-log forma védhető, de célszerű lineáris vagy Box–Cox robusztussági futtatást is mellékelni.</div>`
+                 ? `<div style="margin-top:4px;font-size:11px;">⚠️ A Box–Cox MLE elveti a tiszta ln(y) formát (p &lt; 0.05); futtasd alul a 3×2 robusztussági mátrixot.</div>`
                  : ""
              }
            </div>`
@@ -387,10 +541,10 @@ function renderStage3ResultsHTML(state, s3) {
       <div class="card-header">
         <div>
           <h3 class="card-title">3B. Összehasonlító Regressziós Mátrix &amp; Diagnosztika</h3>
-          <div class="card-subtitle">SE típus, Halvorsen–Palmquist / Kennedy %Δ kapcsoló és Overleaf booktabs LaTeX export</div>
+          <div class="card-subtitle">SE típus (+ automatikus Wild Cluster Bootstrap G &lt; 30 esetén), %Δ és Overleaf LaTeX</div>
         </div>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-          <select id="selCovType">
+          <select id="selCovType" aria-label="Standard hiba (SE) típus">
             <option value="HC3" ${state.covType === "HC3" ? "selected" : ""}>HC3 Robusztus SE</option>
             <option value="cluster" ${state.covType === "cluster" ? "selected" : ""}>CR1 Klaszterezett SE</option>
             <option value="OLS" ${state.covType === "OLS" ? "selected" : ""}>Klasszikus OLS SE</option>
@@ -398,17 +552,55 @@ function renderStage3ResultsHTML(state, s3) {
           <label style="font-size:11px;display:inline-flex;align-items:center;gap:4px;">
             <input type="checkbox" id="chkShowPct" ${state.showPct ? "checked" : ""} /> Kennedy/HP %Δ
           </label>
-          <button class="btn btn-sm" id="btnCopyLatex">📋 LaTeX Másolása</button>
+          <button type="button" class="btn btn-sm" id="btnRunRobustnessMatrix">🧪 3×2 Robusztussági Mátrix</button>
+          <button type="button" class="btn btn-sm" id="btnCopyLatex">📋 LaTeX Másolása</button>
         </div>
       </div>
 
       ${failedModels.map((fm) => `<div class="alert-box">⚠️ <strong>${escapeHtml(fm.model_name || fm.model_id)}:</strong> ${escapeHtml(fm.error)}</div>`).join("")}
       ${renderComparisonTable(s3.models || [], state.showPct)}
+      ${renderRobustnessMatrixHTML(state.robustnessRes)}
     </div>
 
     ${renderDiagnosticsDeepCard(valid, diagModel)}
     ${renderADProfileCard(s3.ad_profiles, state)}
     ${renderHeckmanCard(s3.heckman)}
+  `;
+}
+
+function renderRobustnessMatrixHTML(rob) {
+  if (!rob) return "";
+  if (!rob.ok) {
+    return `<div class="alert-box" style="margin-top:8px;">⚠️ Robusztussági mátrix: ${escapeHtml(rob.reason || "sikertelen")}</div>`;
+  }
+  return `
+    <div style="margin-top:12px;padding-top:10px;border-top:1px dashed var(--border);" id="robustnessMatrixArea">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px;">
+        <strong>🧪 Funkcionális Forma × SE Robusztussági Mátrix (${escapeHtml(rob.focal_term)}, N = ${rob.n_obs})</strong>
+        <button type="button" class="btn btn-sm" id="btnCopyRobLatex">📋 Mátrix LaTeX Másolása</button>
+      </div>
+      <div class="table-wrap">
+        <table class="academic">
+          <thead><tr><th>y Skála</th><th>SE</th><th class="num">Fókusz β̂</th><th class="num">SE</th><th class="num">p</th><th class="num">R²</th><th class="num">Jakobi AIC</th><th class="num">Koenker p</th></tr></thead>
+          <tbody>
+            ${(rob.rows || [])
+              .map(
+                (r) => `<tr>
+                  <td>${escapeHtml(r.y_label)}</td>
+                  <td>${escapeHtml(r.cov_type_used)}</td>
+                  <td class="num">${r.focal_beta}</td>
+                  <td class="num">${r.focal_se}</td>
+                  <td class="num">${r.focal_p}</td>
+                  <td class="num">${r.r2}</td>
+                  <td class="num">${r.aic_y_scale}</td>
+                  <td class="num">${r.koenker_p ?? "—"}</td>
+                </tr>`
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
   `;
 }
 
@@ -418,6 +610,7 @@ function bindStage3ResultsEventsAndPlots(container, state, actions) {
 
   resultsArea.querySelector("#selCovType")?.addEventListener("change", (e) => {
     state.covType = e.target.value;
+    state.recipe.default_cov_type = e.target.value;
     actions.runStage3();
   });
   resultsArea.querySelector("#chkShowPct")?.addEventListener("change", (e) => {
@@ -425,6 +618,8 @@ function bindStage3ResultsEventsAndPlots(container, state, actions) {
     patchStage3ResultsOnly(container, { state, actions });
   });
   resultsArea.querySelector("#btnCopyLatex")?.addEventListener("click", () => actions.copyLatexTable());
+  resultsArea.querySelector("#btnRunRobustnessMatrix")?.addEventListener("click", () => actions.runRobustnessMatrix());
+  resultsArea.querySelector("#btnCopyRobLatex")?.addEventListener("click", () => actions.copyLatexTable("robustness"));
 
   resultsArea.querySelector("#selDiagModel")?.addEventListener("change", (e) => {
     state.stage3DiagModelId = e.target.value;
@@ -438,9 +633,39 @@ function bindStage3ResultsEventsAndPlots(container, state, actions) {
     });
   });
 
+  resultsArea.querySelector("#btnApplyAdCstar")?.addEventListener("click", () => {
+    const prof = s3?.ad_profiles?.[state.stage3AdKey];
+    if (!prof?.ok) return;
+    const parts = String(state.stage3AdKey).split("::");
+    const mid = parts[0];
+    const tid = parts[1];
+    const sp = state.recipe.models.find((m) => m.id === mid);
+    const term = sp?.spatial_terms?.find((st) => st.target_id === tid && st.transform === "andersson_day");
+    if (term) {
+      term.cutoff_m = prof.c_star_m;
+      actions.showToast?.(`c* = ${prof.c_star_m} m alkalmazva (${mid}:${tid})`, "pass");
+      actions.render();
+      actions.runStage3();
+    }
+  });
+
+  resultsArea.querySelector("#btnUpdateAdRange")?.addEventListener("click", () => {
+    const parts = String(state.stage3AdKey || "").split("::");
+    const mid = parts[0];
+    const tid = parts[1];
+    const sp = state.recipe.models.find((m) => m.id === mid);
+    const term = sp?.spatial_terms?.find((st) => st.target_id === tid && st.transform === "andersson_day");
+    const rMin = Number(resultsArea.querySelector("#inpAdMin")?.value) || 100;
+    const rMax = Number(resultsArea.querySelector("#inpAdMax")?.value) || 600;
+    const rStep = Math.max(5, Number(resultsArea.querySelector("#inpAdStep")?.value) || 25);
+    if (term && rMax > rMin) {
+      term.cutoff_range_m = [rMin, rMax, rStep];
+      actions.runStage3();
+    }
+  });
+
   if (!s3?.ok || !window.Plotly) return;
 
-  // Render AD Profile Curve Plotly chart for active tab
   if (s3.ad_profiles) {
     const okKeys = Object.keys(s3.ad_profiles).filter((k) => s3.ad_profiles[k]?.ok);
     const activeKey = okKeys.includes(state.stage3AdKey) ? state.stage3AdKey : okKeys[0];
@@ -483,7 +708,6 @@ function bindStage3ResultsEventsAndPlots(container, state, actions) {
     }
   }
 
-  // Render Residual vs Fitted & Normal Q-Q plots for selected model
   const valid = (s3.models || []).filter((m) => m.params && Array.isArray(m.resid) && Array.isArray(m.fitted));
   const diagModel = valid.find((m) => m.model_id === state.stage3DiagModelId) || valid[0];
   if (diagModel && diagModel.resid.length > 2) {
@@ -493,9 +717,10 @@ function bindStage3ResultsEventsAndPlots(container, state, actions) {
     const nObs = resid.length;
     const cookThresh = 4 / Math.max(1, nObs);
 
-    if (resultsArea.querySelector("#plotResidFitted")) {
+    const rfEl = resultsArea.querySelector("#plotResidFitted");
+    if (rfEl) {
       window.Plotly.newPlot(
-        "plotResidFitted",
+        rfEl,
         [
           {
             x: fitted,
@@ -507,12 +732,12 @@ function bindStage3ResultsEventsAndPlots(container, state, actions) {
               color: cooks.map((c) => (c > cookThresh ? "#dc2626" : "#0f766e")),
               opacity: 0.72,
             },
-            text: cooks.map((c, idx) => `Obs #${idx} | Cook D: ${Number(c).toFixed(4)}`),
+            text: cooks.map((c, idx) => `Sor #${diagModel.valid_indices?.[idx] ?? idx} | Cook D: ${Number(c).toFixed(4)} (kattints a térképes ugráshoz)`),
             name: "Reziduális",
           },
         ],
         getPlotlyThemeLayout({
-          title: { text: `Reziduális vs. Becsült érték (${escapeHtml(diagModel.model_id)})`, font: { size: 12 } },
+          title: { text: `Reziduális vs. Becsült érték (${escapeHtml(diagModel.model_id)}) — kattints a pontra`, font: { size: 12 } },
           xaxis: { title: "ŷ (illesztett)" },
           yaxis: { title: "ε̂ (reziduális)" },
           margin: { t: 34, r: 16, b: 44, l: 50 },
@@ -521,6 +746,14 @@ function bindStage3ResultsEventsAndPlots(container, state, actions) {
         }),
         { responsive: true, displayModeBar: false }
       );
+      if (typeof rfEl.on === "function") {
+        rfEl.on("plotly_click", (evtData) => {
+          const ptIdx = evtData?.points?.[0]?.pointIndex;
+          if (ptIdx !== undefined && Array.isArray(diagModel.valid_indices) && diagModel.valid_indices[ptIdx] !== undefined) {
+            actions.focusObservation?.(diagModel.valid_indices[ptIdx]);
+          }
+        });
+      }
     }
 
     if (resultsArea.querySelector("#plotResidQQ")) {
@@ -581,7 +814,7 @@ function renderSpatialTermInspectors(spec) {
       return `
     <div style="display:flex;gap:10px;align-items:center;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-alt);margin-bottom:6px;flex-wrap:wrap;" data-sp-edit-idx="${idx}">
       <strong style="font-size:11px;">${escapeHtml(st.target_id)} (${escapeHtml(st.transform)})</strong>
-      <select class="sp-metric-sel" style="font-size:11px;" ${isCircuity ? 'disabled title="Kanyargósság transzformációnál a metrika rögzített (eucl és net szükséges)"' : ""}>
+      <select class="sp-metric-sel" aria-label="Távolsági metrika" style="font-size:11px;" ${isCircuity ? 'disabled title="Kanyargósság transzformációnál a metrika rögzített"' : ""}>
         <option value="eucl" ${!isCircuity && st.metric === "eucl" ? "selected" : ""}>Euklideszi</option>
         <option value="net" ${!isCircuity && st.metric === "net" ? "selected" : ""}>Hálózati Dijkstra</option>
         <option value="circuity_delta" ${st.transform === "circuity_delta" || st.metric === "circuity_delta" ? "selected" : ""}>Δd (m)</option>
@@ -599,21 +832,21 @@ function renderSpatialTermInspectors(spec) {
               }
               return `<div style="display:flex;align-items:center;gap:8px;flex:1;min-width:220px;">
                <span style="font-size:11px;">Küszöb c:</span>
-               <input type="range" class="sp-ad-slider" min="${rMin}" max="${rMax}" step="${rStep}" value="${curC}" style="flex:1;" />
+               <input type="range" class="sp-ad-slider" aria-label="Andersson–Day c küszöb" min="${rMin}" max="${rMax}" step="${rStep}" value="${curC}" style="flex:1;" />
                <span class="mono sp-ad-val" style="font-weight:600;min-width:48px;">${curC} m</span>
              </div>`;
             })()
           : st.transform === "rings"
-          ? `<div style="display:flex;align-items:center;gap:6px;">
-               <span style="font-size:11px;">Sávhatárok (m):</span>
-               <input type="text" class="sp-rings-inp mono" value="${escapeHtml((st.breakpoints_m || [150, 300, 500]).join(", "))}" style="width:160px;" />
-             </div>`
-          : st.transform === "exp_decay"
-          ? `<div style="display:flex;align-items:center;gap:6px;">
-               <span style="font-size:11px;">Felezési távolság h½ (m):</span>
-               <input type="number" class="sp-hl-inp mono" value="${Number(st.half_life_m) || 250}" style="width:80px;" />
-             </div>`
-          : ""
+            ? `<div style="display:flex;align-items:center;gap:6px;">
+                 <span style="font-size:11px;">Sávhatárok (m):</span>
+                 <input type="text" class="sp-rings-inp mono" aria-label="Sávhatárok" value="${escapeHtml((st.breakpoints_m || [150, 300, 500]).join(", "))}" style="width:160px;" />
+               </div>`
+            : st.transform === "exp_decay"
+              ? `<div style="display:flex;align-items:center;gap:6px;">
+                   <span style="font-size:11px;">Felezési távolság h½ (m):</span>
+                   <input type="number" class="sp-hl-inp mono" aria-label="Felezési távolság" value="${Number(st.half_life_m) || 250}" style="width:80px;" />
+                 </div>`
+              : ""
       }
     </div>`;
     })
@@ -636,15 +869,21 @@ function renderComparisonTable(models, showPct) {
   }
   const maps = valid.map((m) => Object.fromEntries(m.params.map((p) => [p.name, p])));
 
-  const guardNotes = valid.flatMap((m) => (m.footnotes || []).map((f) => `[${m.model_id}] ${f}`));
-  const proxyAlerts = valid.flatMap((m) => (m.diagnostics?.proxy_alerts || []).map((a) => `[${m.model_id}] ${a.message}`));
-  const covWarnings = valid.flatMap((m) => (m.diagnostics?.cov_warnings || []).map((w) => `[${m.model_id}] ${w}`));
+  const guardNotes = valid.flatMap((m) => (m.footnotes || []).map((f) => `[${m.model_id}] ${translateVerdict(f)}`));
+  const proxyAlerts = valid.flatMap((m) => (m.diagnostics?.proxy_alerts || []).map((a) => `[${m.model_id}] ${translateVerdict(a.message)}`));
+  const covWarnings = valid.flatMap((m) => (m.diagnostics?.cov_warnings || []).map((w) => `[${m.model_id}] ${translateVerdict(w)}`));
   const mixedScale = new Set(valid.map((m) => m.y_transform)).size > 1;
+  const anyWcb = valid.some((m) => m.wild_bootstrap?.triggered);
 
   return `
     ${proxyAlerts.map((a) => `<div class="alert-box">⚠️ ${escapeHtml(a)}</div>`).join("")}
     ${covWarnings.map((w) => `<div class="alert-box">⚠️ ${escapeHtml(w)}</div>`).join("")}
     ${guardNotes.map((f) => `<div class="alert-box info">🛡️ ${escapeHtml(f)}</div>`).join("")}
+    ${
+      anyWcb
+        ? `<div class="alert-box info">🔔 <strong>Wild Cluster Bootstrap-t (G &lt; 30):</strong> A zárójelek alatt megjelenített <code>WCB p</code> értékek kis klaszterszám mellett is érvényes inferenciát adnak.</div>`
+        : ""
+    }
     ${
       mixedScale
         ? `<div class="alert-box info">ℹ️ Eltérő függőváltozó-transzformációk mellett a nyers AIC nem összehasonlítható; lásd a Jakobi-korrigált Y-skálás AIC sort.</div>`
@@ -655,7 +894,13 @@ function renderComparisonTable(models, showPct) {
         <thead>
           <tr>
             <th>Változó</th>
-            ${valid.map((m) => `<th class="num">${escapeHtml(m.model_name)}<div class="card-subtitle" style="font-weight:400;font-size:10px;">SE: ${escapeHtml(m.cov_type_used || "—")} (df=${m.df_infer ?? "—"})</div></th>`).join("")}
+            ${valid
+              .map((m) => {
+                const cm = m.cluster_meta;
+                const clInfo = m.cov_type_used === "cluster" && cm?.n_clusters ? `, ${cm.method}, G=${cm.n_clusters}` : "";
+                return `<th class="num">${escapeHtml(m.model_name)}<div class="card-subtitle" style="font-weight:400;font-size:10px;">SE: ${escapeHtml(m.cov_type_used || "—")} (df=${m.df_infer ?? "—"}${escapeHtml(clInfo)})</div></th>`;
+              })
+              .join("")}
           </tr>
         </thead>
         <tbody>
@@ -672,10 +917,11 @@ function renderComparisonTable(models, showPct) {
                     showPct && p.kennedy_pct !== null
                       ? `<div class="card-subtitle mono" style="font-size:10px;">Kennedy: ${p.kennedy_pct >= 0 ? "+" : ""}${p.kennedy_pct}% (HP: ${p.hp_pct >= 0 ? "+" : ""}${p.hp_pct}%)</div>`
                       : "";
+                  const wcbBadge = p.wcb_p !== undefined ? `<div class="card-subtitle mono" style="font-size:10px;">WCB p=${p.wcb_p}</div>` : "";
                   return `<td class="num">
                     <div>${p.beta}<span class="sig-stars">${escapeHtml(p.sig)}</span></div>
                     <div class="card-subtitle" style="font-size:10px;">(${p.se})</div>
-                    ${pctBadge}
+                    ${wcbBadge}${pctBadge}
                   </td>`;
                 })
                 .join("")}
@@ -695,7 +941,7 @@ function renderComparisonTable(models, showPct) {
               : ""
           }
           <tr>
-            <td><strong>5-szörös Diagnosztika</strong></td>
+            <td><strong>Diagnosztika</strong></td>
             ${valid
               .map((m) => {
                 const d = m.diagnostics || {};
@@ -703,7 +949,7 @@ function renderComparisonTable(models, showPct) {
                 return `<td class="num">
                   <div class="diag-bar" style="justify-content:flex-end;">
                     <span class="diag-chip ${d.max_vif < 5 ? "pass" : d.max_vif < 10 ? "warn" : "fail"}">VIF:${escapeHtml(vifDisp)}</span>
-                    <span class="diag-chip ${d.bp_p >= 0.05 ? "pass" : "warn"}">BP:${d.bp_p ?? "—"}</span>
+                    <span class="diag-chip ${(d.koenker_p ?? d.bp_p ?? 1) >= 0.05 ? "pass" : "warn"}">Koenker:${d.koenker_p ?? d.bp_p ?? "—"}</span>
                     <span class="diag-chip ${d.reset_p === null || d.reset_p >= 0.05 ? "pass" : "fail"}">RESET:${d.reset_p ?? "—"}</span>
                     <span class="diag-chip ${d.jb_p >= 0.05 ? "pass" : "warn"}">JB:${d.jb_p ?? "—"}</span>
                   </div>
@@ -728,9 +974,9 @@ function renderDiagnosticsDeepCard(valid, diagModel) {
       <div class="card-header">
         <div>
           <h3 class="card-title">3B-2. Mélydiagnosztika: Per-Változó VIF, κ &amp; Reziduális Ábrák</h3>
-          <div class="card-subtitle">Kondíciószám κ = <span class="diag-chip ${kappaCls}">${kappa ?? "—"}</span> | Max Leverage h<sub>ii</sub>: <span class="mono">${d.max_leverage ?? "—"}</span> | White p = <span class="mono">${d.white_p ?? "—"}</span> (${escapeHtml(d.white_mode || "—")})</div>
+          <div class="card-subtitle">Kondíciószám κ = <span class="diag-chip ${kappaCls}">${kappa ?? "—"}</span> | Max Leverage h<sub>ii</sub>: <span class="mono">${d.max_leverage ?? "—"}</span> | Koenker BP p = <span class="mono">${d.koenker_p ?? "—"}</span> | White p = <span class="mono">${d.white_p ?? "—"}</span> (${escapeHtml(d.white_mode || "—")})</div>
         </div>
-        <select id="selDiagModel" style="font-size:11px;">
+        <select id="selDiagModel" aria-label="Mélydiagnosztikai modell kiválasztása" style="font-size:11px;">
           ${valid.map((m) => `<option value="${escapeHtml(m.model_id)}" ${m.model_id === diagModel.model_id ? "selected" : ""}>${escapeHtml(m.model_name)}</option>`).join("")}
         </select>
       </div>
@@ -771,20 +1017,35 @@ function renderADProfileCard(adProfiles, state) {
   const activeKey = okKeys.includes(state.stage3AdKey) ? state.stage3AdKey : okKeys[0] || allKeys[0];
   state.stage3AdKey = activeKey;
   const prof = adProfiles[activeKey];
+  const parts = String(activeKey).split("::");
+  const spModel = state.recipe.models.find((m) => m.id === parts[0]);
+  const spTerm = spModel?.spatial_terms?.find((st) => st.target_id === parts[1] && st.transform === "andersson_day");
+  const curRng = spTerm?.cutoff_range_m || [100, 600, 25];
+
   return `
     <div class="card">
       <div class="card-header">
         <div>
           <h3 class="card-title">3C. Andersson–Day Küszöbprofil-Szkennelés (Profile-MLE)</h3>
-          <div class="card-subtitle">${escapeHtml(prof?.post_selection_note || prof?.reason || prof?.error || "")}</div>
+          <div class="card-subtitle">${escapeHtml(translateVerdict(prof?.post_selection_note || prof?.reason || prof?.error || ""))}</div>
         </div>
+        ${prof?.ok ? `<button type="button" class="btn btn-primary btn-sm" id="btnApplyAdCstar">✓ c* = ${prof.c_star_m} m alkalmazása</button>` : ""}
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;font-size:11px;">
+        <span>Tartomány (m): min</span>
+        <input type="number" id="inpAdMin" value="${curRng[0] ?? 100}" style="width:68px;" min="20" max="5000" />
+        <span>max</span>
+        <input type="number" id="inpAdMax" value="${curRng[1] ?? 600}" style="width:68px;" min="50" max="10000" />
+        <span>lépés</span>
+        <input type="number" id="inpAdStep" value="${curRng[2] ?? 25}" style="width:60px;" min="5" max="500" />
+        <button type="button" class="btn btn-sm" id="btnUpdateAdRange">↻ Szkennelés frissítése</button>
       </div>
       ${
         allKeys.length > 1
           ? `<div class="spec-tabs" style="margin-bottom:8px;">
                ${allKeys
                  .map(
-                   (k) => `<button class="spec-tab ad-prof-tab ${k === activeKey ? "active" : ""}" data-ad-key="${escapeHtml(k)}">${escapeHtml(k)}${adProfiles[k]?.ok ? ` (c*=${adProfiles[k].c_star_m}m)` : " (hiba)"}</button>`
+                   (k) => `<button type="button" class="spec-tab ad-prof-tab ${k === activeKey ? "active" : ""}" data-ad-key="${escapeHtml(k)}">${escapeHtml(k)}${adProfiles[k]?.ok ? ` (c*=${adProfiles[k].c_star_m}m)` : " (hiba)"}</button>`
                  )
                  .join("")}
              </div>`
@@ -798,7 +1059,7 @@ function renderADProfileCard(adProfiles, state) {
 function renderHeckmanCard(heck) {
   if (!heck) return "";
   if (!heck.activated) {
-    return `<div class="card"><div class="card-subtitle"><strong>Guard #4 Heckman 2-Lépcsős Szelekció:</strong> ${escapeHtml(heck.reason)}</div></div>`;
+    return `<div class="card"><div class="card-subtitle"><strong>Guard #4 Heckman 2-Lépcsős Szelekció:</strong> ${escapeHtml(translateVerdict(heck.reason))}</div></div>`;
   }
   return `
     <div class="card">
@@ -811,7 +1072,7 @@ function renderHeckmanCard(heck) {
       ${(heck.warnings || []).map((w) => `<div class="alert-box">⚠️ ${escapeHtml(w)}</div>`).join("")}
       <div class="table-wrap">
         <table class="academic">
-          <thead><tr><th>Változó</th><th class="num">Alap HC3 β̂ (SE)</th><th class="num">Heckman β̂ (Korrigált SE)</th><th class="num">Heckman p</th></tr></thead>
+          <thead><tr><th>Változó</th><th class="num">Alap SE β̂</th><th class="num">Heckman β̂ (Korrigált SE)</th><th class="num">Heckman p</th></tr></thead>
           <tbody>
             ${(heck.comparison || [])
               .map(

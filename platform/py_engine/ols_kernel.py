@@ -81,14 +81,15 @@ def fit_ols_core(
     beta, _, rank, _ = np.linalg.lstsq(X, y, rcond=None)
     resid = y - X @ beta
     fitted = X @ beta
-    df_resid = max(1, n - k)
+    eff_k = max(1, min(k, int(rank)))
+    df_resid = max(1, n - eff_k)
     rss = float(resid @ resid)
     tss = float(np.sum((y - np.mean(y)) ** 2))
     r2 = 1.0 - rss / tss if tss > 1e-18 else 0.0
     adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / df_resid if df_resid > 0 else 0.0
     sigma2 = rss / df_resid
     llf = -0.5 * n * (math.log(2.0 * math.pi) + math.log(max(rss / n, 1e-18)) + 1.0)
-    k_ml = k + 1  # Include residual variance sigma^2 for ML AIC/BIC parity with SAR/SEM/SDM
+    k_ml = eff_k + 1  # Include residual variance sigma^2 for ML AIC/BIC parity with SAR/SEM/SDM
     aic = 2.0 * k_ml - 2.0 * llf
     bic = k_ml * math.log(n) - 2.0 * llf
     aicc = aic + (2.0 * k_ml * (k_ml + 1)) / max(1, n - k_ml - 1)
@@ -209,6 +210,7 @@ def fit_ols_core(
         "cooks_d": cooks_d,
         "n": n,
         "k": k,
+        "rank": int(rank),
         "df_resid": df_resid,
         "df_infer": df_infer,
         "rss": rss,
@@ -246,11 +248,20 @@ def build_cluster_ids(
     1) Column (with optional regex street-number stripping)
     2) Coordinate-radius union-find (building clustering within radius_m)
     """
-    mode = cluster_spec.get("mode", "auto_or_column")
+    mode = str(cluster_spec.get("mode", "auto_or_column"))
     col = cluster_spec.get("col")
     regex = cluster_spec.get("regex")
-    radius_m = float(cluster_spec.get("radius_m", 15.0))
+    radius_raw = cluster_spec.get("radius_m", 15.0)
+    try:
+        radius_m = max(1e-6, float(radius_raw))
+    except (TypeError, ValueError):
+        radius_m = 15.0
+    if not math.isfinite(radius_m):
+        radius_m = 15.0
     n = len(valid_indices)
+
+    if mode == "none":
+        return None, {"method": "none", "n_clusters": n}
 
     if mode in ("column", "auto_or_column") and col and col in columns:
         raw_vals = columns[col]
@@ -480,6 +491,9 @@ def run_guard1_diagnostics(
         "vifs": vifs,
         "collinear_cols": collinear_cols,
         "condition_number_kappa": round(kappa, 2),
+        "koenker_lm": round(koenker_lm, 3),
+        "koenker_p": round(koenker_p, 5),
+        "het_detected": bool(math.isfinite(koenker_p) and koenker_p < 0.05),
         "bp_lm": round(bp_lm, 3),
         "bp_p": round(bp_p, 5),
         "white_mode": white_mode,
@@ -507,10 +521,15 @@ def scan_andersson_day_profile(
     step: float = 25.0,
     sparse_min_cell: int = 5,
     override_valid_mask: Optional[np.ndarray] = None,
+    cov_type: str = "HC3",
+    cluster_spec: Optional[Dict[str, Any]] = None,
+    coords_xy: Optional[np.ndarray] = None,
+    cluster_ids: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Scan Andersson-Day censoring cutoff c in [c_min, c_max] via profile-MLE,
-    returning AICc(c), LL(c), beta(c), 95% CI, and 95% profile-likelihood CI for c*.
+    returning AICc(c), LL(c), beta(c), 95% t-CI (respecting active cov_type/CR1 clustering),
+    and 95% profile-likelihood CI for c*.
     """
     spatial_terms = model_spec.get("spatial_terms", [])
     if target_term_idx >= len(spatial_terms) or spatial_terms[target_term_idx].get("transform") != "andersson_day":
@@ -533,6 +552,16 @@ def scan_andersson_day_profile(
     if n_obs < 15:
         return {"ok": False, "reason": "Too few valid observations for threshold scan."}
 
+    # Resolve cluster IDs ONCE on the locked sample
+    cl_scan: Optional[np.ndarray] = None
+    if cov_type == "cluster":
+        if cluster_ids is not None and len(cluster_ids) == len(base_valid_mask):
+            cl_scan = cluster_ids[base_design["valid_indices"]]
+        elif cluster_ids is not None and len(cluster_ids) == n_obs:
+            cl_scan = cluster_ids
+        elif cluster_spec is not None and coords_xy is not None:
+            cl_scan, _ = build_cluster_ids(columns, coords_xy, base_design["valid_indices"], cluster_spec)
+
     for c_val in cutoffs:
         spec_copy["spatial_terms"][target_term_idx]["cutoff_m"] = float(c_val)
         d = build_model_design(columns, dist_dict, spec_copy, y_info, base_valid_mask, sparse_min_cell, scan_mask)
@@ -551,9 +580,19 @@ def scan_andersson_day_profile(
             curve.append({"c_m": float(c_val), "llf": None, "aicc": None, "beta": 0.0, "se": 0.0, "t": 0.0, "p": 1.0})
             continue
 
-        ols_r = fit_ols_core(d["X"], d["y"], cov_type="HC3")
+        cl_cur = None
+        if cov_type == "cluster" and cl_scan is not None:
+            if len(d["valid_indices"]) == len(base_design["valid_indices"]):
+                cl_cur = cl_scan
+            elif cluster_ids is not None and len(cluster_ids) == len(base_valid_mask):
+                cl_cur = cluster_ids[d["valid_indices"]]
+            elif cluster_spec is not None and coords_xy is not None:
+                cl_cur, _ = build_cluster_ids(columns, coords_xy, d["valid_indices"], cluster_spec)
+
+        ols_r = fit_ols_core(d["X"], d["y"], cov_type=cov_type, cluster_ids=cl_cur)
         b = float(ols_r["beta"][ad_col_idx])
         se = float(ols_r["se"][ad_col_idx])
+        t_crit = float(stats.t.ppf(0.975, max(1, ols_r["df_infer"])))
         curve.append({
             "c_m": float(c_val),
             "llf": round(float(ols_r["llf"]), 4),
@@ -562,8 +601,8 @@ def scan_andersson_day_profile(
             "r2": round(float(ols_r["r2"]), 4),
             "beta": round(b, 4),
             "se": round(se, 4),
-            "ci_lo": round(b - 1.96 * se, 4),
-            "ci_hi": round(b + 1.96 * se, 4),
+            "ci_lo": round(b - t_crit * se, 4),
+            "ci_hi": round(b + t_crit * se, 4),
             "t": round(float(ols_r["t"][ad_col_idx]), 3),
             "p": round(float(ols_r["p"][ad_col_idx]), 5),
         })
@@ -584,6 +623,7 @@ def scan_andersson_day_profile(
         "aicc_star": best_pt["aicc"],
         "c_ci_95": [min(ci_set), max(ci_set)] if ci_set else [best_pt["c_m"], best_pt["c_m"]],
         "n_obs": n_obs,
+        "cov_type_used": cov_type,
         "curve": curve,
         "post_selection_note": (
             "Profile-MLE cutoff c* maximizes likelihood over the grid; standard errors at c* treat c as fixed "
@@ -601,21 +641,33 @@ def run_stepwise_and_gelbach(
     base_valid_mask: np.ndarray,
     sparse_min_cell: int = 5,
     common_mask: Optional[np.ndarray] = None,
+    cov_type: str = "HC3",
+    cluster_spec: Optional[Dict[str, Any]] = None,
+    coords_xy: Optional[np.ndarray] = None,
+    cluster_ids: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Guard #3: Dynamic Step 0 -> Step K composition chain + Gelbach (2016)
-    exact order-independent OVB decomposition (delta_g = Gamma_g @ gamma_g).
+    exact order-independent OVB decomposition (delta_g = Gamma_g @ gamma_g)
+    with HC/CR1 cluster-consistent inference.
     """
     blocks = chain_cfg.get("blocks", [])
     focal_ref = chain_cfg.get("focal_term_ref", "")
-    cov_lookup = {c["col"]: c for c in full_model_spec.get("covariates", [])}
 
     # Build full design first to lock identical sample across Step 0..Step K
     full_design = build_model_design(columns, dist_dict, full_model_spec, y_info, base_valid_mask, sparse_min_cell, common_mask)
-    locked_mask = full_design["valid_mask"]
     n_obs = full_design["n_obs"]
     if n_obs < 15:
         return {"ok": False, "reason": "Too few valid observations for Stepwise/Gelbach analysis."}
+
+    cl_valid: Optional[np.ndarray] = None
+    if cov_type == "cluster":
+        if cluster_ids is not None and len(cluster_ids) == len(base_valid_mask):
+            cl_valid = cluster_ids[full_design["valid_indices"]]
+        elif cluster_ids is not None and len(cluster_ids) == n_obs:
+            cl_valid = cluster_ids
+        elif cluster_spec is not None and coords_xy is not None:
+            cl_valid, _ = build_cluster_ids(columns, coords_xy, full_design["valid_indices"], cluster_spec)
 
     # Identify focal column index in full_design
     focal_idx = None
@@ -668,7 +720,7 @@ def run_stepwise_and_gelbach(
     # Step 0 -> Step K estimation
     steps_out: List[Dict[str, Any]] = []
     cur_indices = list(x1_indices)
-    ols_step0 = fit_ols_core(X_full[:, cur_indices], y, cov_type="HC3")
+    ols_step0 = fit_ols_core(X_full[:, cur_indices], y, cov_type=cov_type, cluster_ids=cl_valid)
     pos_focal_0 = cur_indices.index(focal_idx)
     beta_0 = float(ols_step0["beta"][pos_focal_0])
     se_0 = float(ols_step0["se"][pos_focal_0])
@@ -690,7 +742,7 @@ def run_stepwise_and_gelbach(
 
     for s_idx, (bname, b_cols) in enumerate(block_col_indices, start=1):
         cur_indices.extend(b_cols)
-        ols_s = fit_ols_core(X_full[:, cur_indices], y, cov_type="HC3")
+        ols_s = fit_ols_core(X_full[:, cur_indices], y, cov_type=cov_type, cluster_ids=cl_valid)
         pos_f = cur_indices.index(focal_idx)
         b_s = float(ols_s["beta"][pos_f])
         se_s = float(ols_s["se"][pos_f])
@@ -710,41 +762,51 @@ def run_stepwise_and_gelbach(
             "attenuation_pct": round(atten, 2),
         })
 
-    ols_full = fit_ols_core(X_full, y, cov_type="HC3")
+    ols_full = fit_ols_core(X_full, y, cov_type=cov_type, cluster_ids=cl_valid)
     beta_full = float(ols_full["beta"][focal_idx])
     total_diff = beta_0 - beta_full
 
+    # Cluster grouping & finite-sample scale for Gelbach (2016) influence variance
+    use_cl_gel = ols_full["cov_type_used"] == "cluster" and cl_valid is not None
+    if use_cl_gel:
+        uniq_gg, inv_gg = np.unique(cl_valid, return_inverse=True)
+        g_cnt = len(uniq_gg)
+        if g_cnt <= 1:
+            use_cl_gel = False
+            gel_df = ols_full["df_resid"]
+        else:
+            cr1_gel_scale = (g_cnt / (g_cnt - 1.0)) * ((n_obs - 1.0) / max(1, ols_full["df_resid"]))
+            gel_df = max(1, g_cnt - 1)
+    else:
+        gel_df = ols_full["df_resid"]
+    hc_small_scale = float(n_obs) / max(1.0, float(ols_full["df_resid"]))
+
     # Exact Gelbach (2016) order-independent decomposition:
-    # For each block g: H_g = X_{2,g} @ gamma_g; regress H_g on X_1 -> delta_g = coef[pos_focal_0]
     gelbach_rows: List[Dict[str, Any]] = []
     if bool(chain_cfg.get("compute_gelbach_ovb", True)) and block_col_indices:
         X1 = X_full[:, x1_indices]
         gamma_full = ols_full["beta"]
         x1_x1_inv = ols_step0["xtx_inv"]
-        # Projection selector row e_f^T (X_1' X_1)^{-1} X_1'
         p_vec = x1_x1_inv[pos_focal_0, :] @ X1.T  # shape (N,)
-        # Cross-covariate influence correction for asymptotic SE of delta_g (Gelbach 2016 Eq. 12)
         e_full = ols_full["resid"]
-        # M1 residual maker for X1
         for bname, b_cols in block_col_indices:
             H_g = X_full[:, b_cols] @ gamma_full[b_cols]
             delta_g = float(p_vec @ H_g)
-            # Auxiliary residual + full residual influence approximation (HC-robust)
-            aux_fit = fit_ols_core(X1, H_g, cov_type="HC3")
+            aux_fit = fit_ols_core(X1, H_g, cov_type=cov_type, cluster_ids=cl_valid)
             u_g = aux_fit["resid"]
-            # Full influence for delta_g = A_g * e_full + p_vec * u_g
-            # where A_g selects gamma_g block via (X'X)^{-1}
-            sel_g = np.zeros(X_full.shape[1], dtype=np.float64)
-            # Compute linear combination c_g = sum_{j in b_cols} (p_vec @ X_full[:, j]) * e_j
-            proj_x2g = p_vec @ X_full[:, b_cols]  # shape (len(b_cols),)
+            proj_x2g = p_vec @ X_full[:, b_cols]
             c_full = np.zeros(X_full.shape[1], dtype=np.float64)
             c_full[b_cols] = proj_x2g
-            # Influence vector psi_i = (c_full' (X'X)^{-1} x_i) * e_full_i + p_vec_i * u_g_i
             w_full = c_full @ ols_full["xtx_inv"] @ X_full.T
             psi_i = w_full * e_full + p_vec * u_g
-            se_delta = float(np.sqrt(max(0.0, np.sum(psi_i ** 2))))
+            if use_cl_gel:
+                psi_g = np.zeros(g_cnt, dtype=np.float64)
+                np.add.at(psi_g, inv_gg, psi_i)
+                se_delta = float(np.sqrt(max(0.0, cr1_gel_scale * float(np.sum(psi_g ** 2)))))
+            else:
+                se_delta = float(np.sqrt(max(0.0, hc_small_scale * float(np.sum(psi_i ** 2)))))
             t_delta = delta_g / se_delta if se_delta > 1e-15 else 0.0
-            p_delta = float(2.0 * stats.t.sf(abs(t_delta), df=ols_full["df_resid"]))
+            p_delta = float(2.0 * stats.t.sf(abs(t_delta), df=gel_df))
             share_pct = (delta_g / total_diff * 100.0) if abs(total_diff) > 1e-12 else 0.0
             gelbach_rows.append({
                 "block": bname,
@@ -763,6 +825,7 @@ def run_stepwise_and_gelbach(
         "ok": True,
         "focal_term": focal_label,
         "n_obs": n_obs,
+        "cov_type_used": ols_full["cov_type_used"],
         "beta_uncontrolled": round(beta_0, 5),
         "beta_controlled": round(beta_full, 5),
         "total_ovb_gap": round(total_diff, 5),
@@ -771,6 +834,75 @@ def run_stepwise_and_gelbach(
         "steps": steps_out,
         "gelbach": gelbach_rows,
         "gelbach_sum_check": round(sum(r["delta"] for r in gelbach_rows), 5),
+    }
+
+
+def run_wild_cluster_bootstrap(
+    X: np.ndarray,
+    y: np.ndarray,
+    cluster_ids: np.ndarray,
+    n_boot: int = 999,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """
+    Vectorized Restricted Wild Cluster Bootstrap-t (Cameron, Gelbach & Miller 2008;
+    Roodman et al. 2019 fast matrix algebra) using Webb 6-point (G < 12) or Rademacher (G >= 12) weights.
+    """
+    n, k = X.shape
+    uniq_g, inv_idx = np.unique(cluster_ids, return_inverse=True)
+    g_count = len(uniq_g)
+    if g_count < 2 or n <= k:
+        return {"triggered": False, "n_clusters": int(g_count), "p_values": [], "weight_dist": "none"}
+
+    ols_obs = fit_ols_core(X, y, cov_type="cluster", cluster_ids=cluster_ids)
+    t_obs = ols_obs["t"]
+    xtx_inv = ols_obs["xtx_inv"]
+    cr1_scale = (g_count / (g_count - 1.0)) * ((n - 1.0) / max(1, ols_obs["df_resid"]))
+
+    weight_dist = "webb" if g_count < 12 else "rademacher"
+    if g_count < 12:
+        pts = np.array([-math.sqrt(1.5), -1.0, -math.sqrt(0.5), math.sqrt(0.5), 1.0, math.sqrt(1.5)], dtype=np.float64)
+    else:
+        pts = np.array([-1.0, 1.0], dtype=np.float64)
+
+    rng = np.random.default_rng(seed)
+    V = rng.choice(pts, size=(n_boot, g_count))
+
+    # Precompute cluster cross-products X_h^T X_h once
+    xh_txh = [None] * g_count
+    for h in range(g_count):
+        Xh = X[inv_idx == h]
+        xh_txh[h] = Xh.T @ Xh
+
+    wcb_p = [float(ols_obs["p"][0])]
+    for j in range(1, k):
+        X_r = np.delete(X, j, axis=1)
+        b_r, _, _, _ = np.linalg.lstsq(X_r, y, rcond=None)
+        e_r = y - X_r @ b_r
+
+        q_mat = np.zeros((g_count, k), dtype=np.float64)
+        np.add.at(q_mat, inv_idx, X * e_r[:, None])
+
+        c_j = xtx_inv[j, :]  # (k,)
+        d_vec = q_mat @ c_j  # (G,)
+        b_num = V @ d_vec    # (B,)
+
+        # B_mat[h, g] = c_j @ (X_h^T X_h) @ xtx_inv @ q_g
+        r_mat = np.vstack([c_j @ xh_txh[h] @ xtx_inv for h in range(g_count)])  # (G, k)
+        B_mat = r_mat @ q_mat.T  # (G, G)
+
+        S_boot = V * d_vec[None, :] - V @ B_mat.T  # (B, G)
+        se_boot = np.sqrt(np.maximum(1e-18, cr1_scale * np.sum(S_boot * S_boot, axis=1)))
+        t_boot = b_num / se_boot
+        p_j = float((np.sum(np.abs(t_boot) >= abs(float(t_obs[j]))) + 1.0) / (n_boot + 1.0))
+        wcb_p.append(round(p_j, 5))
+
+    return {
+        "triggered": True,
+        "n_clusters": int(g_count),
+        "n_boot": int(n_boot),
+        "weight_dist": weight_dist,
+        "p_values": wcb_p,
     }
 
 
@@ -794,26 +926,51 @@ def run_heckman_two_step(
     n_analytic = len(analytic_indices)
     n_excluded = int(np.sum(selection_indicator == 0))
 
-    # Build Stage 1 Probit matrix Z over rows with complete first-stage covariates
+    # Build Stage 1 Probit matrix Z over rows with complete first-stage covariates (numeric + categorical dummies)
     z_names: List[str] = ["const"]
     z_cols: List[np.ndarray] = [np.ones(n_total, dtype=np.float64)]
     all_probit_vars = list(dict.fromkeys(list(first_stage_covs) + list(exclusion_cols)))
     skipped_non_numeric: List[str] = []
+    encoded_sources: Dict[str, str] = {}
 
     for col in all_probit_vars:
-        if col in columns:
-            arr = parse_numeric_array(columns[col])
-            n_fin = int(np.sum(np.isfinite(arr)))
-            if n_fin > 20 and float(np.nanstd(arr)) > 1e-12:
-                z_names.append(col)
-                z_cols.append(arr)
-            elif n_fin <= 20:
-                skipped_non_numeric.append(col)
+        if col not in columns:
+            continue
+        raw_col = columns[col]
+        arr = parse_numeric_array(raw_col)
+        n_fin = int(np.sum(np.isfinite(arr)))
+        if n_fin > 20 and float(np.nanstd(arr)) > 1e-12:
+            z_names.append(col)
+            z_cols.append(arr)
+            encoded_sources[col] = col
+            continue
+
+        # Categorical/string fallback for Heckman Stage-1 Z
+        str_vals = [str(v).strip() if (v is not None and str(v).strip() != "") else None for v in raw_col]
+        counts: Dict[str, int] = {}
+        for sv in str_vals:
+            if sv is not None:
+                counts[sv] = counts.get(sv, 0) + 1
+        if 2 <= len(counts) <= 12 and sum(counts.values()) > 20:
+            modal_lvl = max(counts.keys(), key=lambda k: counts[k])
+            kept_lvls = [lvl for lvl, cnt in counts.items() if lvl != modal_lvl and cnt >= 5]
+            if kept_lvls:
+                for lvl in kept_lvls:
+                    d_name = f"{col}[{lvl}]"
+                    d_arr = np.array(
+                        [np.nan if sv is None else (1.0 if sv == lvl else 0.0) for sv in str_vals],
+                        dtype=np.float64,
+                    )
+                    z_names.append(d_name)
+                    z_cols.append(d_arr)
+                    encoded_sources[d_name] = col
+                continue
+        skipped_non_numeric.append(col)
 
     if len(z_cols) < 2:
         return {
             "activated": False,
-            "reason": "No valid non-constant numeric Stage-1 covariates available for Heckman Probit.",
+            "reason": "No valid non-constant numeric or categorical Stage-1 covariates available for Heckman Probit.",
             "skipped_non_numeric": skipped_non_numeric,
         }
 
@@ -824,7 +981,7 @@ def run_heckman_two_step(
     if int(np.sum(s2_keep_mask)) < 25:
         return {"activated": False, "reason": "Insufficient non-missing Stage-1 covariates on analytic sample."}
 
-    Z_fit = Z_raw[z_valid_mask]
+    Z_fit_all = Z_raw[z_valid_mask]
     s_fit = selection_indicator[z_valid_mask]
     n_sel_fit = int(np.sum(s_fit >= 0.5))
     n_excl_fit = int(np.sum(s_fit < 0.5))
@@ -835,12 +992,37 @@ def run_heckman_two_step(
         }
     fit_global_indices = np.where(z_valid_mask)[0]
 
+    # Prune columns that became constant or strictly collinear AFTER z_valid_mask listwise deletion!
+    keep_z_idx = [0]
+    pruned_post_z: List[str] = []
+    for j in range(1, Z_fit_all.shape[1]):
+        col_v = Z_fit_all[:, j]
+        if float(np.std(col_v)) <= 1e-12:
+            pruned_post_z.append(z_names[j])
+            continue
+        prev_mat = Z_fit_all[:, keep_z_idx]
+        b_col, _, _, _ = np.linalg.lstsq(prev_mat, col_v, rcond=None)
+        res_col = col_v - prev_mat @ b_col
+        if float(np.std(res_col)) <= 1e-10 * max(1.0, float(np.std(col_v))):
+            pruned_post_z.append(z_names[j])
+            continue
+        keep_z_idx.append(j)
+
+    if len(keep_z_idx) < 2:
+        return {
+            "activated": False,
+            "reason": "Stage-1 covariates became constant or collinear after missingness filtering.",
+            "skipped_non_numeric": skipped_non_numeric + pruned_post_z,
+        }
+
+    z_names = [z_names[j] for j in keep_z_idx]
+    Z_fit = Z_fit_all[:, keep_z_idx]
+
     # Standardize non-constant columns of Z_fit for numerically stable Probit optimization
-    z_means = np.mean(Z_fit[:, 1:], axis=0) if Z_fit.shape[1] > 1 else np.array([])
-    z_stds = np.where(np.std(Z_fit[:, 1:], axis=0) > 1e-12, np.std(Z_fit[:, 1:], axis=0), 1.0) if Z_fit.shape[1] > 1 else np.array([])
+    z_means = np.mean(Z_fit[:, 1:], axis=0)
+    z_stds = np.where(np.std(Z_fit[:, 1:], axis=0) > 1e-12, np.std(Z_fit[:, 1:], axis=0), 1.0)
     Z_std = Z_fit.copy()
-    if Z_fit.shape[1] > 1:
-        Z_std[:, 1:] = (Z_fit[:, 1:] - z_means) / z_stds
+    Z_std[:, 1:] = (Z_fit[:, 1:] - z_means) / z_stds
 
     def _probit_neg_ll(gamma: np.ndarray, l2_reg: float = 0.0) -> Tuple[float, np.ndarray]:
         eta = np.clip(Z_std @ gamma, -30.0, 30.0)
@@ -928,7 +1110,9 @@ def run_heckman_two_step(
     delta_i = np.clip(imr2 * (imr2 + eta2), 0.0, 0.999)
     sigma2_hat = float(np.mean(e_heck ** 2) + (theta_imr ** 2) * float(np.mean(delta_i)))
     sigma2_hat = max(sigma2_hat, 1e-12)
-    rho2 = min(0.99, (theta_imr ** 2) / sigma2_hat)
+    rho2_raw = (theta_imr ** 2) / sigma2_hat
+    rho_clamped = rho2_raw >= 0.99
+    rho2 = min(0.99, rho2_raw)
 
     xtx_h = X_heck.T @ X_heck
     try:
@@ -969,15 +1153,28 @@ def run_heckman_two_step(
         "heckman_p": round(float(p_heck[-1]), 5),
     })
 
-    has_excl = len([c for c in exclusion_cols if c in z_names]) > 0
+    has_excl = any(encoded_sources.get(zn) in exclusion_cols for zn in z_names) or any(c in z_names for c in exclusion_cols)
+    imr_unreliable = bool(imr_vif >= 100.0 and not has_excl)
     warnings = []
     if skipped_non_numeric:
         warnings.append(
-            f"Skipped non-numeric or mostly missing Stage-1 variables: {', '.join(skipped_non_numeric)}."
+            f"Skipped non-numeric, high-cardinality, or mostly missing Stage-1 variables: {', '.join(skipped_non_numeric)}."
+        )
+    if pruned_post_z:
+        warnings.append(
+            f"Pruned constant/collinear Stage-1 variables after missingness filter: {', '.join(pruned_post_z)}."
         )
     if not has_excl:
         warnings.append("Heckman Probit has no explicit exclusion restriction (Z_excl); identified via Probit nonlinearity only.")
-    if imr_vif >= 20.0:
+    if rho_clamped:
+        warnings.append(
+            f"Heckman 2-step boundary condition (|theta|^2/sigma^2 = {rho2_raw:.3f} >= 0.99): rho clamped to +/-0.995 (interpret with caution)."
+        )
+    if imr_unreliable:
+        warnings.append(
+            f"Weak/collinear IMR without exclusion restriction (VIF={imr_vif:.1f} >= 100): 2-step Heckman estimates are numerically unstable; rely on OLS baseline."
+        )
+    elif imr_vif >= 20.0:
         warnings.append(
             f"High IMR collinearity (VIF={imr_vif:.1f} >= 20): Stage-2 identification is weak without an exclusion restriction Z_excl."
         )
@@ -990,11 +1187,13 @@ def run_heckman_two_step(
         "n_analytic": n2,
         "n_excluded": int(np.sum(s_fit == 0)),
         "has_exclusion_restriction": has_excl,
+        "imr_unreliable": imr_unreliable,
+        "rho_clamped": rho_clamped,
         "imr_beta": round(theta_imr, 4),
         "imr_se": round(float(se_heck[-1]), 4),
         "imr_p": round(float(p_heck[-1]), 5),
         "imr_vif": round(imr_vif, 2),
-        "selection_bias_detected": bool(float(p_heck[-1]) < 0.05),
+        "selection_bias_detected": bool(float(p_heck[-1]) < 0.05 and not imr_unreliable),
         "rho_selection_est": round(math.sqrt(rho2) * (1.0 if theta_imr >= 0 else -1.0), 4),
         "sigma_est": round(math.sqrt(sigma2_hat), 4),
         "comparison": rows_comp,

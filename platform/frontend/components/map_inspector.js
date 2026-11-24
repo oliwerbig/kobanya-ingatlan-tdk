@@ -1,4 +1,5 @@
-/* Docked MapLibre GL Map, Dynamic Legend & Clickable Point / OSM-Toggle Inspector */
+/* Docked MapLibre GL Map, Dynamic Legend, Co-located Parcel Paginator, BBox/Snap Overlay & Bidirectional Plot Focus */
+import { translateVerdict } from "../utils/i18n.js";
 import { escapeHtml, parseNumericScalar } from "../utils/sanitize.js";
 
 const LISA_COLORS = {
@@ -7,6 +8,14 @@ const LISA_COLORS = {
   HL: "#f59e0b",
   LH: "#7c3aed",
   NS: "#94a3b8",
+};
+
+const SNAP_COLORS = {
+  0: "#16a34a", // SNAP_OK
+  1: "#d97706", // SNAP_DISCONNECTED
+  2: "#dc2626", // SNAP_EXCEEDED
+  3: "#94a3b8", // SNAP_TARGET_EMPTY / fallback
+  4: "#64748b", // SNAP_FETCH_FAILED
 };
 
 function makeFallbackStyle(isDark, useTiles) {
@@ -55,15 +64,21 @@ export class MapInspector {
     this.map = null;
     this.ready = false;
     this.isDark = false;
-    this.fallbackTier = 0; // 0 = vector OpenFreeMap, 1 = raster OSM, 2 = pure offline blank
+    this.fallbackTier = 0;
     this.layerMode = "y_raw";
     this.gwrColIdx = 1;
     this.gwrMaskMode = "fdr";
     this.activeModelId = null;
+    this.activeRouteTargetId = "";
     this.targetGeojsonMap = new Map();
     this.obsFeatures = [];
+    this.obsByIdx = new Map();
+    this.colocatedGroups = new Map();
+    this.obsClusterKey = new Map();
     this.routeFeatures = [];
+    this.fetchedBboxGeojson = null;
     this.selectedObsIdx = null;
+    this._pendingBounds = null;
     this._lastRestyleArgs = {};
   }
 
@@ -97,7 +112,6 @@ export class MapInspector {
       this.map.setStyle(makeFallbackStyle(this.isDark, useTiles));
     };
 
-    // Timeout guard if remote style hangs without immediate error event
     const bootWatchdog = setTimeout(() => {
       if (!this.ready && this.fallbackTier === 0) {
         triggerFallback();
@@ -121,6 +135,10 @@ export class MapInspector {
       this._ensureLayers();
       this._bindMapEvents();
       this._flushSources();
+      if (this._pendingBounds) {
+        this._applyFitBounds(this._pendingBounds);
+        this._pendingBounds = null;
+      }
     });
 
     this.map.on("style.load", () => {
@@ -129,6 +147,13 @@ export class MapInspector {
         this._flushSources();
       }
     });
+  }
+
+  _applyFitBounds(bounds) {
+    if (!this.map || !this.ready || !bounds) return;
+    try {
+      this.map.fitBounds(bounds, { padding: 36, maxZoom: 15, duration: 500 });
+    } catch (_) {}
   }
 
   setTheme(isDark) {
@@ -147,6 +172,21 @@ export class MapInspector {
 
   _ensureLayers() {
     if (!this.map) return;
+    if (!this.map.getSource("fetched-bbox-src")) {
+      this.map.addSource("fetched-bbox-src", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+    }
+    if (!this.map.getLayer("fetched-bbox-line")) {
+      this.map.addLayer({
+        id: "fetched-bbox-line",
+        type: "line",
+        source: "fetched-bbox-src",
+        paint: { "line-color": "#0284c7", "line-width": 2, "line-dasharray": [4, 3], "line-opacity": 0.75 },
+      });
+    }
+
     if (!this.map.getSource("targets-src")) {
       this.map.addSource("targets-src", {
         type: "geojson",
@@ -231,7 +271,7 @@ export class MapInspector {
         type: "circle",
         source: "obs-src",
         paint: {
-          "circle-radius": ["case", ["==", ["get", "selected"], true], 8, 5],
+          "circle-radius": ["case", ["==", ["get", "selected"], true], 9, 5],
           "circle-color": ["coalesce", ["get", "color"], "#1d4ed8"],
           "circle-opacity": ["coalesce", ["get", "opacity"], 0.85],
           "circle-stroke-width": ["case", ["==", ["get", "selected"], true], 2.5, 1],
@@ -324,6 +364,27 @@ export class MapInspector {
     this._flushTargets();
   }
 
+  setFetchedBbox(bbox) {
+    if (!bbox || !Number.isFinite(bbox.south) || !Number.isFinite(bbox.north) || !Number.isFinite(bbox.west) || !Number.isFinite(bbox.east)) {
+      this.fetchedBboxGeojson = null;
+    } else {
+      const { south: s, west: w, north: n, east: e } = bbox;
+      const boxes = w > e ? [[w, s, 180, n], [-180, s, e, n]] : [[w, s, e, n]];
+      this.fetchedBboxGeojson = {
+        type: "FeatureCollection",
+        features: boxes.map(([bxW, bxS, bxE, bxN]) => ({
+          type: "Feature",
+          geometry: {
+            type: "Polygon",
+            coordinates: [[[bxW, bxS], [bxE, bxS], [bxE, bxN], [bxW, bxN], [bxW, bxS]]],
+          },
+          properties: { kind: "fetched_bbox" },
+        })),
+      };
+    }
+    this._flushBbox();
+  }
+
   clearRoute() {
     this.selectedObsIdx = null;
     this.routeFeatures = [];
@@ -332,11 +393,23 @@ export class MapInspector {
 
   clearObservations() {
     this.obsFeatures = [];
+    this.obsByIdx.clear();
+    this.colocatedGroups.clear();
+    this.obsClusterKey.clear();
     this.selectedObsIdx = null;
     this.routeFeatures = [];
+    this._pendingBounds = null;
     this._flushObs();
     this._flushRoute();
     this._renderLegend({});
+  }
+
+  _flushBbox() {
+    if (!this.ready) return;
+    const src = this.map.getSource("fetched-bbox-src");
+    if (src) {
+      src.setData(this.fetchedBboxGeojson || { type: "FeatureCollection", features: [] });
+    }
   }
 
   _flushTargets() {
@@ -354,7 +427,7 @@ export class MapInspector {
     if (src) src.setData({ type: "FeatureCollection", features: merged });
   }
 
-  setObservationsFromDataset(columns, latCol, lonCol, rowIdCol, ySpec, fitMap = true) {
+  setObservationsFromDataset(columns, latCol, lonCol, rowIdCol, ySpec, fitMap = true, bbox = null) {
     const lats = columns[latCol] || [];
     const lons = columns[lonCol] || [];
     const ids = rowIdCol && columns[rowIdCol] ? columns[rowIdCol] : null;
@@ -362,7 +435,11 @@ export class MapInspector {
     const dens = ySpec.mode === "ratio" && ySpec.den_col && columns[ySpec.den_col] ? columns[ySpec.den_col] : null;
 
     const feats = [];
+    this.obsByIdx.clear();
+    this.colocatedGroups.clear();
+    this.obsClusterKey.clear();
     let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90;
+    const validLons = [];
     for (let i = 0; i < lats.length; i++) {
       const la = parseNumericScalar(lats[i]);
       const lo = parseNumericScalar(lons[i]);
@@ -372,7 +449,7 @@ export class MapInspector {
         const dv = parseNumericScalar(dens[i]);
         yv = dv > 0 ? yv / dv : NaN;
       }
-      feats.push({
+      const feat = {
         type: "Feature",
         geometry: { type: "Point", coordinates: [lo, la] },
         properties: {
@@ -383,7 +460,14 @@ export class MapInspector {
           opacity: 0.85,
           selected: false,
         },
-      });
+      };
+      feats.push(feat);
+      this.obsByIdx.set(i, feat);
+      const ck = `${la.toFixed(6)},${lo.toFixed(6)}`;
+      this.obsClusterKey.set(i, ck);
+      if (!this.colocatedGroups.has(ck)) this.colocatedGroups.set(ck, []);
+      this.colocatedGroups.get(ck).push(i);
+      validLons.push(lo);
       minLon = Math.min(minLon, lo);
       maxLon = Math.max(maxLon, lo);
       minLat = Math.min(minLat, la);
@@ -395,19 +479,66 @@ export class MapInspector {
     this._flushRoute();
     this.obsFeatures = feats;
     this.restyleObservations({});
-    if (fitMap && this.ready && feats.length > 0) {
-      this.map.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 36, maxZoom: 15, duration: 500 });
+
+    if (fitMap && feats.length > 0) {
+      let bounds = [[minLon, minLat], [maxLon, maxLat]];
+      if (bbox && Number.isFinite(bbox.west) && Number.isFinite(bbox.east) && bbox.west > bbox.east) {
+        // Antimeridian dataset: compute unwrapped positive span from circular lon0
+        let sx = 0, sy = 0;
+        for (const lo of validLons) {
+          const rad = (lo * Math.PI) / 180;
+          sx += Math.sin(rad);
+          sy += Math.cos(rad);
+        }
+        const lon0 = (Math.atan2(sx, sy) * 180) / Math.PI;
+        let dMin = Infinity, dMax = -Infinity;
+        for (const lo of validLons) {
+          const d = ((((lo - lon0 + 180) % 360) + 360) % 360) - 180;
+          if (d < dMin) dMin = d;
+          if (d > dMax) dMax = d;
+        }
+        bounds = [[lon0 + dMin, minLat], [lon0 + dMax, maxLat]];
+      }
+      if (this.ready) {
+        this._applyFitBounds(bounds);
+      } else {
+        this._pendingBounds = bounds;
+      }
     }
   }
 
-  restyleObservations({ stage3, stage4, stage5, layerMode, gwrColIdx, gwrMaskMode, activeModelId }) {
+  focusObservation(obsIdx) {
+    const feat = this.obsByIdx.get(Number(obsIdx));
+    if (!feat) return false;
+    this.selectedObsIdx = Number(obsIdx);
+    const [lon, lat] = feat.geometry.coordinates;
+    if (this.map && this.ready) {
+      this.map.easeTo({
+        center: [lon, lat],
+        zoom: Math.max(this.map.getZoom(), 15),
+        duration: 400,
+      });
+    }
+    if (this.callbacks.onClickObservation) {
+      this.callbacks.onClickObservation(this.selectedObsIdx);
+    }
+    return true;
+  }
+
+  getColocatedNeighbors(obsIdx) {
+    const ck = this.obsClusterKey.get(Number(obsIdx));
+    if (!ck) return [Number(obsIdx)];
+    return this.colocatedGroups.get(ck) || [Number(obsIdx)];
+  }
+
+  restyleObservations({ stage1, stage3, stage4, stage5, layerMode, gwrColIdx, gwrMaskMode, activeModelId, routeTargetId }) {
     if (layerMode) this.layerMode = layerMode;
     if (gwrColIdx !== undefined) this.gwrColIdx = gwrColIdx;
     if (gwrMaskMode) this.gwrMaskMode = gwrMaskMode;
     if (activeModelId !== undefined) this.activeModelId = activeModelId;
-    this._lastRestyleArgs = { stage3, stage4, stage5 };
+    if (routeTargetId !== undefined) this.activeRouteTargetId = routeTargetId;
+    this._lastRestyleArgs = { stage1, stage3, stage4, stage5 };
 
-    // Resolve focal OLS model (prefer selected/activeModelId)
     let activeOlsModel = null;
     const olsMap = new Map();
     if (stage3 && stage3.models && stage3.models.length) {
@@ -448,6 +579,12 @@ export class MapInspector {
       });
     }
 
+    const snapByTarget = stage1?.snap_status_by_target || {};
+    const snapArr =
+      (this.activeRouteTargetId && snapByTarget[this.activeRouteTargetId]) ||
+      Object.values(snapByTarget)[0] ||
+      null;
+
     const vals = [];
     for (const f of this.obsFeatures) {
       const idx = f.properties.obs_idx;
@@ -459,6 +596,7 @@ export class MapInspector {
     const minV = vals.length ? Math.min(...vals) : 0;
     const maxV = vals.length ? Math.max(...vals) : 1;
     const tCritNom = stage5?.t_crit_nom || 1.96;
+    const snapCounts = { 0: 0, 1: 0, 2: 0, 3: 0 };
 
     for (const f of this.obsFeatures) {
       const idx = f.properties.obs_idx;
@@ -481,14 +619,19 @@ export class MapInspector {
       } else if (this.layerMode === "gwr_r2") {
         const g = gwrMap.get(idx);
         f.properties.color = g ? this._colorScale(g.r2, minV, maxV, false) : "#cbd5e1";
+      } else if (this.layerMode === "snap_status") {
+        const st = snapArr && idx < snapArr.length ? Number(snapArr[idx]) : 3;
+        f.properties.color = SNAP_COLORS[st] || "#94a3b8";
+        const bucket = st === 0 || st === 1 || st === 2 ? st : 3;
+        snapCounts[bucket] = (snapCounts[bucket] || 0) + 1;
       }
     }
 
     this._flushObs();
-    this._renderLegend({ minV, maxV, activeOlsModel, stage4, stage5, gwrVarName });
+    this._renderLegend({ minV, maxV, activeOlsModel, stage1, stage4, stage5, gwrVarName, snapCounts });
   }
 
-  _renderLegend({ minV, maxV, activeOlsModel, stage4, stage5, gwrVarName }) {
+  _renderLegend({ minV, maxV, activeOlsModel, stage1, stage4, stage5, gwrVarName, snapCounts }) {
     const el = document.getElementById(this.legendId);
     if (!el) return;
     if (!this.obsFeatures.length) {
@@ -497,6 +640,22 @@ export class MapInspector {
     }
     el.style.display = "block";
     const fmt = (v) => (Number.isFinite(v) ? (Math.abs(v) >= 1000 ? v.toLocaleString("hu-HU", { maximumFractionDigits: 0 }) : v.toFixed(3)) : "—");
+
+    if (this.layerMode === "snap_status") {
+      el.innerHTML = `
+        <div><strong>Hálózati illesztés (Snap &amp; BBox)</strong></div>
+        ${
+          stage1?.ok
+            ? `<div class="legend-swatches">
+                 <span class="legend-swatch"><span class="legend-dot" style="background:${SNAP_COLORS[0]};"></span>OK (${snapCounts?.[0] ?? 0})</span>
+                 <span class="legend-swatch"><span class="legend-dot" style="background:${SNAP_COLORS[2]};"></span>Snap &gt; limit (${snapCounts?.[2] ?? 0})</span>
+                 <span class="legend-swatch"><span class="legend-dot" style="background:${SNAP_COLORS[1]};"></span>Elszigetelt (${snapCounts?.[1] ?? 0})</span>
+               </div>`
+            : `<div class="card-subtitle">Futtasd az 1. fázist a hálózati snap diagnosztikához.</div>`
+        }
+      `;
+      return;
+    }
 
     if (this.layerMode === "lisa") {
       const cnt = stage4?.ok ? stage4.lisa_resid?.counts || {} : null;
@@ -513,7 +672,7 @@ export class MapInspector {
           cnt
             ? `<div class="legend-swatches">${items
                 .map(
-                  ([k, lbl, col]) =>
+                  ([k, , col]) =>
                     `<span class="legend-swatch"><span class="legend-dot" style="background:${col};"></span>${k} (${cnt[k] ?? 0})</span>`
                 )
                 .join("")}</div>`
@@ -574,6 +733,7 @@ export class MapInspector {
   }
 
   _flushSources() {
+    this._flushBbox();
     this._flushTargets();
     this._flushObs();
     this._flushRoute();
@@ -591,30 +751,70 @@ export class MapInspector {
     const el = document.getElementById(this.inspectorId);
     if (!el) return;
     if (obsIdx === null || !info) {
-      el.innerHTML = `<div class="card-subtitle">Kattints bármely megfigyelési pontra a térképen a pontos távolságok, Dijkstra sétaútvonal, reziduum, LISA-klaszter és GWR lokális együtthatók megtekintéséhez (Stage 1-ben az OSM objektumokra kattintva egyesével ki-/bekapcsolhatók az elemek).</div>`;
+      el.innerHTML = `<div class="card-subtitle">Kattints bármely megfigyelési pontra a térképen (vagy Stage 3-ban a reziduális ábrán) a pontos távolságok, Dijkstra sétaútvonal, co-located csoport, reziduum, LISA és GWR adatokhoz.</div>`;
       return;
     }
+
     const route = info.route;
     let detourTxt = `<span class="card-subtitle">Nincs aktív célpont útvonal-visszajátszáshoz</span>`;
     if (route && route.ok && route.inside_zero) {
-      detourTxt = `<span class="mono">Belső zóna (d<sub>eucl</sub>=0 m | d<sub>net</sub>=0 m | Δd=0 m)</span>`;
+      detourTxt = `<span class="mono">Belső zóna (d<sub>eucl</sub>=0 m | d<sub>net</sub>=0 m | 0 perc)</span>`;
     } else if (route && route.ok && route.dist_net_m !== null) {
-      detourTxt = `<span class="mono">d<sub>eucl</sub>=${escapeHtml(route.dist_eucl_m)} m | d<sub>net</sub>=${escapeHtml(route.dist_net_m)} m | Δd=${escapeHtml(route.detour_m)} m</span>`;
+      const timeStr = route.travel_time_min != null ? ` | ~${escapeHtml(route.travel_time_min)} perc` : "";
+      detourTxt = `<span class="mono">d<sub>eucl</sub>=${escapeHtml(route.dist_eucl_m)} m | d<sub>net</sub>=${escapeHtml(route.dist_net_m)} m | Δd=${escapeHtml(route.detour_m)} m${timeStr}</span>`;
     } else if (route && route.ok) {
-      detourTxt = `<span class="mono">d<sub>eucl</sub>=${escapeHtml(route.dist_eucl_m)} m (Dijkstra útvonal nincs betöltve)</span>`;
+      const reasonMap = {
+        SNAP_EXCEEDED: "távolabb a hálózattól mint max_snap_m",
+        SNAP_DISCONNECTED: "szigetkomponens (nem elérhető célpont)",
+        SNAP_NO_GRAPH: "Dijkstra utcahálózat nincs betöltve",
+        SNAP_TARGET_EMPTY: "minden célpont elem kizárva",
+      };
+      const reasonLbl = reasonMap[route.snap_reason] || translateVerdict(route.snap_reason || "Dijkstra nem elérhető");
+      detourTxt = `<span class="mono">d<sub>eucl</sub>=${escapeHtml(route.dist_eucl_m)} m (${escapeHtml(reasonLbl)})</span>`;
     }
 
+    const group = this.getColocatedNeighbors(obsIdx);
+    const posInGroup = Math.max(0, group.indexOf(Number(obsIdx)));
+    const clusterBar =
+      group.length > 1
+        ? `<div style="display:flex;align-items:center;justify-content:space-between;background:var(--surface-alt);border:1px solid var(--border);border-radius:6px;padding:4px 8px;margin-bottom:6px;font-size:11px;">
+             <span>🏢 Épületben / azonos ponton <strong>${group.length}</strong> megfigyelés — <strong>[${posInGroup + 1}/${group.length}]</strong></span>
+             <span style="display:flex;gap:4px;">
+               <button type="button" class="btn btn-sm" id="btnInspPrevCluster" aria-label="Előző co-located megfigyelés">◀</button>
+               <button type="button" class="btn btn-sm" id="btnInspNextCluster" aria-label="Következő co-located megfigyelés">▶</button>
+             </span>
+           </div>`
+        : "";
+
+    const covLine =
+      info.covSummary && info.covSummary.length
+        ? `<div class="card-subtitle mono" style="margin-top:4px;font-size:10.5px;">${info.covSummary.map((kv) => `${escapeHtml(kv.key)}=${escapeHtml(kv.val)}`).join(" | ")}</div>`
+        : "";
+
     el.innerHTML = `
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+      ${clusterBar}
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
         <strong>📍 Megfigyelés #${escapeHtml(info.row_id)} <span class="card-subtitle">(sor ${escapeHtml(obsIdx)})</span></strong>
         <span class="mono">y = ${info.y_raw !== null && Number.isFinite(Number(info.y_raw)) ? Number(info.y_raw).toLocaleString("hu-HU", { maximumFractionDigits: 2 }) : "—"}</span>
       </div>
-      <div style="margin-bottom:6px;">${detourTxt}</div>
+      <div style="margin-bottom:5px;">${detourTxt}</div>
       <div class="grid-3" style="font-size:11px;">
         <div><strong>OLS reziduum${info.modelLabel ? ` (${escapeHtml(info.modelLabel)})` : ""}:</strong> <span class="mono">${info.resid !== null ? escapeHtml(info.resid) : "—"}</span></div>
         <div><strong>LISA klaszter:</strong> <span class="mono">${info.lisa ? escapeHtml(info.lisa) : "—"}</span></div>
-        <div><strong>GWR lokális β̂ / t:</strong> <span class="mono">${info.gwr_beta !== null ? `${escapeHtml(info.gwr_beta)} (t=${escapeHtml(info.gwr_t)})` : "—"}</span></div>
+        <div><strong>GWR β̂/t/R²:</strong> <span class="mono">${info.gwr_beta !== null ? `${escapeHtml(info.gwr_beta)} (t=${escapeHtml(info.gwr_t)}, R²=${escapeHtml(info.gwr_r2 ?? "—")}, κ=${escapeHtml(info.gwr_kappa ?? "—")})` : "—"}</span></div>
       </div>
+      ${covLine}
     `;
+
+    if (group.length > 1 && this.callbacks.onClickObservation) {
+      el.querySelector("#btnInspPrevCluster")?.addEventListener("click", () => {
+        const nextIdx = group[(posInGroup - 1 + group.length) % group.length];
+        this.focusObservation(nextIdx);
+      });
+      el.querySelector("#btnInspNextCluster")?.addEventListener("click", () => {
+        const nextIdx = group[(posInGroup + 1) % group.length];
+        this.focusObservation(nextIdx);
+      });
+    }
   }
 }

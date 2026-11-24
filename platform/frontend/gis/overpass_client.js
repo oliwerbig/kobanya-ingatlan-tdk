@@ -87,6 +87,47 @@ function wrapLongitude(lon) {
   return Math.max(-179.999999, Math.min(179.999999, x));
 }
 
+export function splitAntimeridianBbox(bbox) {
+  if (!bbox) return [];
+  const south = Math.max(-89.9, Number(bbox.south));
+  const north = Math.min(89.9, Number(bbox.north));
+  const west = Number(bbox.west);
+  const east = Number(bbox.east);
+  if (west <= east) {
+    return [{ south, west, north, east }];
+  }
+  return [
+    { south, west, north, east: 180.0 },
+    { south, west: -180.0, north, east },
+  ];
+}
+
+export function computeAntimeridianMidLon(west, east) {
+  if (west <= east) return 0.5 * (west + east);
+  const span = (180.0 - west) + (east + 180.0);
+  return wrapLongitude(west + 0.5 * span);
+}
+
+export function splitGrid2x2Bbox(padded) {
+  const midLat = 0.5 * (padded.south + padded.north);
+  const midLon = computeAntimeridianMidLon(padded.west, padded.east);
+  return [
+    { south: padded.south, west: padded.west, north: midLat, east: midLon },
+    { south: padded.south, west: midLon, north: midLat, east: padded.east },
+    { south: midLat, west: padded.west, north: padded.north, east: midLon },
+    { south: midLat, west: midLon, north: padded.north, east: padded.east },
+  ];
+}
+
+function quickStrHash(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h.toString(16);
+}
+
 export function padBbox(bbox, bufferM = 1500) {
   const latMid = 0.5 * (bbox.south + bbox.north);
   const dLat = bufferM / 111132.95;
@@ -117,24 +158,28 @@ export function parseTagShorthand(shorthand) {
 }
 
 export function buildTargetOverpassQL(target, paddedBbox) {
-  const b = `${paddedBbox.south.toFixed(6)},${paddedBbox.west.toFixed(6)},${paddedBbox.north.toFixed(6)},${paddedBbox.east.toFixed(6)}`;
+  const boxes = splitAntimeridianBbox(paddedBbox);
   const types = target.element_types && target.element_types.length ? target.element_types : ["node", "way", "relation"];
+  const isLinearTarget = target.geometry_handling === "line_segment";
   const clauses = [];
 
-  for (const clause of target.osm_filter || []) {
-    let filterExpr = "";
-    for (const [k, vals] of Object.entries(clause)) {
-      if (!vals || vals.length === 0 || (vals.length === 1 && vals[0] === "*")) {
-        filterExpr += `["${k}"]`;
-      } else if (vals.length === 1) {
-        filterExpr += `["${k}"="${vals[0]}"]`;
-      } else {
-        filterExpr += `["${k}"~"^(${vals.join("|")})$"]`;
+  for (const box of boxes) {
+    const b = `${box.south.toFixed(6)},${box.west.toFixed(6)},${box.north.toFixed(6)},${box.east.toFixed(6)}`;
+    for (const clause of target.osm_filter || []) {
+      let filterExpr = "";
+      for (const [k, vals] of Object.entries(clause)) {
+        if (!vals || vals.length === 0 || (vals.length === 1 && vals[0] === "*")) {
+          filterExpr += `["${k}"]`;
+        } else if (vals.length === 1) {
+          filterExpr += `["${k}"="${vals[0]}"]`;
+        } else {
+          filterExpr += `["${k}"~"^(${vals.join("|")})$"]`;
+        }
       }
-    }
-    for (const et of types) {
-      const relFilter = et === "relation" ? '["type"="multipolygon"]' : "";
-      clauses.push(`  ${et}${relFilter}${filterExpr}(${b});`);
+      for (const et of types) {
+        const relFilter = et === "relation" && !isLinearTarget ? '["type"~"^(multipolygon|boundary)$"]' : "";
+        clauses.push(`  ${et}${relFilter}${filterExpr}(${b});`);
+      }
     }
   }
   const outMode = target.geometry_handling === "point" ? "out center;" : "out geom;";
@@ -142,23 +187,43 @@ export function buildTargetOverpassQL(target, paddedBbox) {
 }
 
 export function buildStreetGraphOverpassQL(paddedBbox, profile = "walk") {
-  const b = `${paddedBbox.south.toFixed(6)},${paddedBbox.west.toFixed(6)},${paddedBbox.north.toFixed(6)},${paddedBbox.east.toFixed(6)}`;
-  if (profile === "drive") {
-    return `[out:json][timeout:30];\nway["highway"~"^(motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|service)$"]["access"!="private"](${b});\nout tags;\n>;\nout skel qt;`;
+  const boxes = splitAntimeridianBbox(paddedBbox);
+  const clauses = [];
+  for (const box of boxes) {
+    const b = `${box.south.toFixed(6)},${box.west.toFixed(6)},${box.north.toFixed(6)},${box.east.toFixed(6)}`;
+    if (profile === "drive") {
+      clauses.push(
+        `  way["highway"~"^(motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|service)$"]["access"!~"^(private|no)$"]["motor_vehicle"!~"^(private|no)$"](${b});`
+      );
+    } else if (profile === "bike") {
+      const hwy =
+        '["highway"~"^(cycleway|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|path|track|service)$"]["bicycle"!="no"]["service"!~"^(parking_aisle|driveway)$"]';
+      clauses.push(`  way${hwy}["access"!~"^(private|no)$"](${b});`);
+      clauses.push(`  way${hwy}["bicycle"~"^(yes|designated|permissive)$"](${b});`);
+    } else {
+      const hwy =
+        '["highway"~"^(primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|pedestrian|footway|path|cycleway|steps|service)$"]["foot"!="no"]["service"!~"^(parking_aisle|driveway)$"]';
+      clauses.push(`  way${hwy}["access"!~"^(private|no)$"](${b});`);
+      clauses.push(`  way${hwy}["foot"~"^(yes|designated|permissive)$"](${b});`);
+    }
   }
-  if (profile === "bike") {
-    return `[out:json][timeout:30];\nway["highway"~"^(cycleway|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|path|track|service)$"]["bicycle"!="no"]["access"!="private"]["service"!~"^(parking_aisle|driveway)$"](${b});\nout tags;\n>;\nout skel qt;`;
-  }
-  // Undirected pedestrian walk network: minimal out skel qt payload (60-80% smaller)
-  return `[out:json][timeout:30];\nway["highway"~"^(primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|pedestrian|footway|path|cycleway|steps|service)$"]["foot"!="no"]["access"!="private"]["service"!~"^(parking_aisle|driveway)$"](${b});\n(._;>;);\nout skel qt;`;
+  return `[out:json][timeout:30];\n(\n${clauses.join("\n")}\n);\nout body;\n>;\nout skel qt;`;
 }
 
 function sqlLit(s) {
   return `'${String(s).replace(/'/g, "''")}'`;
 }
 
+function buildPostpassEnvelopeCond(paddedBbox) {
+  const boxes = splitAntimeridianBbox(paddedBbox);
+  const envs = boxes.map(
+    (bx) => `geom && st_makeenvelope(${bx.west.toFixed(6)}, ${bx.south.toFixed(6)}, ${bx.east.toFixed(6)}, ${bx.north.toFixed(6)}, 4326)`
+  );
+  return envs.length === 1 ? envs[0] : `(${envs.join(" OR ")})`;
+}
+
 export function buildTargetPostpassSQL(target, paddedBbox) {
-  const env = `st_makeenvelope(${paddedBbox.west.toFixed(6)}, ${paddedBbox.south.toFixed(6)}, ${paddedBbox.east.toFixed(6)}, ${paddedBbox.north.toFixed(6)}, 4326)`;
+  const envCond = buildPostpassEnvelopeCond(paddedBbox);
   const types = target.element_types && target.element_types.length ? target.element_types : ["node", "way", "relation"];
   const osmTypes = [];
   if (types.includes("node")) osmTypes.push("'N'");
@@ -196,7 +261,7 @@ export function buildTargetPostpassSQL(target, paddedBbox) {
     }
   }
   const whereExpr = orClauses.length ? orClauses.join(" OR ") : "FALSE";
-  return `SELECT osm_type, osm_id, tags, ${geomExpr} FROM ${table} WHERE geom && ${env} AND ${typeClause} AND (${whereExpr})`;
+  return `SELECT osm_type, osm_id, tags, ${geomExpr} FROM ${table} WHERE ${envCond} AND ${typeClause} AND (${whereExpr})`;
 }
 
 export function postpassToOverpassTarget(fc) {
@@ -301,7 +366,7 @@ export function postpassToOverpassTarget(fc) {
             }
           });
           if (members.length) {
-            elements.push({ type: "relation", id: nextId(), tags: { ...tags, type: tags.type || "multipolygon" }, members });
+            elements.push({ type: "relation", orig_type: elType, id: nextId(), tags: { ...tags, type: tags.type || "multipolygon" }, members });
           }
         }
       } else if (g.type === "MultiPolygon") {
@@ -319,7 +384,7 @@ export function postpassToOverpassTarget(fc) {
           });
         }
         if (members.length) {
-          elements.push({ type: "relation", id: nextId(), tags: { ...tags, type: tags.type || "multipolygon" }, members });
+          elements.push({ type: "relation", orig_type: elType, id: nextId(), tags: { ...tags, type: tags.type || "multipolygon" }, members });
         }
       }
     };
@@ -329,37 +394,56 @@ export function postpassToOverpassTarget(fc) {
   return { version: 0.6, generator: "Postpass", elements };
 }
 
-export function buildStreetGraphPostpassSQL(paddedBbox, profile = "walk") {
-  const env = `st_makeenvelope(${paddedBbox.west.toFixed(6)}, ${paddedBbox.south.toFixed(6)}, ${paddedBbox.east.toFixed(6)}, ${paddedBbox.north.toFixed(6)}, 4326)`;
+export function buildStreetGraphPostpassSQL(paddedBbox, profile = "walk", clipMarginM = 2000) {
+  const envCond = buildPostpassEnvelopeCond(paddedBbox);
+  const clipBoxes = splitAntimeridianBbox(padBbox(paddedBbox, clipMarginM));
+  const geomSelect =
+    clipBoxes.length === 1
+      ? `ST_ClipByBox2D(geom, st_makeenvelope(${clipBoxes[0].west.toFixed(6)}, ${clipBoxes[0].south.toFixed(6)}, ${clipBoxes[0].east.toFixed(6)}, ${clipBoxes[0].north.toFixed(6)}, 4326)) AS geom`
+      : "geom AS geom";
+
   let filterExpr;
   if (profile === "drive") {
     filterExpr =
-      "tags->>'highway' IN ('motorway','motorway_link','trunk','trunk_link','primary','primary_link','secondary','secondary_link','tertiary','tertiary_link','unclassified','residential','living_street','service') AND COALESCE(tags->>'access','yes') <> 'private'";
+      "tags->>'highway' IN ('motorway','motorway_link','trunk','trunk_link','primary','primary_link','secondary','secondary_link','tertiary','tertiary_link','unclassified','residential','living_street','service') AND COALESCE(tags->>'access','yes') NOT IN ('private','no') AND COALESCE(tags->>'motor_vehicle','yes') NOT IN ('private','no')";
   } else if (profile === "bike") {
     filterExpr =
-      "tags->>'highway' IN ('cycleway','primary','primary_link','secondary','secondary_link','tertiary','tertiary_link','unclassified','residential','living_street','path','track','service') AND COALESCE(tags->>'bicycle','yes') <> 'no' AND COALESCE(tags->>'access','yes') <> 'private' AND COALESCE(tags->>'service','') NOT IN ('parking_aisle','driveway')";
+      "tags->>'highway' IN ('cycleway','primary','primary_link','secondary','secondary_link','tertiary','tertiary_link','unclassified','residential','living_street','path','track','service') AND COALESCE(tags->>'bicycle','yes') <> 'no' AND (COALESCE(tags->>'access','yes') NOT IN ('private','no') OR tags->>'bicycle' IN ('yes','designated','permissive')) AND COALESCE(tags->>'service','') NOT IN ('parking_aisle','driveway')";
   } else {
     filterExpr =
-      "tags->>'highway' IN ('primary','primary_link','secondary','secondary_link','tertiary','tertiary_link','unclassified','residential','living_street','pedestrian','footway','path','cycleway','steps','service') AND COALESCE(tags->>'foot','yes') <> 'no' AND COALESCE(tags->>'access','yes') <> 'private' AND COALESCE(tags->>'service','') NOT IN ('parking_aisle','driveway')";
+      "tags->>'highway' IN ('primary','primary_link','secondary','secondary_link','tertiary','tertiary_link','unclassified','residential','living_street','pedestrian','footway','path','cycleway','steps','service') AND COALESCE(tags->>'foot','yes') <> 'no' AND (COALESCE(tags->>'access','yes') NOT IN ('private','no') OR tags->>'foot' IN ('yes','designated','permissive')) AND COALESCE(tags->>'service','') NOT IN ('parking_aisle','driveway')";
   }
-  return `SELECT osm_id, tags, geom AS geom FROM postpass_line WHERE geom && ${env} AND ${filterExpr}`;
+  return `SELECT osm_id, tags, ${geomSelect} FROM postpass_line WHERE ${envCond} AND ${filterExpr}`;
 }
 
 export function postpassToOverpassStreetGraph(fc) {
   const coordToId = new Map();
   const nodeElements = [];
   const wayElements = [];
+  const nodeDegree = new Map();
+  const groundEndpoints = new Map();
+  const nonGroundEndpoints = [];
   let nextNodeId = 1;
   let nextWayId = 1;
 
+  const bumpDeg = (nid) => nodeDegree.set(nid, (nodeDegree.get(nid) || 0) + 1);
+
   const addLine = (coords, tags) => {
     if (!Array.isArray(coords) || coords.length < 2) return;
+    const layer = String(tags?.layer ?? "0");
+    const bridge = String(tags?.bridge ?? "");
+    const tunnel = String(tags?.tunnel ?? "");
+    const isGround = layer === "0" && bridge === "" && tunnel === "";
+    const layerNum = Number(layer);
+    const sepSuffix = `${layer}|${bridge}|${tunnel}`;
     const nids = [];
+    const coordKeys = [];
     for (const c of coords) {
       if (!Array.isArray(c) || c.length < 2) continue;
-      const rLon = Number(Number(c[0]).toFixed(6));
-      const rLat = Number(Number(c[1]).toFixed(6));
-      const key = `${rLon.toFixed(6)},${rLat.toFixed(6)}`;
+      const rLon = Number(Number(c[0]).toFixed(7));
+      const rLat = Number(Number(c[1]).toFixed(7));
+      const coordKey = `${rLon.toFixed(7)},${rLat.toFixed(7)}`;
+      const key = `${coordKey}|${sepSuffix}`;
       let nid = coordToId.get(key);
       if (nid === undefined) {
         nid = nextNodeId++;
@@ -367,9 +451,28 @@ export function postpassToOverpassStreetGraph(fc) {
         nodeElements.push({ type: "node", id: nid, lon: rLon, lat: rLat });
       }
       nids.push(nid);
+      coordKeys.push(coordKey);
     }
     if (nids.length >= 2) {
       wayElements.push({ type: "way", id: nextWayId++, nodes: nids, tags });
+      for (let i = 0; i < nids.length - 1; i++) {
+        if (nids[i] !== nids[i + 1]) {
+          bumpDeg(nids[i]);
+          bumpDeg(nids[i + 1]);
+        }
+      }
+      const last = nids.length - 1;
+      if (isGround) {
+        if (!groundEndpoints.has(coordKeys[0])) {
+          groundEndpoints.set(coordKeys[0], { nid: nids[0], tags });
+        }
+        if (!groundEndpoints.has(coordKeys[last])) {
+          groundEndpoints.set(coordKeys[last], { nid: nids[last], tags });
+        }
+      } else if (Math.abs(Number.isFinite(layerNum) ? layerNum : 0) <= 1) {
+        nonGroundEndpoints.push({ nid: nids[0], coordKey: coordKeys[0] });
+        if (last > 0) nonGroundEndpoints.push({ nid: nids[last], coordKey: coordKeys[last] });
+      }
     }
   };
 
@@ -387,6 +490,24 @@ export function postpassToOverpassStreetGraph(fc) {
     const tags = feat?.properties?.tags || {};
     unpackLineGeom(feat?.geometry, tags);
   }
+
+  const linkedPairs = new Set();
+  for (const ep of nonGroundEndpoints) {
+    if ((nodeDegree.get(ep.nid) || 0) !== 1) continue;
+    const ground = groundEndpoints.get(ep.coordKey);
+    if (!ground || ground.nid === ep.nid) continue;
+    const pk = `${ep.nid}|${ground.nid}`;
+    if (linkedPairs.has(pk)) continue;
+    linkedPairs.add(pk);
+    wayElements.push({
+      type: "way",
+      id: nextWayId++,
+      role: "abutment",
+      nodes: [ep.nid, ground.nid],
+      tags: { ...(ground.tags || {}) },
+    });
+  }
+
   return { version: 0.6, generator: "Postpass", elements: [...nodeElements, ...wayElements] };
 }
 
@@ -478,14 +599,15 @@ export async function fetchTargetOSM(target, rawBbox, { forceRefresh = false, si
 export async function fetchStreetGraphOSM(rawBbox, bufferM = 800, profile = "walk", { forceRefresh = false, signal } = {}) {
   const padded = padBbox(rawBbox, bufferM);
   const ql = buildStreetGraphOverpassQL(padded, profile);
-  const cacheKey = `graph::${BACKEND_CACHE_VERSION}::${profile}::${padded.south.toFixed(4)},${padded.west.toFixed(4)},${padded.north.toFixed(4)},${padded.east.toFixed(4)}`;
+  const sql = buildStreetGraphPostpassSQL(padded, profile, Math.max(2000, bufferM + 2000));
+  const queryHash = quickStrHash(`${sql}::${ql}`);
+  const cacheKey = `graph::${BACKEND_CACHE_VERSION}::${profile}::${queryHash}::${padded.south.toFixed(4)},${padded.west.toFixed(4)},${padded.north.toFixed(4)},${padded.east.toFixed(4)}`;
 
   if (!forceRefresh) {
     const cached = await getCachedOSM(cacheKey);
     if (cached) return { data: cached, fromCache: true };
   }
 
-  const sql = buildStreetGraphPostpassSQL(padded, profile);
   try {
     const fc = await fetchPostpassSingle(sql, signal);
     const data = postpassToOverpassStreetGraph(fc);
@@ -501,16 +623,9 @@ export async function fetchStreetGraphOSM(rawBbox, bufferM = 800, profile = "wal
     await setCachedOSM(cacheKey, data);
     return { data, fromCache: false };
   } catch (err) {
-    if (err.name === "AbortError") throw err;
-    // 2x2 sub-tile fallback for large areas
-    const midLat = 0.5 * (padded.south + padded.north);
-    const midLon = 0.5 * (padded.west + padded.east);
-    const subBoxes = [
-      { south: padded.south, west: padded.west, north: midLat, east: midLon },
-      { south: padded.south, west: midLon, north: midLat, east: padded.east },
-      { south: midLat, west: padded.west, north: padded.north, east: midLon },
-      { south: midLat, west: midLon, north: padded.north, east: padded.east },
-    ];
+    if (signal?.aborted || err.name === "AbortError") throw err;
+    // Antimeridian-aware 2x2 sub-tile fallback for large areas
+    const subBoxes = splitGrid2x2Bbox(padded);
     const seen = new Set();
     const mergedElements = [];
     for (const sb of subBoxes) {

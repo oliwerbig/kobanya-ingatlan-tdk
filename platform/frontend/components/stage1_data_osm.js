@@ -1,5 +1,5 @@
-/* Stage 1: Universal File Intake (CSV / GeoJSON / Recipe / OSM Bundle / Workspace),
- * Schema Mapping (with pre-CSV recipe preview/edit), Parametric OSM & Feature Filter
+/* Stage 1: Universal File Intake, Schema Mapping (incl. cluster_spec.mode & regex + checkbox-pills),
+ * Parametric OSM / GeoJSON Targets (snap/buffer controls, Cancel fetch, remove_target RPC) & Time/Snap Summary
  */
 import { clearAllCachedOSM, parseOsmBundle } from "../gis/osm_idb_cache.js";
 import { OSM_TARGET_PRESETS, parseTagShorthand } from "../gis/overpass_client.js";
@@ -31,7 +31,7 @@ function renderFeatureListHtml(t, previewInfo, filterQuery) {
     shown
       .map((f) => {
         const isExcl = exclSet.has(f.uid);
-        return `<div class="osm-feature-item ${isExcl ? "excluded" : ""}" data-uid="${escapeHtml(f.uid)}">
+        return `<div class="osm-feature-item ${isExcl ? "excluded" : ""}" data-uid="${escapeHtml(f.uid)}" role="button" tabindex="0" aria-pressed="${isExcl ? "true" : "false"}">
           <span>${isExcl ? "☐" : "☑"} <strong>${escapeHtml(f.name)}</strong> <span class="mono card-subtitle">(${escapeHtml(f.uid)}, ${escapeHtml(f.geom_type)})</span></span>
           <span class="card-subtitle osm-item-state">${isExcl ? "kizárva" : "aktív"}</span>
         </div>`;
@@ -84,6 +84,10 @@ export function renderStage1(container, ctx) {
   const snapshotGraphCount = Object.keys(state.rawStreetGraphs || {}).length;
   const hasLoadedRecipe = Boolean(state.recipeFileName || state.workspaceFileName || targets.length > 0 || models.length > 1);
 
+  const clMode = ds.cluster_spec?.mode || "coordinate_radius";
+  const clusterNeedsCol = clMode === "column" || clMode === "auto_or_column";
+  const clusterNeedsRadius = clMode === "coordinate_radius" || clMode === "auto_or_column";
+
   const allOpts = (sel) => {
     const pool = headers.length > 0 ? [...headers] : [...recipeCols];
     if (sel && !pool.includes(sel)) {
@@ -103,21 +107,22 @@ export function renderStage1(container, ctx) {
     return `<option value="">— válassz —</option>` + opts;
   };
 
-  const multiOpts = (selectedArr) => {
+  const renderCheckboxPills = (clsName, selectedArr) => {
     const selectedSet = new Set(selectedArr || []);
     const base = headers.length > 0 ? [...numCols] : [...recipeCols];
     for (const s of selectedSet) {
       if (s && !base.includes(s)) base.unshift(s);
     }
+    if (!base.length) {
+      return `<div class="card-subtitle">Nincs még választható oszlop.</div>`;
+    }
     return base
       .map((h) => {
-        const note =
-          headers.length > 0 && !headers.includes(h)
-            ? " (receptből)"
-            : headers.length === 0
-              ? " (receptből)"
-              : "";
-        return `<option value="${escapeHtml(h)}" ${selectedSet.has(h) ? "selected" : ""}>${escapeHtml(h)}${note}</option>`;
+        const checked = selectedSet.has(h);
+        return `<label class="checkbox-pill ${checked ? "checked" : ""}">
+          <input type="checkbox" class="${clsName}" value="${escapeHtml(h)}" ${checked ? "checked" : ""} />
+          <span>${escapeHtml(h)}</span>
+        </label>`;
       })
       .join("");
   };
@@ -127,20 +132,16 @@ export function renderStage1(container, ctx) {
       <div class="card-header">
         <div>
           <h3 class="card-title">1A. Saját Adatbázis, Recept &amp; Projekt Betöltése</h3>
-          <div class="card-subtitle">100%-ban kliensoldali: tölts be CSV/GeoJSON adatot, <code>_recipe.json</code> receptet, <code>.osm_bundle.json</code> csomagot vagy <code>.geospec.json</code> projektet.</div>
+          <div class="card-subtitle">100%-ban kliensoldali: tölts be CSV/GeoJSON adatot, <code>_recipe.json</code> receptet, <code>.osm_bundle.json</code> csomagot vagy <code>.geospec.json</code> projektet (használd a fenti 📥 Betöltés / 💾 Mentés menüt is).</div>
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap;">
-          <button class="btn btn-sm" id="btnDlCsvTemplate">📄 CSV Sablon</button>
-          <button class="btn btn-sm" id="btnImportRecipeS1" title="Recept (_recipe.json) vagy projekt betöltése">📥 Recept (.json)</button>
-          <input type="file" id="fileRecipeS1" accept=".json" multiple style="display:none" />
-          <button class="btn btn-sm" id="btnExportRecipeS1" title="Aktuális recept (_recipe.json) mentése">💾 Recept Mentés</button>
-          <button class="btn btn-sm" id="btnExportProjectS1" title="Teljes munkamenet mentése (&lt;slug&gt;.geospec.json)">💾 Projekt Mentés</button>
+          <button type="button" class="btn btn-sm" id="btnDlCsvTemplate">📄 CSV Sablon</button>
         </div>
       </div>
 
       <div class="dropzone" id="csvDropzone" tabindex="0" role="button" aria-label="Fájlok kiválasztása vagy áthúzása">
         <div style="font-weight:600;margin-bottom:4px;">📂 Húzd ide vagy válaszd ki a fájlokat (CSV, GeoJSON, Recept, OSM Bundle, .geospec.json)</div>
-        <div class="card-subtitle">Egyszerre több fájl is kijelölhető (pl. adat + recept + GeoJSON célpontok) | Elválasztók: <code>,</code> <code>;</code> <code>Tab</code> | UTF-8 &amp; Windows-1250</div>
+        <div class="card-subtitle">Egyszerre több fájl is kijelölhető | Elválasztók: <code>,</code> <code>;</code> <code>Tab</code> | UTF-8 &amp; Windows-1250</div>
         <input type="file" id="csvFileInput" accept=".csv,.tsv,.txt,.geojson,.json" multiple style="display:none" />
       </div>
 
@@ -161,14 +162,14 @@ export function renderStage1(container, ctx) {
                    }
                  </div>`
               : `<div><strong>📊 Adatbázis:</strong> Nincs még betöltve</div>
-                 <div class="card-subtitle" style="margin-top:4px;">Húzz ide egy <code>.csv</code> / <code>.tsv</code> / Pont <code>.geojson</code> fájlt, vagy nyiss meg egy mentett <code>.geospec.json</code> projektet.</div>`
+                 <div class="card-subtitle" style="margin-top:4px;">Húzz ide egy <code>.csv</code> / <code>.tsv</code> / Pont <code>.geojson</code> fájlt, vagy nyiss meg egy <code>.geospec.json</code> projektet.</div>`
           }
         </div>
 
         <div class="workspace-status-box ${hasLoadedRecipe ? "loaded" : ""}" id="recipeStatusCard">
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
             <strong>🧪 Recept:</strong>
-            <input type="text" id="txtRecipeTitle" value="${escapeHtml(state.recipe.recipe_meta?.title || "")}" placeholder="Vizsgálat címe..." style="flex:1;min-width:160px;padding:3px 6px;font-size:11.5px;font-weight:600;" />
+            <input type="text" id="txtRecipeTitle" value="${escapeHtml(state.recipe.recipe_meta?.title || "")}" placeholder="Vizsgálat címe..." aria-label="Vizsgálat címe" style="flex:1;min-width:160px;padding:3px 6px;font-size:11.5px;font-weight:600;" />
           </div>
           <div class="card-subtitle" style="margin-top:4px;">
             Forrás: <span class="mono">${escapeHtml(state.workspaceFileName || state.recipeFileName || "Alapértelmezett sablon")}</span>
@@ -191,7 +192,7 @@ export function renderStage1(container, ctx) {
       ${
         headers.length > 0 && state.columns && state.nRows > 0
           ? `<div style="margin-top:10px;">
-               <div class="card-subtitle" style="margin-bottom:4px;"><strong>Sorelőnézet</strong> (első ${Math.min(5, state.nRows)} sor a betöltött ${state.nRows} sorból — kódolás és tizedesjel ellenőrzéséhez):</div>
+               <div class="card-subtitle" style="margin-bottom:4px;"><strong>Sorelőnézet</strong> (első ${Math.min(5, state.nRows)} sor a betöltött ${state.nRows} sorból):</div>
                <div class="table-wrap" style="max-height:170px;overflow:auto;">
                  <table class="academic" style="font-size:11px;">
                    <thead><tr>${headers.map((h) => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>
@@ -216,52 +217,52 @@ export function renderStage1(container, ctx) {
     <div class="card">
       <div class="card-header">
         <div>
-          <h3 class="card-title">1B. Oszlopszerepek &amp; Függő Változó (y)</h3>
+          <h3 class="card-title">1B. Oszlopszerepek, Függő Változó (y) &amp; Klaszterezés</h3>
           <div class="card-subtitle">${
             headers.length > 0
-              ? "Koordináták, célváltozó-transzformáció és opcionális klaszter / szelekciós / proxy szerepkörök"
-              : "Recept oszlopszerepek előnézete és szerkesztése (CSV betöltése előtt is módosítható)"
+              ? "Koordináták, y-transzformáció és CR1 / Guard #1 / Heckman oszlopszerepek"
+              : "Recept oszlopszerepek előnézete (CSV előtt is szerkeszthető)"
           }</div>
         </div>
-        <button class="btn btn-primary btn-sm" id="btnApplySchema">${headers.length > 0 ? "✓ Séma Rögzítése" : "✓ Recept Séma Mentése"}</button>
+        <button type="button" class="btn btn-primary btn-sm" id="btnApplySchema">${headers.length > 0 ? "✓ Séma Rögzítése" : "✓ Recept Séma Mentése"}</button>
       </div>
 
       <div class="grid-3">
         <div class="field-row">
-          <label>Szélesség (lat)</label>
+          <label for="mapLatCol">Szélesség (lat)</label>
           <select id="mapLatCol">${allOpts(ds.lat_col)}</select>
         </div>
         <div class="field-row">
-          <label>Hosszúság (lon)</label>
+          <label for="mapLonCol">Hosszúság (lon)</label>
           <select id="mapLonCol">${allOpts(ds.lon_col)}</select>
         </div>
         <div class="field-row">
-          <label>Sorazonosító (row_id)</label>
+          <label for="mapIdCol">Sorazonosító (row_id)</label>
           <select id="mapIdCol">${allOpts(ds.row_id_col)}</select>
         </div>
       </div>
 
       <div class="grid-3" style="margin-top:8px;">
         <div class="field-row">
-          <label>Függő változó mód</label>
+          <label for="mapYMode">Függő változó mód</label>
           <select id="mapYMode">
             <option value="column" ${ds.y_spec.mode === "column" ? "selected" : ""}>Önálló oszlop (y)</option>
             <option value="ratio" ${ds.y_spec.mode === "ratio" ? "selected" : ""}>Hányados (számláló / nevező)</option>
           </select>
         </div>
         <div class="field-row">
-          <label>${ds.y_spec.mode === "ratio" ? "Számláló (pl. ár)" : "Célváltozó (y)"}</label>
+          <label for="mapYNum">${ds.y_spec.mode === "ratio" ? "Számláló (pl. ár)" : "Célváltozó (y)"}</label>
           <select id="mapYNum">${allOpts(ds.y_spec.num_col)}</select>
         </div>
         <div class="field-row" style="${ds.y_spec.mode === "ratio" ? "" : "opacity:0.45;"}">
-          <label>Nevező (pl. alapterület)</label>
+          <label for="mapYDen">Nevező (pl. alapterület)</label>
           <select id="mapYDen" ${ds.y_spec.mode === "ratio" ? "" : "disabled"}>${allOpts(ds.y_spec.den_col)}</select>
         </div>
       </div>
 
       <div class="grid-3" style="margin-top:8px;">
         <div class="field-row">
-          <label>y Transzformáció</label>
+          <label for="mapYTrans">y Transzformáció</label>
           <select id="mapYTrans">
             <option value="log" ${ds.y_spec.transform === "log" ? "selected" : ""}>ln(y) (Fél-logaritmikus)</option>
             <option value="raw" ${ds.y_spec.transform === "raw" ? "selected" : ""}>y (Lineáris nyers)</option>
@@ -270,27 +271,43 @@ export function renderStage1(container, ctx) {
           </select>
         </div>
         <div class="field-row">
-          <label>Klaszter-oszlop (CR1 SE-hez, opcionális)</label>
-          <select id="mapClusterCol">${allOpts(ds.cluster_spec.col)}</select>
+          <label for="mapClusterMode">Klaszterezés módja (CR1 SE)</label>
+          <select id="mapClusterMode">
+            <option value="coordinate_radius" ${clMode === "coordinate_radius" ? "selected" : ""}>Koordináta-sugár (m)</option>
+            <option value="column" ${clMode === "column" ? "selected" : ""}>Klaszter-oszlop (+ opcionális regex)</option>
+            <option value="auto_or_column" ${clMode === "auto_or_column" ? "selected" : ""}>Oszlop ha megadott, különben sugár</option>
+            <option value="none" ${clMode === "none" ? "selected" : ""}>Nincs klaszter (HC3 / OLS)</option>
+          </select>
         </div>
-        <div class="field-row">
-          <label>Koordináta-klaszter sugár (m)</label>
-          <input type="number" id="mapClusterRadius" value="${escapeHtml(ds.cluster_spec.radius_m || 15)}" min="1" max="500" />
+        <div class="field-row" style="${clusterNeedsRadius ? "" : "opacity:0.45;"}">
+          <label for="mapClusterRadius">Koordináta-klaszter sugár (m)</label>
+          <input type="number" id="mapClusterRadius" value="${escapeHtml(ds.cluster_spec.radius_m || 15)}" min="1" max="5000" ${clusterNeedsRadius ? "" : "disabled"} />
+        </div>
+      </div>
+
+      <div class="grid-2" style="margin-top:8px;">
+        <div class="field-row" style="${clusterNeedsCol ? "" : "opacity:0.45;"}">
+          <label for="mapClusterCol">Klaszter-oszlop (CR1 SE-hez)</label>
+          <select id="mapClusterCol" ${clusterNeedsCol ? "" : "disabled"}>${allOpts(ds.cluster_spec.col)}</select>
+        </div>
+        <div class="field-row" style="${clusterNeedsCol ? "" : "opacity:0.45;"}">
+          <label for="mapClusterRegex">Klaszter-oszlop regex csonkítás (pl. <code>\\s+\\d+.*$</code> utca-szintre)</label>
+          <input type="text" id="mapClusterRegex" class="mono" value="${escapeHtml(ds.cluster_spec.regex || "")}" placeholder="opcionális reguláris kifejezés..." ${clusterNeedsCol ? "" : "disabled"} />
         </div>
       </div>
 
       <div class="grid-2" style="margin-top:8px;">
         <div class="field-row">
           <label>Térbeli Proxy / CBD oszlopok (Guard #1, több is jelölhető)</label>
-          <select id="mapProxyCols" multiple size="2" style="height:46px;">
-            ${multiOpts(ds.spatial_proxy_cols)}
-          </select>
+          <div class="checkbox-pills-wrap" id="wrapProxyCols">
+            ${renderCheckboxPills("chk-proxy-col", ds.spatial_proxy_cols)}
+          </div>
         </div>
         <div class="field-row">
           <label>Heckman kizárási restrikció Z<sub>excl</sub> (Guard #4, opcionális)</label>
-          <select id="mapHeckExcl" multiple size="2" style="height:46px;">
-            ${multiOpts(ds.selection_spec.exclusion_restriction_cols)}
-          </select>
+          <div class="checkbox-pills-wrap" id="wrapHeckExcl">
+            ${renderCheckboxPills("chk-heck-excl", ds.selection_spec.exclusion_restriction_cols)}
+          </div>
         </div>
       </div>
     </div>
@@ -299,28 +316,35 @@ export function renderStage1(container, ctx) {
       <div class="card-header">
         <div>
           <h3 class="card-title">1C. Parametrikus Térbeli Célpontok (Bármilyen OSM Entitás / GeoJSON)</h3>
-          <div class="card-subtitle">Adj hozzá célpontokat, kérd le az OSM objektumokat (vagy tölts be offline <code>.osm_bundle.json</code> csomagot)</div>
+          <div class="card-subtitle">Adj hozzá célpontokat, kérd le az OSM objektumokat (a már betöltött rétegek kihagyásával)</div>
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap;">
-          <button class="btn btn-sm" id="btnFetchOSM" ${state.datasetInfo && targets.some((t) => t.source === "osm_preset" || t.source === "osm_custom_tag") ? "" : "disabled"}>🌐 OSM Lekérése</button>
-          <button class="btn btn-sm" id="btnImportOsmBundle" title="Korábban mentett offline .osm_bundle.json betöltése">📦 Bundle Betöltés</button>
+          <button type="button" class="btn btn-sm" id="btnFetchOSM" ${state.datasetInfo && targets.some((t) => t.source === "osm_preset" || t.source === "osm_custom_tag") && !state.osmFetching ? "" : "disabled"}>🌐 OSM Lekérése</button>
+          ${
+            state.osmFetching
+              ? `<button type="button" class="btn btn-sm" id="btnCancelOsmFetch" style="color:var(--fail);">⏹ Lekérés megszakítása</button>`
+              : ""
+          }
+          <button type="button" class="btn btn-sm" id="btnImportOsmBundle" title="Korábban mentett offline .osm_bundle.json betöltése">📦 Bundle</button>
           <input type="file" id="fileOsmBundle" accept=".json" style="display:none" />
-          <button class="btn btn-sm" id="btnExportOsmBundle" ${hasSnapshotTargets || snapshotGraphCount ? "" : "disabled"} title="OSM / GeoJSON rétegek és utcahálózat mentése offline reprodukálhatósághoz">💾 .osm_bundle</button>
-          <button class="btn btn-sm" id="btnClearOsmCache" title="IndexedDB OSM cache ürítése">🗑 Cache</button>
-          <button class="btn btn-primary btn-sm" id="btnComputeDistances" ${state.datasetInfo && targets.length ? "" : "disabled"}>📐 Távolságok Számítása</button>
+          <button type="button" class="btn btn-sm" id="btnExportOsmBundle" ${hasSnapshotTargets || snapshotGraphCount ? "" : "disabled"} title="OSM / GeoJSON rétegek mentése">💾 .osm_bundle</button>
+          <button type="button" class="btn btn-sm" id="btnClearOsmCache" title="IndexedDB OSM cache ürítése">🗑 Cache</button>
+          <button type="button" class="btn btn-primary btn-sm" id="btnComputeDistances" ${state.datasetInfo && targets.length ? "" : "disabled"}>📐 Távolságok Számítása</button>
         </div>
       </div>
 
+      <div id="stage1InlineAlert"></div>
+
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;align-items:center;">
-        <select id="selOsmPreset" style="min-width:210px;">
+        <select id="selOsmPreset" aria-label="OSM sablon célpont" style="min-width:210px;">
           ${OSM_TARGET_PRESETS.map((p) => `<option value="${escapeHtml(p.preset_id)}">${escapeHtml(p.label)}</option>`).join("")}
         </select>
-        <button class="btn btn-sm" id="btnAddOsmPreset">+ Sablon Célpont</button>
-        <input type="text" id="txtCustomOsmTag" placeholder="Egyedi OSM tag (pl. amenity=school;leisure=park)" style="flex:1;min-width:210px;" />
-        <button class="btn btn-sm" id="btnAddCustomTag">+ Egyedi Tag</button>
-        <button class="btn btn-sm" id="btnAddGeojsonTarget">+ Saját GeoJSON</button>
+        <button type="button" class="btn btn-sm" id="btnAddOsmPreset">+ Sablon Célpont</button>
+        <input type="text" id="txtCustomOsmTag" aria-label="Egyedi OSM tag" placeholder="Egyedi OSM tag (pl. amenity=school;leisure=park)" style="flex:1;min-width:210px;" />
+        <button type="button" class="btn btn-sm" id="btnAddCustomTag">+ Egyedi Tag</button>
+        <button type="button" class="btn btn-sm" id="btnAddGeojsonTarget">+ Saját GeoJSON</button>
         <input type="file" id="fileGeojsonTarget" accept=".geojson,.json" multiple style="display:none" />
-        <button class="btn btn-sm" id="btnAddCsvDistTarget" ${numCols.length ? "" : 'disabled title="Előbb tölts be numerikus oszlopokat tartalmazó CSV adatbázist"'}>+ Meglévő CSV Oszlop</button>
+        <button type="button" class="btn btn-sm" id="btnAddCsvDistTarget" ${numCols.length ? "" : 'disabled title="Előbb tölts be numerikus oszlopokat tartalmazó CSV adatbázist"'}>+ Meglévő CSV Oszlop</button>
       </div>
 
       <div id="targetListArea">
@@ -347,7 +371,7 @@ export function renderStage1(container, ctx) {
       state.stage1Res
         ? `<div class="card">
              <div class="card-header">
-               <h3 class="card-title">1D. Térbeli Távolság &amp; Hálózati Kanyargósság Összesítő</h3>
+               <h3 class="card-title">1D. Térbeli Távolság, Menetidő &amp; Snap Összesítő</h3>
                <span class="card-subtitle">A becslések készen állnak a 2–5. fázisokhoz</span>
              </div>
              ${(state.stage1Res.warnings || []).map((w) => `<div class="alert-box">⚠️ ${escapeHtml(w)}</div>`).join("")}
@@ -356,7 +380,7 @@ export function renderStage1(container, ctx) {
                  <thead><tr>
                    <th>Célpont</th><th class="num">Aktív elem</th><th class="num">Kizárva</th>
                    <th class="num">Medián Eukl. (m)</th><th class="num">Medián Hálózati (m)</th>
-                   <th class="num">Medián Δd (m)</th><th class="num">Max Δd (m)</th>
+                   <th class="num">Medián idő (perc)</th><th class="num">Medián Δd / Snap</th>
                  </tr></thead>
                  <tbody>
                    ${state.stage1Res.summary
@@ -367,8 +391,8 @@ export function renderStage1(container, ctx) {
                          <td class="num">${escapeHtml(r.n_excluded_features)}</td>
                          <td class="num">${r.median_eucl_m ?? "—"}</td>
                          <td class="num">${r.median_net_m ?? "—"}</td>
-                         <td class="num">${r.median_detour_m ?? "—"}</td>
-                         <td class="num">${r.max_detour_m ?? "—"}</td>
+                         <td class="num">${r.median_time_min ?? "—"}</td>
+                         <td class="num">${r.median_detour_m ?? "—"}${r.n_snap_ok != null ? ` <span class="card-subtitle mono">(OK:${r.n_snap_ok}/Exc:${r.n_snap_exceeded ?? 0})</span>` : ""}</td>
                        </tr>`
                      )
                      .join("")}
@@ -380,7 +404,12 @@ export function renderStage1(container, ctx) {
     }
   `;
 
-  // Bind Dropzone / Multi-file intake / Template / Recipe / Project actions
+  const showInlineError = (msg) => {
+    const box = container.querySelector("#stage1InlineAlert");
+    if (box) box.innerHTML = `<div class="alert-box" style="margin-bottom:8px;">⚠️ ${escapeHtml(msg)}</div>`;
+    actions.showToast?.(msg, "error");
+  };
+
   const dropzone = container.querySelector("#csvDropzone");
   const fileInput = container.querySelector("#csvFileInput");
   dropzone.addEventListener("click", () => fileInput.click());
@@ -412,23 +441,12 @@ export function renderStage1(container, ctx) {
   container.querySelector("#btnDlCsvTemplate").addEventListener("click", () => {
     actions.downloadText("geospec_template.csv", generateEmptyCSVTemplate(), "text/csv");
   });
-  container.querySelector("#btnImportRecipeS1").addEventListener("click", () => {
-    container.querySelector("#fileRecipeS1").click();
-  });
-  container.querySelector("#fileRecipeS1").addEventListener("change", async (e) => {
-    const files = Array.from(e.target.files || []);
-    e.target.value = "";
-    if (files.length) await actions.handleIncomingFiles(files);
-  });
-  container.querySelector("#btnExportRecipeS1")?.addEventListener("click", () => actions.exportRecipe());
-  container.querySelector("#btnExportProjectS1")?.addEventListener("click", () => actions.exportWorkspace());
 
   container.querySelector("#txtRecipeTitle")?.addEventListener("input", (e) => {
     if (!state.recipe.recipe_meta) state.recipe.recipe_meta = {};
     state.recipe.recipe_meta.title = e.target.value;
   });
 
-  // Bind 1B Schema controls (live updates into ds + explicit Apply/Sync)
   const syncSchemaFromDom = () => {
     ds.lat_col = container.querySelector("#mapLatCol").value;
     ds.lon_col = container.querySelector("#mapLonCol").value;
@@ -437,10 +455,13 @@ export function renderStage1(container, ctx) {
     ds.y_spec.num_col = container.querySelector("#mapYNum").value;
     ds.y_spec.den_col = container.querySelector("#mapYDen").value;
     ds.y_spec.transform = container.querySelector("#mapYTrans").value;
+    ds.cluster_spec.mode = container.querySelector("#mapClusterMode").value;
     ds.cluster_spec.col = container.querySelector("#mapClusterCol").value;
-    ds.cluster_spec.radius_m = Number(container.querySelector("#mapClusterRadius").value) || 15;
-    ds.spatial_proxy_cols = Array.from(container.querySelector("#mapProxyCols").selectedOptions).map((o) => o.value);
-    ds.selection_spec.exclusion_restriction_cols = Array.from(container.querySelector("#mapHeckExcl").selectedOptions).map((o) => o.value);
+    ds.cluster_spec.regex = container.querySelector("#mapClusterRegex").value;
+    ds.cluster_spec.radius_m = Math.max(1, Number(container.querySelector("#mapClusterRadius").value) || 15);
+    ds.spatial_proxy_cols = Array.from(container.querySelectorAll(".chk-proxy-col:checked")).map((el) => el.value);
+    ds.selection_spec.exclusion_restriction_cols = Array.from(container.querySelectorAll(".chk-heck-excl:checked")).map((el) => el.value);
+    actions.markStageStale?.(1);
   };
 
   container.querySelector("#mapYMode").addEventListener("change", (e) => {
@@ -449,24 +470,36 @@ export function renderStage1(container, ctx) {
     actions.render();
   });
 
-  ["#mapLatCol", "#mapLonCol", "#mapIdCol", "#mapYNum", "#mapYDen", "#mapYTrans", "#mapClusterCol", "#mapClusterRadius", "#mapProxyCols", "#mapHeckExcl"].forEach(
+  container.querySelector("#mapClusterMode").addEventListener("change", (e) => {
+    syncSchemaFromDom();
+    ds.cluster_spec.mode = e.target.value;
+    actions.render();
+  });
+
+  ["#mapLatCol", "#mapLonCol", "#mapIdCol", "#mapYNum", "#mapYDen", "#mapYTrans", "#mapClusterCol", "#mapClusterRegex", "#mapClusterRadius"].forEach(
     (sel) => {
       container.querySelector(sel)?.addEventListener("change", syncSchemaFromDom);
     }
   );
   container.querySelector("#mapClusterRadius")?.addEventListener("input", syncSchemaFromDom);
 
+  container.querySelectorAll(".chk-proxy-col, .chk-heck-excl").forEach((chk) => {
+    chk.addEventListener("change", () => {
+      chk.closest(".checkbox-pill")?.classList.toggle("checked", chk.checked);
+      syncSchemaFromDom();
+    });
+  });
+
   container.querySelector("#btnApplySchema").addEventListener("click", () => {
     syncSchemaFromDom();
     if (state.columns) {
       actions.syncDatasetToWorker();
     } else {
-      actions.setLog("Recept séma frissítve (CSV betöltésekor automatikusan aktiválódik).");
+      actions.setLog("Recept séma frissítve (CSV betöltésekor aktiválódik).");
       actions.render();
     }
   });
 
-  // Bind 1C Target Addition controls
   container.querySelector("#btnAddOsmPreset").addEventListener("click", () => {
     const pid = container.querySelector("#selOsmPreset").value;
     const preset = OSM_TARGET_PRESETS.find((p) => p.preset_id === pid);
@@ -487,6 +520,7 @@ export function renderStage1(container, ctx) {
       max_snap_distance_m: 300,
       bbox_buffer_m: 800,
     });
+    actions.markStageStale?.(1);
     actions.render();
   });
 
@@ -494,7 +528,7 @@ export function renderStage1(container, ctx) {
     const rawTag = container.querySelector("#txtCustomOsmTag").value.trim();
     if (!rawTag) return;
     const parsed = parseTagShorthand(rawTag);
-    if (!parsed.length) return alert("Adj meg érvényes key=value formátumot (pl. leisure=park)!");
+    if (!parsed.length) return showInlineError("Adj meg érvényes key=value formátumot (pl. leisure=park)!");
     const firstKey = Object.keys(parsed[0])[0];
     const slug = `${firstKey}_${parsed[0][firstKey][0]}`.replace(/[^a-z0-9_]/gi, "_").toLowerCase();
     targets.push({
@@ -511,6 +545,7 @@ export function renderStage1(container, ctx) {
       max_snap_distance_m: 300,
       bbox_buffer_m: 800,
     });
+    actions.markStageStale?.(1);
     actions.render();
   });
 
@@ -538,6 +573,7 @@ export function renderStage1(container, ctx) {
           distance_modes: "euclidean",
           routing_profile: "walk",
           max_snap_distance_m: 300,
+          bbox_buffer_m: 800,
         });
         state.rawGeojsonTargets[tid] = gj;
         try {
@@ -550,10 +586,11 @@ export function renderStage1(container, ctx) {
         }
         addedAny = true;
       }
+      actions.markStageStale?.(1);
       actions.render();
     } catch (err) {
       if (addedAny) actions.render();
-      alert(`GeoJSON célpont hiba: ${err.message}`);
+      showInlineError(`GeoJSON célpont hiba: ${err.message}`);
     }
   });
 
@@ -569,10 +606,10 @@ export function renderStage1(container, ctx) {
       geometry_handling: "point",
       distance_modes: "euclidean",
     });
+    actions.markStageStale?.(1);
     actions.render();
   });
 
-  // Bundle export / import & Cache clear
   container.querySelector("#btnExportOsmBundle")?.addEventListener("click", () => actions.exportOsmBundle());
   container.querySelector("#btnImportOsmBundle")?.addEventListener("click", () => {
     container.querySelector("#fileOsmBundle").click();
@@ -585,15 +622,15 @@ export function renderStage1(container, ctx) {
       const parsed = parseOsmBundle(parseJsonText(await readTextWithEncodingFallback(f), "OSM bundle"));
       await actions.importOsmBundle(parsed, { fileName: f.name });
     } catch (err) {
-      alert(`OSM bundle betöltési hiba: ${err.message}`);
+      showInlineError(`OSM bundle betöltési hiba: ${err.message}`);
     }
   });
   container.querySelector("#btnClearOsmCache")?.addEventListener("click", async () => {
     await clearAllCachedOSM();
     actions.setLog("IndexedDB OSM cache kiürítve.");
+    actions.showToast?.("IndexedDB OSM cache kiürítve.", "pass");
   });
 
-  // Bind per-target edits & non-scrolling feature search/toggle
   container.querySelectorAll("[data-target-idx]").forEach((row) => {
     const idx = Number(row.getAttribute("data-target-idx"));
     const tgt = targets[idx];
@@ -604,40 +641,57 @@ export function renderStage1(container, ctx) {
       const nextGeom = e.target.value;
       tgt.geometry_handling = nextGeom;
       const isOsm = tgt.source === "osm_preset" || tgt.source === "osm_custom_tag";
-      if (isOsm && state.rawOsmTargets[tgt.id] && (prevGeom === "point" || nextGeom === "point") && prevGeom !== nextGeom) {
+      // Only invalidate cached OSM snapshot if switching FROM point (which may lack ring geom) to non-point
+      if (isOsm && state.rawOsmTargets[tgt.id] && prevGeom === "point" && nextGeom !== "point") {
         actions.invalidateTargetSnapshot(tgt.id);
-        actions.setLog(`Geometria mód váltás (${tgt.id}: ${prevGeom} → ${nextGeom}): OSM lekérés frissítésre jelölve.`);
+        actions.setLog(`Geometria mód váltás (${tgt.id}: point → ${nextGeom}): OSM réteg újratöltése szükséges.`);
+      } else {
+        actions.invalidateFromStage?.(1);
       }
     });
     row.querySelector(".tgt-mode")?.addEventListener("change", (e) => {
       tgt.distance_modes = e.target.value;
+      actions.invalidateFromStage?.(1);
     });
     row.querySelector(".tgt-profile")?.addEventListener("change", (e) => {
       tgt.routing_profile = e.target.value;
+      actions.invalidateFromStage?.(1);
     });
     row.querySelector(".tgt-inside")?.addEventListener("change", (e) => {
       tgt.inside_is_zero = e.target.checked;
+      actions.invalidateFromStage?.(1);
+    });
+    row.querySelector(".tgt-snap-m")?.addEventListener("change", (e) => {
+      tgt.max_snap_distance_m = Math.max(10, Math.min(50000, Number(e.target.value) || 300));
+      actions.invalidateFromStage?.(1);
+    });
+    row.querySelector(".tgt-buf-m")?.addEventListener("change", (e) => {
+      tgt.bbox_buffer_m = Math.max(100, Math.min(50000, Number(e.target.value) || 800));
+      actions.invalidateFromStage?.(1);
     });
     row.querySelector(".tgt-csv-col")?.addEventListener("change", (e) => {
       tgt.csv_col = e.target.value;
       tgt.name = `CSV oszlop (${e.target.value})`;
+      actions.invalidateFromStage?.(1);
     });
     row.querySelector(".tgt-remove")?.addEventListener("click", () => {
-      targets.splice(idx, 1);
-      delete state.targetPreviews[tgt.id];
-      delete state.rawOsmTargets[tgt.id];
-      delete state.rawGeojsonTargets[tgt.id];
-      actions.refreshMapTargets();
-      actions.render();
+      actions.removeTarget(idx);
     });
 
     const listBox = row.querySelector(".osm-feature-list");
     const bindListClicks = () => {
       if (!listBox) return;
       listBox.querySelectorAll(".osm-feature-item").forEach((el) => {
-        el.addEventListener("click", () => {
+        const triggerToggle = () => {
           const uid = el.getAttribute("data-uid");
           actions.toggleOsmFeature(tgt.id, uid);
+        };
+        el.addEventListener("click", triggerToggle);
+        el.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            triggerToggle();
+          }
         });
       });
     };
@@ -671,8 +725,8 @@ export function renderStage1(container, ctx) {
     });
   });
 
-  // Bind Overpass Fetch & Distance Execution
   container.querySelector("#btnFetchOSM")?.addEventListener("click", () => actions.fetchAllTargetsOSM());
+  container.querySelector("#btnCancelOsmFetch")?.addEventListener("click", () => actions.cancelOsmFetch());
   container.querySelector("#btnComputeDistances")?.addEventListener("click", () => actions.runStage1());
 }
 
@@ -711,16 +765,16 @@ function renderTargetRow(t, idx, numCols, previewInfo, filterQuery, hasRawSnapsh
                 : ""
           }
         </div>
-        <button class="btn btn-sm tgt-remove" style="color:var(--fail);">✕ Eltávolítás</button>
+        <button type="button" class="btn btn-sm tgt-remove" style="color:var(--fail);" aria-label="Célpont eltávolítása: ${escapeHtml(t.name)}">✕ Eltávolítás</button>
       </div>
       ${
         t.source === "csv_column"
           ? `<div class="field-row"><label>Meglévő távolságoszlop (méter)</label>
-             <select class="tgt-csv-col">${csvColOptions}</select></div>`
+             <select class="tgt-csv-col" aria-label="Meglévő távolságoszlop">${csvColOptions}</select></div>`
           : `<div class="grid-3">
                <div class="field-row">
                  <label>Geometria kezelése</label>
-                 <select class="tgt-geom">
+                 <select class="tgt-geom" aria-label="Geometria kezelése">
                    <option value="point" ${t.geometry_handling === "point" ? "selected" : ""}>Pont / Centroid</option>
                    <option value="line_segment" ${t.geometry_handling === "line_segment" ? "selected" : ""}>Vonalszakasz (egzakt merőleges)</option>
                    <option value="polygon_boundary" ${t.geometry_handling === "polygon_boundary" ? "selected" : ""}>Poligon határ</option>
@@ -729,16 +783,16 @@ function renderTargetRow(t, idx, numCols, previewInfo, filterQuery, hasRawSnapsh
                </div>
                <div class="field-row">
                  <label>Távolságmód</label>
-                 <select class="tgt-mode">
+                 <select class="tgt-mode" aria-label="Távolságmód">
                    <option value="euclidean" ${t.distance_modes === "euclidean" ? "selected" : ""}>Euklideszi (légvonal)</option>
                    <option value="network_dijkstra" ${t.distance_modes === "network_dijkstra" ? "selected" : ""}>Hálózati Dijkstra</option>
-                   <option value="both" ${t.distance_modes === "both" ? "selected" : ""}>Mindkettő + Δd Kanyargósság</option>
+                   <option value="both" ${t.distance_modes === "both" ? "selected" : ""}>Mindkettő + Δd + Menetidő</option>
                  </select>
                </div>
                <div class="field-row">
                  <label>Hálózati profil &amp; Belső zóna</label>
                  <div style="display:flex;gap:8px;align-items:center;">
-                   <select class="tgt-profile" style="flex:1;">
+                   <select class="tgt-profile" aria-label="Úthálózati profil" style="flex:1;">
                      <option value="walk" ${t.routing_profile === "walk" ? "selected" : ""}>Gyalogos</option>
                      <option value="bike" ${t.routing_profile === "bike" ? "selected" : ""}>Kerékpáros</option>
                      <option value="drive" ${t.routing_profile === "drive" ? "selected" : ""}>Autós</option>
@@ -747,6 +801,16 @@ function renderTargetRow(t, idx, numCols, previewInfo, filterQuery, hasRawSnapsh
                      <input type="checkbox" class="tgt-inside" ${t.inside_is_zero ? "checked" : ""} /> d=0 belül
                    </label>
                  </div>
+               </div>
+             </div>
+             <div class="grid-2" style="margin-top:6px;">
+               <div class="field-row">
+                 <label>Max. hálózati snap sugár (m)</label>
+                 <input type="number" class="tgt-snap-m" value="${Number(t.max_snap_distance_m ?? 300)}" min="10" max="50000" step="25" />
+               </div>
+               <div class="field-row">
+                 <label>OSM BBox puffer (m)</label>
+                 <input type="number" class="tgt-buf-m" value="${Number(t.bbox_buffer_m ?? 800)}" min="100" max="50000" step="100" />
                </div>
              </div>`
       }

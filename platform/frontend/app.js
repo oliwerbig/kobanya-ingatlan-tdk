@@ -1,13 +1,13 @@
-/* GeoSpec Main Controller — Connects 5-Stage Workbench, 6-Guard Rail,
- * MapInspector, Overpass/Postpass Client, Offline Bundle & Pyodide WASM Worker.
+/* GeoSpec Main Controller — 5-Stage Workbench, 6-Guard Slide-Over Drawer, Non-Blocking Toasts,
+ * HU|EN i18n, Crash Recovery, Plot<->Map Sync & Pyodide WASM Worker Integration
  */
 import { MapInspector } from "./components/map_inspector.js";
 import { renderStage1 } from "./components/stage1_data_osm.js";
 import { renderStage2 } from "./components/stage2_composition.js";
 import { patchStage3ResultsOnly, renderStage3 } from "./components/stage3_model_composer.js";
 import { renderStage4, renderStage5 } from "./components/stage4_5_spatial_gwr.js";
-import { buildOsmBundle, parseOsmBundle } from "./gis/osm_idb_cache.js";
-import { fetchStreetGraphOSM, fetchTargetOSM } from "./gis/overpass_client.js";
+import { buildOsmBundle, pruneExpiredOSM } from "./gis/osm_idb_cache.js";
+import { fetchStreetGraphOSM, fetchTargetOSM, padBbox } from "./gis/overpass_client.js";
 import { DagClient } from "./state/dag_client.js";
 import {
   buildWorkspaceBundle,
@@ -15,13 +15,10 @@ import {
   inferColumnProfile,
   inferGeojsonTargetDefaults,
   makeUniqueTargetId,
-  parseCSVText,
-  parseGeoJSONDataset,
-  parseWorkspaceBundle,
-  prepareIncomingBatch,
   readTextWithEncodingFallback,
   slugifyTitle,
 } from "./state/recipe_store.js";
+import { applyI18nDOM, getLang, initLang, setLang, t, translateVerdict } from "./utils/i18n.js";
 import { escapeHtml, sanitizeRecipe } from "./utils/sanitize.js";
 
 const state = {
@@ -36,35 +33,55 @@ const state = {
   nRows: 0,
   colProfile: {},
   datasetInfo: null,
-  targetPreviews: {},     // targetId -> { preview_geojson, feature_index }
-  rawOsmTargets: {},      // targetId -> raw Overpass/converted payload
-  rawGeojsonTargets: {},  // targetId -> GeoJSON FeatureCollection
-  rawStreetGraphs: {},    // profile -> raw street graph payload
-  osmFilterQuery: {},     // targetId -> filter string
+  targetPreviews: {},
+  rawOsmTargets: {},
+  rawGeojsonTargets: {},
+  rawStreetGraphs: {},
+  osmFilterQuery: {},
+  osmFetching: false,
   stage1Res: null,
   stage2Res: null,
   stage3Res: null,
   stage4Res: null,
   stage5Res: null,
+  robustnessRes: null,
+  staleStages: new Set(),
+  stage5Busy: false,
+  stage5ProgressPct: 0,
+  stage5ProgressText: "",
   activeSpecId: "spec_a",
-  covType: "cluster",
+  covType: "HC3",
   showPct: false,
   stage3AdKey: "",
   stage3DiagModelId: "",
   stage4ImpactKind: "sar",
+  stage4ParamKind: "sem",
   pipelineRunning: false,
   wasmStatus: "booting",
-  wasmMessage: "WASM indítása...",
+  wasmMessage: "Pyodide indítása...",
   logLine: "Várakozás saját CSV / GeoJSON adatbázis, recept vagy .geospec.json projekt betöltésére.",
 };
 
 let debounceTimer = null;
+let osmFetchAbortCtrl = null;
 let datasetSeq = 0;
 let s1Seq = 0;
 let s2Seq = 0;
 let s3Seq = 0;
 let s4Seq = 0;
 let s5Seq = 0;
+
+function showToast(message, level = "info", durationMs = 5200) {
+  const stack = document.getElementById("toastStack");
+  if (!stack) return;
+  const el = document.createElement("div");
+  el.className = `toast toast-${level}`;
+  el.innerHTML = `<span>${escapeHtml(String(message || ""))}</span><button type="button" class="toast-close" aria-label="${escapeHtml(t("toast.close"))}">✕</button>`;
+  const close = () => el.remove();
+  el.querySelector(".toast-close")?.addEventListener("click", close);
+  stack.appendChild(el);
+  if (durationMs > 0) setTimeout(close, durationMs);
+}
 
 function setLog(msg) {
   state.logLine = msg;
@@ -74,16 +91,36 @@ function setLog(msg) {
 
 function updateBootIndicator(status, message) {
   state.wasmStatus = status;
-  state.wasmMessage = message;
+  const localizedMsg = translateVerdict(message || "");
+  state.wasmMessage = localizedMsg;
   const dot = document.getElementById("wasmDot");
   const lbl = document.getElementById("wasmStatusText");
-  if (dot) {
-    dot.className = "dot " + (status === "ready" ? "ready" : status === "error" ? "err" : "busy");
+  const crashBanner = document.getElementById("workerCrashBanner");
+  const crashMsg = document.getElementById("workerCrashMsg");
+  if (dot) dot.className = "dot " + (status === "ready" ? "ready" : status === "error" ? "err" : "busy");
+  if (lbl) lbl.textContent = localizedMsg;
+  if (crashBanner) {
+    crashBanner.hidden = status !== "error";
+    if (status === "error" && crashMsg && message) {
+      crashMsg.textContent = `${t("worker.crash_msg")} (${localizedMsg})`;
+    }
   }
-  if (lbl) lbl.textContent = message;
 }
 
-const dag = new DagClient("./worker/pyodide_worker.js", updateBootIndicator, setLog);
+function handleWorkerProgress(msg) {
+  if (msg.stage === "stage5") {
+    state.stage5ProgressPct = Math.max(0, Math.min(100, Number(msg.pct) || 0));
+    if (msg.message) state.stage5ProgressText = msg.message;
+    const bar = document.getElementById("gwrProgressBar");
+    const lbl = document.getElementById("gwrProgressLabel");
+    const wrap = document.getElementById("gwrProgressWrap");
+    if (wrap) wrap.style.display = "block";
+    if (bar) bar.style.width = `${state.stage5ProgressPct}%`;
+    if (lbl && msg.message) lbl.textContent = `${msg.message} (${Math.round(state.stage5ProgressPct)}%)`;
+  }
+}
+
+const dag = new DagClient("./worker/pyodide_worker.js", updateBootIndicator, setLog, handleWorkerProgress);
 
 const mapInspector = new MapInspector("mapContainer", "pointInspector", {
   onToggleOsmFeature: (targetId, uid) => actions.toggleOsmFeature(targetId, uid, true),
@@ -100,7 +137,9 @@ function restyleMap() {
   const layerMode = document.getElementById("selMapLayer")?.value;
   const gwrColIdx = parseGwrColIdx(document.getElementById("selGwrVarLayer")?.value);
   const gwrMaskMode = document.getElementById("selGwrMaskMode")?.value || "fdr";
+  const routeTargetId = document.getElementById("selRouteTarget")?.value || "";
   mapInspector.restyleObservations({
+    stage1: state.stage1Res,
     stage3: state.stage3Res,
     stage4: state.stage4Res,
     stage5: state.stage5Res,
@@ -108,6 +147,7 @@ function restyleMap() {
     gwrColIdx,
     gwrMaskMode,
     activeModelId: state.activeSpecId,
+    routeTargetId,
   });
 }
 
@@ -117,6 +157,8 @@ function resetAnalysisResults() {
   state.stage3Res = null;
   state.stage4Res = null;
   state.stage5Res = null;
+  state.robustnessRes = null;
+  state.staleStages.clear();
   state.stage3AdKey = "";
   state.stage3DiagModelId = "";
 }
@@ -138,6 +180,7 @@ function patchOsmListDom(targetId) {
     const uid = item.getAttribute("data-uid");
     const isExcl = exclSet.has(uid);
     item.classList.toggle("excluded", isExcl);
+    item.setAttribute("aria-pressed", isExcl ? "true" : "false");
     const firstSpan = item.querySelector("span");
     if (firstSpan && firstSpan.firstChild && firstSpan.firstChild.nodeType === Node.TEXT_NODE) {
       firstSpan.firstChild.nodeValue = isExcl ? "☐ " : "☑ ";
@@ -150,8 +193,47 @@ function patchOsmListDom(targetId) {
 
 const actions = {
   setLog,
+  showToast,
 
-  render() {
+  markStageStale(fromStage) {
+    const k = Number(fromStage);
+    if (k === 1) [1, 2, 3, 4, 5].forEach((s) => state.staleStages.add(s));
+    else if (k === 2) state.staleStages.add(2);
+    else if (k === 3) [2, 3, 4, 5].forEach((s) => state.staleStages.add(s));
+    else if (k === 4) state.staleStages.add(4);
+    else if (k === 5) state.staleStages.add(5);
+    this.updateStageTabsDom();
+  },
+
+  invalidateFromStage(k) {
+    const st = Number(k);
+    if (st === 1) {
+      resetAnalysisResults();
+      [1, 2, 3, 4, 5].forEach((s) => state.staleStages.add(s));
+    } else if (st === 2) {
+      state.stage2Res = null;
+      state.robustnessRes = null;
+      state.staleStages.add(2);
+    } else if (st === 3) {
+      state.stage2Res = null;
+      state.stage3Res = null;
+      state.stage4Res = null;
+      state.stage5Res = null;
+      state.robustnessRes = null;
+      [2, 3, 4, 5].forEach((s) => state.staleStages.add(s));
+    } else if (st === 4) {
+      state.stage4Res = null;
+      state.staleStages.add(4);
+    } else if (st === 5) {
+      state.stage5Res = null;
+      state.staleStages.add(5);
+    }
+    renderGuardStrip();
+    restyleMap();
+    this.updateStageTabsDom();
+  },
+
+  updateStageTabsDom() {
     document.querySelectorAll(".stage-tab").forEach((btn) => {
       const s = Number(btn.getAttribute("data-stage"));
       btn.classList.toggle("active", s === state.activeStage);
@@ -162,7 +244,15 @@ const actions = {
         (s === 4 && state.stage4Res?.ok) ||
         (s === 5 && state.stage5Res?.ok);
       btn.classList.toggle("done", Boolean(isDone));
+      const staleEl = btn.querySelector(".stale-badge");
+      if (staleEl) {
+        staleEl.hidden = !state.staleStages.has(s);
+      }
     });
+  },
+
+  render() {
+    this.updateStageTabsDom();
 
     const btnRunAll = document.getElementById("btnRunAll");
     if (btnRunAll) btnRunAll.disabled = !state.datasetInfo || state.pipelineRunning;
@@ -202,6 +292,12 @@ const actions = {
     else if (state.activeStage === 5) renderStage5(pane, ctx);
   },
 
+  focusObservation(obsIdx) {
+    if (!mapInspector.focusObservation(obsIdx)) {
+      showToast(`A megfigyelés (#${obsIdx}) nem található a térképen.`, "warn");
+    }
+  },
+
   async onDatasetParsed(fileName, parsed, colProfile, guesses, { skipSync = false, hasPendingRecipe = false } = {}) {
     datasetSeq++;
     s1Seq++; s2Seq++; s3Seq++; s4Seq++; s5Seq++;
@@ -221,8 +317,11 @@ const actions = {
       state.rawStreetGraphs = {};
       state.osmBundleFileName = "";
     }
+    mapInspector.clearObservations();
     mapInspector.clearTargets();
     mapInspector.clearRoute();
+    mapInspector.setFetchedBbox(null);
+    mapInspector.renderPointInspector(null, null);
 
     if (!hasPendingRecipe) {
       const ds = state.recipe.dataset_schema;
@@ -259,8 +358,10 @@ const actions = {
     const ds = state.recipe.dataset_schema;
     if (!state.columns || !ds.lat_col || !ds.lon_col || !state.columns[ds.lat_col] || !state.columns[ds.lon_col]) {
       state.datasetInfo = null;
+      mapInspector.clearObservations();
+      mapInspector.renderPointInspector(null, null);
       if (state.columns) {
-        setLog("Add meg az érvényes szélességi (lat) és hosszúsági (lon) oszlopokat az 1B szekcióban, majd kattints a 'Séma Rögzítése' gombra.");
+        setLog("Add meg az érvényes lat/lon oszlopokat az 1B szekcióban, majd kattints a 'Séma Rögzítése' gombra.");
       }
       this.render();
       return;
@@ -283,7 +384,6 @@ const actions = {
 
       state.datasetInfo = res;
 
-      // Re-ingest cached GeoJSON/OSM targets and street graphs if still attached to current workspace
       for (const tgt of state.recipe.spatial_targets || []) {
         if (mySeq !== datasetSeq) return;
         const rawGj = state.rawGeojsonTargets[tgt.id];
@@ -306,7 +406,8 @@ const actions = {
         await dag.call("ingest_street_graph", { profile: prof, graph_json: sg });
       }
 
-      mapInspector.setObservationsFromDataset(state.columns, ds.lat_col, ds.lon_col, ds.row_id_col, ds.y_spec, true);
+      mapInspector.setObservationsFromDataset(state.columns, ds.lat_col, ds.lon_col, ds.row_id_col, ds.y_spec, true, res.bbox);
+      mapInspector.setFetchedBbox(res.bbox ? padBbox(res.bbox, Math.max(800, ...(state.recipe.spatial_targets || []).map((t) => Number(t.bbox_buffer_m ?? 800) || 800))) : null);
       this.refreshMapTargets();
       restyleMap();
       mapInspector.renderPointInspector(null, null);
@@ -315,17 +416,42 @@ const actions = {
     } catch (err) {
       if (mySeq !== datasetSeq) return;
       state.datasetInfo = null;
+      mapInspector.clearObservations();
+      mapInspector.clearTargets();
+      mapInspector.clearRoute();
+      mapInspector.renderPointInspector(null, null);
       setLog(`Séma hiba: ${err.message}`);
-      alert(`Séma hiba: ${err.message}`);
+      showToast(`Séma hiba: ${err.message}`, "error");
       this.render();
     }
+  },
+
+  async removeTarget(idx) {
+    const tgt = state.recipe.spatial_targets[idx];
+    if (!tgt) return;
+    const tid = tgt.id;
+    state.recipe.spatial_targets.splice(idx, 1);
+    delete state.targetPreviews[tid];
+    delete state.rawOsmTargets[tid];
+    delete state.rawGeojsonTargets[tid];
+    this.invalidateFromStage(1);
+    this.refreshMapTargets();
+    if (state.datasetInfo) {
+      try {
+        await dag.waitUntilReady();
+        await dag.call("remove_target", { target_id: tid });
+      } catch (err) {
+        console.warn("remove_target RPC figyelmeztetés:", err);
+      }
+    }
+    this.render();
   },
 
   async ingestSingleGeojsonTarget(targetId, geojsonObj) {
     const myDsSeq = datasetSeq;
     state.rawGeojsonTargets[targetId] = geojsonObj;
     delete state.rawOsmTargets[targetId];
-    state.stage1Res = null;
+    this.invalidateFromStage(1);
     if (!state.datasetInfo) return;
     await dag.waitUntilReady();
     if (myDsSeq !== datasetSeq) return;
@@ -341,22 +467,43 @@ const actions = {
     mapInspector.setTargetPreview(targetId, prev.preview_geojson);
   },
 
-  async fetchAllTargetsOSM() {
-    if (!state.datasetInfo) return alert("Előbb rögzítsd a dataset sémát!");
-    const myDsSeq = datasetSeq;
-    await dag.waitUntilReady();
-    if (myDsSeq !== datasetSeq) return false;
-    const targets = state.recipe.spatial_targets || [];
-    const osmTargets = targets.filter((t) => t.source === "osm_preset" || t.source === "osm_custom_tag");
-    const routingTargets = targets.filter((t) => t.distance_modes === "network_dijkstra" || t.distance_modes === "both");
-    const needProfiles = new Set(routingTargets.map((t) => t.routing_profile || "walk"));
-    const streetBufM = Math.max(800, ...targets.map((t) => Number(t.bbox_buffer_m ?? 800) || 800));
+  cancelOsmFetch() {
+    if (osmFetchAbortCtrl) {
+      osmFetchAbortCtrl.abort();
+      osmFetchAbortCtrl = null;
+    }
+    state.osmFetching = false;
+    setLog("OSM lekérés megszakítva a felhasználó által.");
+    showToast("OSM lekérés megszakítva.", "warn");
+    this.render();
+  },
 
+  async fetchAllTargetsOSM(forceRefetch = false) {
+    if (!state.datasetInfo) {
+      showToast("Előbb rögzítsd a dataset sémát!", "warn");
+      return false;
+    }
+    const myDsSeq = datasetSeq;
+    osmFetchAbortCtrl = new AbortController();
+    state.osmFetching = true;
+    this.render();
     try {
+      await dag.waitUntilReady();
+      if (myDsSeq !== datasetSeq) return false;
+      const targets = state.recipe.spatial_targets || [];
+      const osmTargets = targets.filter((t) => t.source === "osm_preset" || t.source === "osm_custom_tag");
+      const routingTargets = targets.filter((t) => t.distance_modes === "network_dijkstra" || t.distance_modes === "both");
+      const needProfiles = new Set(routingTargets.map((t) => t.routing_profile || "walk"));
+      const streetBufM = Math.max(800, ...targets.map((t) => Number(t.bbox_buffer_m ?? 800) || 800));
+      mapInspector.setFetchedBbox(padBbox(state.datasetInfo.bbox, streetBufM));
+
       for (const tgt of osmTargets) {
         if (myDsSeq !== datasetSeq) return false;
+        if (!forceRefetch && state.targetPreviews[tgt.id] && state.rawOsmTargets[tgt.id]) {
+          continue;
+        }
         setLog(`OSM lekérés: ${tgt.name}...`);
-        const { data, fromCache } = await fetchTargetOSM(tgt, state.datasetInfo.bbox);
+        const { data, fromCache } = await fetchTargetOSM(tgt, state.datasetInfo.bbox, { signal: osmFetchAbortCtrl.signal });
         if (myDsSeq !== datasetSeq) return false;
         state.rawOsmTargets[tgt.id] = data;
         const prev = await dag.call("ingest_target_raw", {
@@ -373,22 +520,25 @@ const actions = {
 
       for (const prof of needProfiles) {
         if (myDsSeq !== datasetSeq) return false;
-        if (state.rawStreetGraphs[prof] && !osmTargets.length) continue;
+        if (!forceRefetch && state.rawStreetGraphs[prof]) continue;
         setLog(`Utcahálózat lekérése CSR Dijkstra útvonalhoz (${prof}, buffer=${streetBufM}m)...`);
-        const { data, fromCache } = await fetchStreetGraphOSM(state.datasetInfo.bbox, streetBufM, prof);
+        const { data, fromCache } = await fetchStreetGraphOSM(state.datasetInfo.bbox, streetBufM, prof, { signal: osmFetchAbortCtrl.signal });
         if (myDsSeq !== datasetSeq) return false;
         state.rawStreetGraphs[prof] = data;
         const gRes = await dag.call("ingest_street_graph", { profile: prof, graph_json: data });
         if (myDsSeq !== datasetSeq) return false;
         setLog(`Utcahálózat (${prof}) kész: ${gRes.n_nodes} csúcs, ${gRes.n_edges} él (${fromCache ? "cache" : "Overpass/Postpass"}).`);
       }
-      this.render();
       return true;
     } catch (err) {
-      if (myDsSeq !== datasetSeq) return false;
+      if (err?.name === "AbortError" || myDsSeq !== datasetSeq) return false;
       setLog(`OSM lekérési hiba: ${err.message}`);
-      alert(`OSM API hiba: ${err.message}`);
+      showToast(`OSM API hiba: ${err.message}`, "error");
       return false;
+    } finally {
+      state.osmFetching = false;
+      osmFetchAbortCtrl = null;
+      this.render();
     }
   },
 
@@ -416,9 +566,10 @@ const actions = {
       }
       mapInspector.setTargetPreview(targetId, prev.preview_geojson);
     }
-    resetAnalysisResults();
-    renderGuardStrip();
-    setLog(`OSM elem (${targetId}:${uid}) ${idx >= 0 ? "bekapcsolva" : "kizárva"} a távolságszámításból (újra-számítás szükséges).`);
+    this.invalidateFromStage(1);
+    mapInspector.clearRoute();
+    mapInspector.renderPointInspector(null, null);
+    setLog(`OSM elem (${targetId}:${uid}) ${idx >= 0 ? "bekapcsolva" : "kizárva"} (újratervezés szükséges).`);
     if (!patchOsmListDom(targetId)) {
       this.render();
     }
@@ -441,8 +592,9 @@ const actions = {
       }
       mapInspector.setTargetPreview(targetId, prev.preview_geojson);
     }
-    resetAnalysisResults();
-    renderGuardStrip();
+    this.invalidateFromStage(1);
+    mapInspector.clearRoute();
+    mapInspector.renderPointInspector(null, null);
     setLog(`OSM tömeges szűrés (${targetId}): ${uids.length} elem ${excludeBool ? "kizárva" : "aktívvá téve"}.`);
     if (!patchOsmListDom(targetId)) {
       this.render();
@@ -461,16 +613,18 @@ const actions = {
   invalidateTargetSnapshot(targetId) {
     delete state.targetPreviews[targetId];
     delete state.rawOsmTargets[targetId];
-    resetAnalysisResults();
+    this.invalidateFromStage(1);
+    mapInspector.clearRoute();
+    mapInspector.renderPointInspector(null, null);
     this.refreshMapTargets();
-    renderGuardStrip();
     this.render();
   },
 
   async exportOsmBundle() {
     const hasTargets = Object.keys(state.rawOsmTargets).length || Object.keys(state.rawGeojsonTargets).length || Object.keys(state.rawStreetGraphs).length;
     if (!hasTargets) {
-      return alert("Nincs exportálható OSM/GeoJSON célpont vagy utcahálózat — előbb töltsd le a célpontokat az 1. fázisban!");
+      showToast("Nincs exportálható OSM/GeoJSON célpont vagy utcahálózat.", "warn");
+      return;
     }
     const bundle = buildOsmBundle({
       bbox: state.datasetInfo?.bbox || null,
@@ -482,6 +636,7 @@ const actions = {
     const slug = slugifyTitle(state.recipe?.recipe_meta?.title, "geospec_snapshot");
     this.downloadText(`${slug}.osm_bundle.json`, JSON.stringify(bundle), "application/json");
     setLog(`Offline OSM & hálózati pillanatfelvétel (${slug}.osm_bundle.json) elmentve.`);
+    showToast("OSM csomag exportálva.", "pass");
   },
 
   async importOsmBundle(parsedBundle, { fileName = "", skipIngest = false, skipRender = false } = {}) {
@@ -548,9 +703,7 @@ const actions = {
 
     resetAnalysisResults();
     this.refreshMapTargets();
-    setLog(
-      `Offline OSM pillanatfelvétel betöltve (${Object.keys(parsedBundle.targets || {}).length} célpont, ${Object.keys(parsedBundle.street_graphs || {}).length} úthálózat).`
-    );
+    setLog(`Offline OSM pillanatfelvétel betöltve (${Object.keys(parsedBundle.targets || {}).length} célpont, ${Object.keys(parsedBundle.street_graphs || {}).length} úthálózat).`);
     if (!skipRender) this.render();
   },
 
@@ -579,12 +732,19 @@ const actions = {
       const missingProfiles = needProfiles.filter((p) => !state.rawStreetGraphs[p]);
       if (missingProfiles.length) {
         const streetBufM = Math.max(800, ...state.recipe.spatial_targets.map((t) => Number(t.bbox_buffer_m ?? 800) || 800));
-        for (const prof of missingProfiles) {
-          setLog(`Utcahálózat lekérése (${prof}, buffer=${streetBufM}m)...`);
-          const { data } = await fetchStreetGraphOSM(state.datasetInfo.bbox, streetBufM, prof);
-          if (mySeq !== s1Seq) return false;
-          state.rawStreetGraphs[prof] = data;
-          await dag.call("ingest_street_graph", { profile: prof, graph_json: data });
+        osmFetchAbortCtrl = new AbortController();
+        state.osmFetching = true;
+        try {
+          for (const prof of missingProfiles) {
+            setLog(`Utcahálózat lekérése (${prof}, buffer=${streetBufM}m)...`);
+            const { data } = await fetchStreetGraphOSM(state.datasetInfo.bbox, streetBufM, prof, { signal: osmFetchAbortCtrl.signal });
+            if (mySeq !== s1Seq) return false;
+            state.rawStreetGraphs[prof] = data;
+            await dag.call("ingest_street_graph", { profile: prof, graph_json: data });
+          }
+        } finally {
+          state.osmFetching = false;
+          osmFetchAbortCtrl = null;
         }
       }
 
@@ -596,15 +756,18 @@ const actions = {
       state.stage3Res = null;
       state.stage4Res = null;
       state.stage5Res = null;
+      state.robustnessRes = null;
+      state.staleStages.delete(1);
+      [2, 3, 4, 5].forEach((s) => state.staleStages.add(s));
       renderGuardStrip();
       restyleMap();
       setLog(`1. Fázis kész (${res.summary.length} célpont távolságmátrixai frissítve).`);
       this.render();
       return true;
     } catch (err) {
-      if (err.name === "CancelledError" || mySeq !== s1Seq) return false;
+      if (err.name === "CancelledError" || err.name === "AbortError" || mySeq !== s1Seq) return false;
       setLog(`Stage 1 hiba: ${err.message}`);
-      alert(err.message);
+      showToast(`Stage 1 hiba: ${err.message}`, "error");
       return false;
     }
   },
@@ -615,13 +778,12 @@ const actions = {
     try {
       await dag.waitUntilReady();
       if (mySeq !== s2Seq) return false;
-      setLog("2. Fázis: Minta-vízesés, leíró statisztika, Step 0..K & Gelbach (2016) dekompozíció...");
+      setLog("2. Fázis: Minta-vízesés, leíró statisztika, Step 0..K & Gelbach (2016)...");
       const res = await dag.call("run_stage_2", { recipe: state.recipe, run_id: dag.nextRunId() });
       if (mySeq !== s2Seq) return false;
+      // Preserve downstream stage3Res..stage5Res (Stage 2 is descriptive/composition)
       state.stage2Res = res;
-      state.stage3Res = null;
-      state.stage4Res = null;
-      state.stage5Res = null;
+      state.staleStages.delete(2);
       renderGuardStrip();
       restyleMap();
       setLog("2. Fázis kész.");
@@ -630,7 +792,7 @@ const actions = {
     } catch (err) {
       if (err.name === "CancelledError" || mySeq !== s2Seq) return false;
       setLog(`Stage 2 hiba: ${err.message}`);
-      alert(err.message);
+      showToast(`Stage 2 hiba: ${err.message}`, "error");
       return false;
     }
   },
@@ -642,6 +804,7 @@ const actions = {
       await dag.waitUntilReady();
       if (mySeq !== s3Seq) return false;
       const t0 = performance.now();
+      state.recipe.default_cov_type = state.covType;
       const res = await dag.call("run_stage_3", {
         recipe: state.recipe,
         cov_type: state.covType,
@@ -651,9 +814,13 @@ const actions = {
       state.stage3Res = res;
       state.stage4Res = null;
       state.stage5Res = null;
+      state.staleStages.delete(3);
+      if (!patchResultsOnly) {
+        [4, 5].forEach((s) => state.staleStages.add(s));
+      }
       if (!res.ok) {
         setLog(`3. Fázis figyelmeztetés: ${res.reason || "Ismeretlen hiba"}`);
-        if (!patchResultsOnly) alert(res.reason || "3. Fázis nem futtatható.");
+        if (!patchResultsOnly) showToast(res.reason || "3. Fázis nem futtatható.", "warn");
         renderGuardStrip();
         restyleMap();
         this.render();
@@ -672,7 +839,7 @@ const actions = {
     } catch (err) {
       if (err.name === "CancelledError" || mySeq !== s3Seq) return false;
       setLog(`Stage 3 hiba: ${err.message}`);
-      if (!patchResultsOnly) alert(err.message);
+      if (!patchResultsOnly) showToast(`Stage 3 hiba: ${err.message}`, "error");
       return false;
     }
   },
@@ -682,11 +849,35 @@ const actions = {
     debounceTimer = setTimeout(() => this.runStage3({ patchResultsOnly: true }), 90);
   },
 
+  async runRobustnessMatrix() {
+    if (!state.datasetInfo) return;
+    try {
+      await dag.waitUntilReady();
+      setLog("3×2 Funkcionális Forma × SE Robusztussági Mátrix számítása...");
+      const res = await dag.call("run_robustness_matrix", { recipe: state.recipe, run_id: dag.nextRunId() });
+      state.robustnessRes = res;
+      if (res.ok) {
+        setLog(`3×2 Robusztussági Mátrix kész (N=${res.n_obs}).`);
+        showToast(`3×2 Robusztussági Mátrix kész (N=${res.n_obs})`, "pass");
+      } else {
+        showToast(res.reason || "Mátrix hiba", "warn");
+      }
+      if (state.activeStage === 3) {
+        patchStage3ResultsOnly(document.getElementById("stageContent"), { state, actions });
+      }
+    } catch (err) {
+      showToast(`Robusztussági mátrix hiba: ${err.message}`, "error");
+    }
+  },
+
   async generateM1M4Specs() {
     const active = state.recipe.models.find((m) => m.id === state.activeSpecId) || state.recipe.models[0];
     const covs = active ? active.covariates || [] : [];
     const tgts = state.recipe.spatial_targets || [];
-    if (!tgts.length) return alert("Előbb vegyél fel legalább 1 térbeli célpontot az 1. fázisban!");
+    if (!tgts.length) {
+      showToast("Előbb vegyél fel legalább 1 térbeli célpontot az 1. fázisban!", "warn");
+      return;
+    }
     await dag.waitUntilReady();
     const specs = await dag.call("generate_m1_m4", {
       covariates: covs,
@@ -699,6 +890,7 @@ const actions = {
     state.recipe.spatial_engine.active_model_id = "m4_ad";
     state.recipe.spatial_engine.gwr.focal_model_id = "m4_ad";
     if (tgts.length) state.recipe.composition_chain.focal_term_ref = `${tgts[0].id}::andersson_day`;
+    this.invalidateFromStage(3);
     this.render();
     await this.runStage3();
   },
@@ -713,22 +905,21 @@ const actions = {
       const res = await dag.call("run_stage_4", { recipe: state.recipe, run_id: dag.nextRunId() });
       if (mySeq !== s4Seq) return false;
       state.stage4Res = res;
-      state.stage5Res = null;
+      state.staleStages.delete(4);
       if (res.ok) {
-        setLog(`4. Fázis kész (${res.anselin?.verdict || ""}).`);
-        renderGuardStrip();
-        restyleMap();
+        setLog(`4. Fázis kész (${translateVerdict(res.anselin?.verdict || "")}).`);
       } else {
         setLog(`Stage 4 figyelmeztetés: ${res.reason || "Nem futtatható"}`);
-        renderGuardStrip();
-        restyleMap();
+        showToast(res.reason || "4. Fázis nem futtatható.", "warn");
       }
+      renderGuardStrip();
       this.render();
+      restyleMap();
       return Boolean(res.ok);
     } catch (err) {
       if (err.name === "CancelledError" || mySeq !== s4Seq) return false;
       setLog(`Stage 4 hiba: ${err.message}`);
-      alert(err.message);
+      showToast(`Stage 4 hiba: ${err.message}`, "error");
       return false;
     }
   },
@@ -736,26 +927,37 @@ const actions = {
   async runStage5() {
     if (!state.datasetInfo) return false;
     const mySeq = ++s5Seq;
+    state.stage5Busy = true;
+    state.stage5ProgressPct = 5;
+    state.stage5ProgressText = "Adaptív GWR/MGWR optimalizálás indítása...";
+    if (state.activeStage === 5) this.render();
     try {
       await dag.waitUntilReady();
       if (mySeq !== s5Seq) return false;
-      setLog("5. Fázis: Szingularitás-védett Adaptív Bisquare GWR optimalizálása...");
+      setLog("5. Fázis: Szingularitás-védett Adaptív Bisquare GWR/MGWR...");
       const res = await dag.call("run_stage_5", { recipe: state.recipe, run_id: dag.nextRunId() });
       if (mySeq !== s5Seq) return false;
       state.stage5Res = res;
+      state.staleStages.delete(5);
+      state.stage5ProgressPct = 100;
       if (res.ok) {
-        setLog(`5. Fázis kész (b*=${res.optimal_bw}, GWR Adj. R²=${res.gwr_adj_r2}).`);
-        restyleMap();
+        setLog(`5. Fázis kész (b*=${res.optimal_bw}, ${(res.mode || "gwr").toUpperCase()} Adj. R²=${res.gwr_adj_r2}).`);
       } else {
         setLog(`GWR figyelmeztetés: ${res.reason}`);
+        showToast(res.reason || "GWR nem futtatható.", "warn");
       }
       this.render();
+      restyleMap();
       return Boolean(res.ok);
     } catch (err) {
       if (err.name === "CancelledError" || mySeq !== s5Seq) return false;
       setLog(`Stage 5 hiba: ${err.message}`);
-      alert(err.message);
+      showToast(`Stage 5 hiba: ${err.message}`, "error");
       return false;
+    } finally {
+      state.stage5Busy = false;
+      const wrap = document.getElementById("gwrProgressWrap");
+      if (wrap) wrap.style.display = "none";
     }
   },
 
@@ -773,8 +975,10 @@ const actions = {
       if (!(await this.runStage4())) return;
       if (!(await this.runStage5())) return;
       setLog("Teljes 5-fázisú térökonometriai pipeline befejezve.");
+      showToast("Teljes 5-fázisú pipeline sikeresen lefutott.", "pass");
     } catch (err) {
       setLog(`Pipeline megszakadt: ${err.message}`);
+      showToast(`Pipeline megszakadt: ${err.message}`, "error");
     } finally {
       state.pipelineRunning = false;
       if (btnRunAll) btnRunAll.disabled = !state.datasetInfo;
@@ -792,9 +996,11 @@ const actions = {
       } catch {
         route = null;
       }
+    } else {
+      mapInspector.clearRoute();
     }
 
-    const feat = mapInspector.obsFeatures.find((f) => f.properties.obs_idx === obsIdx);
+    const feat = mapInspector.obsByIdx.get(Number(obsIdx)) || mapInspector.obsFeatures.find((f) => f.properties.obs_idx === obsIdx);
     let resid = null;
     let modelLabel = "";
     if (state.stage3Res?.models?.length) {
@@ -813,12 +1019,24 @@ const actions = {
     }
     let gwr_beta = null;
     let gwr_t = null;
+    let gwr_r2 = null;
+    let gwr_kappa = null;
     if (state.stage5Res?.ok) {
       const pos = state.stage5Res.valid_indices.indexOf(obsIdx);
       const ci = Math.min(parseGwrColIdx(document.getElementById("selGwrVarLayer")?.value), state.stage5Res.col_names.length - 1);
       if (pos >= 0) {
         gwr_beta = state.stage5Res.betas_native[pos][ci];
         gwr_t = state.stage5Res.t_vals[pos][ci];
+        gwr_r2 = state.stage5Res.local_r2?.[pos] ?? null;
+        gwr_kappa = state.stage5Res.local_kappas?.[pos] ?? null;
+      }
+    }
+
+    const covSummary = [];
+    if (state.columns) {
+      const activeM = state.recipe.models.find((x) => x.id === state.activeSpecId) || state.recipe.models[0];
+      for (const c of (activeM?.covariates || []).slice(0, 4)) {
+        if (state.columns[c.col]) covSummary.push({ key: c.col, val: state.columns[c.col][obsIdx] });
       }
     }
 
@@ -832,30 +1050,83 @@ const actions = {
       lisa,
       gwr_beta,
       gwr_t,
+      gwr_r2,
+      gwr_kappa,
+      covSummary,
     });
   },
 
-  async copyLatexTable() {
+  async copyLatexTable(kindOverride = null) {
     try {
       await dag.waitUntilReady();
-      const bundle = await dag.call("export_bundle", { recipe: state.recipe });
-      const tex = state.showPct ? bundle.latex_pct : bundle.latex_main;
-      if (!tex) return alert("Előbb futtasd le a 3. fázist!");
-      await navigator.clipboard.writeText(tex);
-      setLog("Overleaf booktabs LaTeX táblázat a vágólapra másolva!");
+      const kind = kindOverride || (state.showPct ? "ols_pct" : "ols_main");
+      const out = await dag.call("export_latex", { recipe: state.recipe, kind });
+      const tex = out?.latex || "";
+      if (!tex || tex.startsWith("% No ")) {
+        showToast("Előbb futtasd le a megfelelő elemzési fázist!", "warn");
+        return;
+      }
+      let copied = false;
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(tex);
+          copied = true;
+        } catch (_) {}
+      }
+      if (!copied) {
+        this.downloadText(`geospec_${kind}.tex`, tex, "text/plain");
+        showToast(`Vágólap korlátozva — fájlként letöltve: geospec_${kind}.tex`, "info");
+      } else {
+        showToast(t("toast.copied_latex"), "pass");
+      }
+      setLog(`LaTeX (${kind}) exportálva.`);
     } catch (err) {
-      alert(err.message);
+      showToast(`LaTeX hiba: ${err.message}`, "error");
     }
   },
 
-  async exportBundle(kind = "zip") {
+  async exportGeojsonOnly() {
     if (!state.datasetInfo) {
-      alert("Előbb tölts be egy érvényes adatbázist a .ZIP / GeoJSON exporthoz! (A recept és a projekt már adatbázis nélkül is menthető.)");
+      showToast("Előbb tölts be egy érvényes adatbázist a GeoJSON exporthoz!", "warn");
       return;
     }
     try {
       await dag.waitUntilReady();
-      setLog("Publikációs export csomag összeállítása...");
+      const out = await dag.call("export_geojson", { recipe: state.recipe });
+      const slug = slugifyTitle(state.recipe?.recipe_meta?.title, "geospec");
+      this.downloadText(`${slug}_enriched.geojson`, JSON.stringify(out.geojson, null, 2), "application/geo+json");
+      setLog(`QGIS GeoJSON export kész (${slug}_enriched.geojson).`);
+      showToast("QGIS GeoJSON exportálva.", "pass");
+    } catch (err) {
+      showToast(`GeoJSON export hiba: ${err.message}`, "error");
+    }
+  },
+
+  async _collectPlotlySvgs() {
+    const svgs = {};
+    if (!window.Plotly) return svgs;
+    for (const el of document.querySelectorAll(".plot-box")) {
+      if (!el.id || !el.data) continue;
+      try {
+        const uri = await window.Plotly.toImage(el, { format: "svg", width: 900, height: 420 });
+        if (typeof uri === "string" && uri.includes("<svg")) {
+          const idx = uri.indexOf("<svg");
+          svgs[el.id] = decodeURIComponent(uri.slice(idx));
+        }
+      } catch (_) {}
+    }
+    return svgs;
+  },
+
+  async exportBundle(kind = "zip") {
+    if (kind === "geojson") return this.exportGeojsonOnly();
+    if (!state.datasetInfo) {
+      showToast("Előbb tölts be egy érvényes adatbázist a .ZIP exporthoz!", "warn");
+      return;
+    }
+    try {
+      await dag.waitUntilReady();
+      setLog("Publikációs export csomag összeállítása (.ZIP + QML + SVG)...");
       const hasSnap =
         Object.keys(state.rawOsmTargets).length > 0 ||
         Object.keys(state.rawGeojsonTargets).length > 0 ||
@@ -869,35 +1140,36 @@ const actions = {
             rawStreetGraphs: state.rawStreetGraphs,
           })
         : null;
+      const svg_figures = await this._collectPlotlySvgs();
 
-      const bundle = await dag.call("export_bundle", { recipe: state.recipe, osm_bundle });
+      const bundle = await dag.call("export_bundle", { recipe: state.recipe, osm_bundle, svg_figures });
       const slug = slugifyTitle(state.recipe?.recipe_meta?.title, "geospec");
-      if (kind === "geojson") {
-        this.downloadText(`${slug}_enriched.geojson`, JSON.stringify(bundle.geojson, null, 2), "application/geo+json");
-      } else {
-        const bin = Uint8Array.from(atob(bundle.zip_base64), (c) => c.charCodeAt(0));
-        const blob = new Blob([bin], { type: "application/zip" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `${slug}_publication_bundle_${Date.now()}.zip`;
-        a.click();
-        URL.revokeObjectURL(url);
-      }
-      setLog(`Export kész (${kind}).`);
+      const bin = Uint8Array.from(atob(bundle.zip_base64), (c) => c.charCodeAt(0));
+      const blob = new Blob([bin], { type: "application/zip" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${slug}_publication_bundle_${Date.now()}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setLog(`Publikációs .ZIP csomag elkészült (${Object.keys(svg_figures).length} SVG ábra).`);
+      showToast("Publikációs .ZIP csomag letöltve.", "pass");
     } catch (err) {
-      alert(err.message);
+      showToast(`Export hiba: ${err.message}`, "error");
     }
   },
 
   exportRecipe() {
+    state.recipe.default_cov_type = state.covType;
     const slug = slugifyTitle(state.recipe?.recipe_meta?.title, "experiment");
     const fileName = `${slug}_recipe.json`;
     this.downloadText(fileName, JSON.stringify(state.recipe, null, 2), "application/json");
     setLog(`${fileName} mentve (nyers adatok nélkül).`);
+    showToast(`${fileName} mentve.`, "pass");
   },
 
   exportWorkspace() {
+    state.recipe.default_cov_type = state.covType;
     const hasSnap =
       Object.keys(state.rawOsmTargets).length > 0 ||
       Object.keys(state.rawGeojsonTargets).length > 0 ||
@@ -927,6 +1199,7 @@ const actions = {
     const fileName = `${slug}.geospec.json`;
     this.downloadText(fileName, JSON.stringify(ws), "application/json");
     setLog(`Teljes projekt mentve: ${fileName}`);
+    showToast(`${fileName} projekt mentve.`, "pass");
   },
 
   async importRecipe(loadedRecipe, { fileName = "", skipSync = false, preserveSnapshots = true } = {}) {
@@ -937,10 +1210,7 @@ const actions = {
     state.workspaceFileName = "";
     const modelIds = new Set((clean.models || []).map((m) => m.id));
     const preferredSpec = clean.spatial_engine?.active_model_id || clean.spatial_engine?.gwr?.focal_model_id;
-    state.activeSpecId =
-      preferredSpec && modelIds.has(preferredSpec)
-        ? preferredSpec
-        : clean.models?.[0]?.id || "spec_a";
+    state.activeSpecId = preferredSpec && modelIds.has(preferredSpec) ? preferredSpec : clean.models?.[0]?.id || "spec_a";
     const clMode = clean.dataset_schema?.cluster_spec?.mode;
     state.covType = clean.default_cov_type || (clMode && clMode !== "none" ? "cluster" : "HC3");
 
@@ -967,7 +1237,7 @@ const actions = {
 
     if (loadedRecipe && typeof loadedRecipe.osm_bundle === "object" && loadedRecipe.osm_bundle !== null) {
       try {
-        const parsedEmbeddedBundle = parseOsmBundle(loadedRecipe.osm_bundle);
+        const parsedEmbeddedBundle = loadedRecipe.osm_bundle;
         await this.importOsmBundle(parsedEmbeddedBundle, {
           fileName: fileName || state.osmBundleFileName,
           skipIngest: true,
@@ -999,8 +1269,7 @@ const actions = {
     }
   },
 
-  async importWorkspace(rawWorkspace, { fileName = "", skipSync = false } = {}) {
-    const parsed = parseWorkspaceBundle(rawWorkspace);
+  async importWorkspace(parsedWorkspace, { fileName = "", skipSync = false } = {}) {
     datasetSeq++;
     s1Seq++; s2Seq++; s3Seq++; s4Seq++; s5Seq++;
 
@@ -1011,21 +1280,24 @@ const actions = {
     state.rawStreetGraphs = {};
     state.osmFilterQuery = {};
     state.osmBundleFileName = "";
+    mapInspector.clearObservations();
     mapInspector.clearTargets();
     mapInspector.clearRoute();
+    mapInspector.setFetchedBbox(null);
+    mapInspector.renderPointInspector(null, null);
 
-    state.recipe = parsed.recipe;
+    state.recipe = parsedWorkspace.recipe;
     state.workspaceFileName = fileName || "workspace.geospec.json";
     state.recipeFileName = fileName || "workspace.geospec.json";
-    state.activeSpecId = parsed.ui_state.activeSpecId;
-    state.covType = parsed.ui_state.covType;
-    state.showPct = parsed.ui_state.showPct;
+    state.activeSpecId = parsedWorkspace.ui_state.activeSpecId;
+    state.covType = parsedWorkspace.ui_state.covType;
+    state.showPct = parsedWorkspace.ui_state.showPct;
 
-    if (parsed.dataset) {
-      state.fileName = parsed.dataset.fileName;
-      state.headers = parsed.dataset.headers;
-      state.columns = parsed.dataset.columns;
-      state.nRows = parsed.dataset.nRows;
+    if (parsedWorkspace.dataset) {
+      state.fileName = parsedWorkspace.dataset.fileName;
+      state.headers = parsedWorkspace.dataset.headers;
+      state.columns = parsedWorkspace.dataset.columns;
+      state.nRows = parsedWorkspace.dataset.nRows;
       const { profile } = inferColumnProfile(state.headers, state.columns);
       state.colProfile = profile;
     } else {
@@ -1035,11 +1307,13 @@ const actions = {
       state.nRows = 0;
       state.colProfile = {};
       state.datasetInfo = null;
-      mapInspector.clearObservations();
+      if (state.wasmStatus === "ready") {
+        await dag.call("reset_session", {}).catch(() => {});
+      }
     }
 
-    if (parsed.osm_bundle) {
-      await this.importOsmBundle(parsed.osm_bundle, {
+    if (parsedWorkspace.osm_bundle) {
+      await this.importOsmBundle(parsedWorkspace.osm_bundle, {
         fileName: fileName || "workspace_osm_bundle",
         skipIngest: true,
         skipRender: true,
@@ -1066,6 +1340,8 @@ const actions = {
         const text = await readTextWithEncodingFallback(f);
         entries.push({ fileName: f.name, text });
       }
+      // Atomic parsing & validation before any state/worker mutation
+      const { prepareIncomingBatch } = await import("./state/recipe_store.js");
       const plan = prepareIncomingBatch(entries, { hasDataset: Boolean(state.columns) });
       const hasPendingRecipe = plan.some((item) => item.kind === "recipe");
       const needsFullWorkerSync =
@@ -1075,13 +1351,10 @@ const actions = {
 
       for (const item of plan) {
         if (item.kind === "workspace") {
-          await this.importWorkspace(item.data, { fileName: item.fileName, skipSync: true });
+          await this.importWorkspace(item.parsed, { fileName: item.fileName, skipSync: true });
           summaryMsgs.push(`Projekt: ${item.fileName}`);
         } else if (item.kind === "dataset_csv" || item.kind === "dataset_geojson") {
-          const parsed =
-            item.kind === "dataset_csv"
-              ? parseCSVText(item.text)
-              : parseGeoJSONDataset(item.data);
+          const parsed = item.parsed;
           const { profile, guesses } = inferColumnProfile(parsed.headers, parsed.columns);
           await this.onDatasetParsed(item.fileName, parsed, profile, guesses, {
             skipSync: true,
@@ -1089,15 +1362,14 @@ const actions = {
           });
           summaryMsgs.push(`Adat: ${item.fileName} (N=${parsed.nRows})`);
         } else if (item.kind === "recipe") {
-          await this.importRecipe(item.data, {
+          await this.importRecipe(item.parsed, {
             fileName: item.fileName,
             skipSync: true,
             preserveSnapshots: true,
           });
-          summaryMsgs.push(`Recept: ${item.data.recipe_meta?.title || item.fileName}`);
+          summaryMsgs.push(`Recept: ${item.parsed.recipe_meta?.title || item.fileName}`);
         } else if (item.kind === "osm_bundle") {
-          const parsedBundle = parseOsmBundle(item.data);
-          await this.importOsmBundle(parsedBundle, {
+          await this.importOsmBundle(item.parsed, {
             fileName: item.fileName,
             skipIngest: needsFullWorkerSync,
             skipRender: true,
@@ -1119,6 +1391,7 @@ const actions = {
             distance_modes: "euclidean",
             routing_profile: "walk",
             max_snap_distance_m: 300,
+            bbox_buffer_m: 800,
           });
           if (needsFullWorkerSync) {
             state.rawGeojsonTargets[tid] = item.data;
@@ -1143,17 +1416,12 @@ const actions = {
         this.render();
       }
       if (summaryMsgs.length) {
-        if (state.columns && !state.datasetInfo) {
-          if (!state.logLine.startsWith("Séma hiba:")) {
-            setLog(`Betöltve (${summaryMsgs.join(" | ")}) — jelöld ki az érvényes lat/lon oszlopokat az 1B szekcióban!`);
-          }
-        } else {
-          setLog(`Betöltve (${summaryMsgs.join(" | ")})`);
-        }
+        setLog(`Betöltve (${summaryMsgs.join(" | ")})`);
+        showToast(`Betöltve: ${summaryMsgs.join(", ")}`, "pass");
       }
     } catch (err) {
       setLog(`Betöltési hiba: ${err.message}`);
-      alert(`Fájl betöltési hiba: ${err.message}`);
+      showToast(`Fájl betöltési hiba: ${err.message}`, "error");
     }
   },
 
@@ -1173,6 +1441,7 @@ function renderGuardStrip() {
   const s3 = state.stage3Res;
   const s4 = state.stage4Res;
   const s5 = state.stage5Res;
+  const tau = state.recipe.guards_cfg?.sparse_min_cell ?? 5;
 
   const g1Warn = s3?.models?.some((m) => m.diagnostics?.status === "warn");
   const g2Count = s3?.models?.reduce((acc, m) => acc + (m.guard2_events?.length || 0), 0) || 0;
@@ -1189,20 +1458,119 @@ function renderGuardStrip() {
   };
 
   setPill("g1Pill", s3 ? (g1Warn ? "warn" : "pass") : "", s3 ? (g1Warn ? "G1 ⚠ Konfound/VIF" : "G1 ✓ VIF/RESET") : "G1 Diagnosztika");
-  setPill("g2Pill", s3 ? (g2Count > 0 ? "warn" : "pass") : "", s3 ? (g2Count > 0 ? `G2 ⚡ ${g2Count} összevonás` : "G2 ✓ Sűrűség ≥5") : "G2 Ritka cellák");
+  setPill("g2Pill", s3 ? (g2Count > 0 ? "warn" : "pass") : "", s3 ? (g2Count > 0 ? `G2 ⚡ ${g2Count} összevonás (τ=${tau})` : `G2 ✓ Sűrűség ≥${tau}`) : `G2 Ritka (τ=${tau})`);
   setPill("g3Pill", g3Atten !== null ? (Math.abs(g3Atten) > (state.recipe.guards_cfg?.attenuation_warn_pct ?? 50) ? "warn" : "pass") : "", g3Atten !== null ? `G3 ${g3Atten}% atten.` : "G3 Gelbach/Step");
   setPill("g4Pill", g4Heck ? (g4Heck.activated && g4Heck.selection_bias_detected ? "warn" : "pass") : "", g4Heck?.activated ? `G4 λ p=${g4Heck.imr_p}` : "G4 Heckman/SE");
   setPill("g5Pill", s4?.ok ? (g5Warn ? "warn" : "pass") : "", s4?.ok ? (g5Warn ? "G5 ⚠ Co-loc W" : `G5 ✓ ${s4.anselin?.recommended_model || "OK"}`) : "G5 Térbeli W");
   setPill("g6Pill", s5?.ok ? (g6Reg > 0 ? "warn" : "pass") : "", s5?.ok ? (g6Reg > 0 ? `G6 🛡️ Ridge (${g6Reg})` : "G6 ✓ GWR Stabil") : "G6 GWR Ridge");
 }
 
+function renderAdvancedDrawerBody() {
+  const body = document.getElementById("advancedDrawerBody");
+  if (!body) return;
+  const r = state.recipe;
+  const grd = r.guards_cfg || {};
+  const ds = r.dataset_schema || {};
+  const ySpec = ds.y_spec || {};
+  const sel = ds.selection_spec || {};
+  const sp = r.spatial_engine || {};
+  const gwr = sp.gwr || {};
+  const headers = state.headers || [];
+
+  body.innerHTML = `
+    <div style="font-weight:700;margin-bottom:6px;">Guard #1–#4 &amp; Mintazárolási Küszöbök</div>
+    <div class="grid-2" style="margin-bottom:10px;">
+      <div class="field-row">
+        <label for="drvSparseTau">G2 Ritka cella min. N (τ)</label>
+        <input type="number" id="drvSparseTau" value="${Number(grd.sparse_min_cell ?? 5)}" min="0" max="200" />
+      </div>
+      <div class="field-row">
+        <label for="drvLevWarn">G1 HC3 Leverage riasztás</label>
+        <input type="number" id="drvLevWarn" value="${Number(grd.hc3_leverage_warn ?? 0.85)}" min="0.1" max="0.999" step="0.05" />
+      </div>
+      <div class="field-row">
+        <label for="drvAttenPct">G3 Gelbach attenuáció riasztás (%)</label>
+        <input type="number" id="drvAttenPct" value="${Number(grd.attenuation_warn_pct ?? 50)}" min="5" max="100" />
+      </div>
+      <div class="field-row">
+        <label style="display:flex;align-items:center;gap:6px;padding-top:16px;">
+          <input type="checkbox" id="drvCommonLock" ${grd.common_sample_lock !== false ? "checked" : ""} /> Közös minta zárolása (N<sub>common</sub>)
+        </label>
+      </div>
+    </div>
+
+    <div style="font-weight:700;margin-bottom:6px;">Függő Változó (Box–Cox / log1p) &amp; Heckman (G4)</div>
+    <div class="grid-2" style="margin-bottom:10px;">
+      <div class="field-row">
+        <label for="drvBcLambda">Box–Cox fix λ (üres = Auto MLE)</label>
+        <input type="number" id="drvBcLambda" step="0.05" min="-5" max="5" value="${ySpec.boxcox_lambda != null ? ySpec.boxcox_lambda : ""}" placeholder="Auto MLE" />
+      </div>
+      <div class="field-row">
+        <label for="drvLog1pShift">log1p shift paraméter</label>
+        <input type="number" id="drvLog1pShift" min="0" step="1" value="${Number(ySpec.log1p_shift ?? 1.0)}" />
+      </div>
+      <div class="field-row">
+        <label style="display:flex;align-items:center;gap:6px;">
+          <input type="checkbox" id="drvHeckEnabled" ${sel.enabled !== false ? "checked" : ""} /> Heckman (1979) aktív
+        </label>
+      </div>
+      <div class="field-row">
+        <label for="drvHeckExclCol">Kizárási jelzőoszlop</label>
+        <select id="drvHeckExclCol">
+          <option value="">— automatikus (hiányzó koordináták) —</option>
+          ${headers.map((h) => `<option value="${escapeHtml(h)}" ${sel.excluded_flag_col === h ? "selected" : ""}>${escapeHtml(h)}</option>`).join("")}
+        </select>
+      </div>
+      <div class="field-row">
+        <label for="drvHeckMinExcl">Min. kizárt minta (Heckman)</label>
+        <input type="number" id="drvHeckMinExcl" value="${Number(grd.heckman_min_excluded ?? 10)}" min="1" max="500" />
+      </div>
+      <div class="field-row">
+        <label for="drvHeckMinAnalytic">Min. analitikus N (Heckman)</label>
+        <input type="number" id="drvHeckMinAnalytic" value="${Number(grd.heckman_min_analytic ?? 30)}" min="10" max="1000" />
+      </div>
+    </div>
+
+    <div style="font-weight:700;margin-bottom:6px;">Térökonometria (G5) &amp; GWR / MGWR (G6)</div>
+    <div class="grid-2">
+      <div class="field-row">
+        <label for="drvKrDraws">Krinsky–Robb szimulációk (draws)</label>
+        <input type="number" id="drvKrDraws" value="${Number(sp.krinsky_robb_draws ?? 1000)}" min="100" max="5000" step="100" />
+      </div>
+      <div class="field-row">
+        <label for="drvGwrFloor">G6 Minimum sávszélesség (b<sub>min</sub>)</label>
+        <input type="number" id="drvGwrFloor" value="${Number(gwr.b_min_floor ?? 15)}" min="10" max="500" />
+      </div>
+      <div class="field-row">
+        <label for="drvGwrPrev">G6 Dummy prevalencia küszöb (0–0.5)</label>
+        <input type="number" id="drvGwrPrev" value="${Number(gwr.prevalence_min_pct ?? 0.10)}" min="0" max="0.5" step="0.05" />
+      </div>
+      <div class="field-row">
+        <label for="drvGwrKappa">G6 Szelektív Ridge κ</label>
+        <input type="number" id="drvGwrKappa" value="${Number(gwr.kappa_thresh ?? 1000)}" min="1" max="100000" step="50" />
+      </div>
+    </div>
+  `;
+}
+
+function toggleAdvancedDrawer(openBool) {
+  const drawer = document.getElementById("advancedDrawer");
+  if (!drawer) return;
+  const nextOpen = openBool === undefined ? drawer.hidden : Boolean(openBool);
+  if (nextOpen) {
+    renderAdvancedDrawerBody();
+    drawer.hidden = false;
+  } else {
+    drawer.hidden = true;
+  }
+  document.querySelectorAll(".guard-pill").forEach((b) => b.setAttribute("aria-expanded", nextOpen ? "true" : "false"));
+}
+
 function applyTheme(isDark) {
   document.body.classList.toggle("dark-theme", Boolean(isDark));
   try {
     localStorage.setItem("geospec_theme", isDark ? "dark" : "light");
-  } catch {
-    // ignore storage restriction
-  }
+  } catch {}
   mapInspector.setTheme(Boolean(isDark));
 }
 
@@ -1210,6 +1578,9 @@ window.addEventListener("DOMContentLoaded", () => {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("./sw.js").catch(() => {});
   }
+
+  initLang();
+  applyI18nDOM();
 
   let initialDark = false;
   try {
@@ -1219,10 +1590,22 @@ window.addEventListener("DOMContentLoaded", () => {
   }
   document.body.classList.toggle("dark-theme", initialDark);
 
+  pruneExpiredOSM().catch(() => {});
+
   mapInspector.init();
   mapInspector.setTheme(initialDark);
   mapInspector.renderPointInspector(null, null);
   dag.init().catch((err) => updateBootIndicator("error", err.message));
+
+  document.getElementById("btnRestartWorker")?.addEventListener("click", async () => {
+    try {
+      await dag.restart();
+      showToast("Pyodide WASM kernel sikeresen újraindítva.", "pass");
+      if (state.columns) await actions.syncDatasetToWorker();
+    } catch (err) {
+      showToast(`WASM újraindítás sikertelen: ${err.message}`, "error");
+    }
+  });
 
   document.querySelectorAll(".stage-tab").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -1231,7 +1614,7 @@ window.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  document.getElementById("btnRunAll").addEventListener("click", () => actions.runFullPipeline());
+  document.getElementById("btnRunAll")?.addEventListener("click", () => actions.runFullPipeline());
 
   const fileTopLoadAny = document.getElementById("fileTopLoadAny");
   document.getElementById("btnTopLoadAny")?.addEventListener("click", () => fileTopLoadAny?.click());
@@ -1241,10 +1624,39 @@ window.addEventListener("DOMContentLoaded", () => {
     if (files.length) actions.handleIncomingFiles(files);
   });
 
-  document.getElementById("btnTopRecipeExport")?.addEventListener("click", () => actions.exportRecipe());
-  document.getElementById("btnTopProjectExport")?.addEventListener("click", () => actions.exportWorkspace());
-  document.getElementById("btnTopZipExport")?.addEventListener("click", () => actions.exportBundle("zip"));
-  document.getElementById("btnThemeToggle").addEventListener("click", () => {
+  // Save Dropdown Menu
+  const btnSaveMenu = document.getElementById("btnTopSaveMenu");
+  const saveMenu = document.getElementById("saveDropdownMenu");
+  btnSaveMenu?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const opening = saveMenu.hidden;
+    saveMenu.hidden = !opening;
+    btnSaveMenu.setAttribute("aria-expanded", opening ? "true" : "false");
+  });
+  document.addEventListener("click", (e) => {
+    if (saveMenu && !saveMenu.hidden && !e.target.closest(".dropdown-wrap")) {
+      saveMenu.hidden = true;
+      btnSaveMenu?.setAttribute("aria-expanded", "false");
+    }
+  });
+  document.getElementById("menuSaveRecipe")?.addEventListener("click", () => { saveMenu.hidden = true; actions.exportRecipe(); });
+  document.getElementById("menuSaveProject")?.addEventListener("click", () => { saveMenu.hidden = true; actions.exportWorkspace(); });
+  document.getElementById("menuSaveOsmBundle")?.addEventListener("click", () => { saveMenu.hidden = true; actions.exportOsmBundle(); });
+  document.getElementById("menuSaveLatexMain")?.addEventListener("click", () => { saveMenu.hidden = true; actions.copyLatexTable(); });
+  document.getElementById("menuSaveGeojson")?.addEventListener("click", () => { saveMenu.hidden = true; actions.exportGeojsonOnly(); });
+  document.getElementById("menuSaveZip")?.addEventListener("click", () => { saveMenu.hidden = true; actions.exportBundle("zip"); });
+
+  // HU | EN Language toggle
+  document.getElementById("btnLangToggle")?.addEventListener("click", () => {
+    const next = getLang() === "hu" ? "en" : "hu";
+    setLang(next);
+    applyI18nDOM();
+    renderGuardStrip();
+    actions.render();
+    showToast(next === "en" ? "Language switched to English" : "Nyelv átváltva magyarra", "info");
+  });
+
+  document.getElementById("btnThemeToggle")?.addEventListener("click", () => {
     const nextDark = !document.body.classList.contains("dark-theme");
     applyTheme(nextDark);
     if (state.activeStage >= 2 && state.activeStage <= 5) {
@@ -1252,7 +1664,71 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  // Prevent browser from navigating away if files are dropped anywhere in the workbench
+  // Guard & Advanced Drawer
+  document.querySelectorAll(".guard-pill").forEach((pill) => {
+    pill.addEventListener("click", () => toggleAdvancedDrawer(true));
+  });
+  document.getElementById("btnCloseAdvancedDrawer")?.addEventListener("click", () => toggleAdvancedDrawer(false));
+
+  document.getElementById("btnPresetBestPractice")?.addEventListener("click", () => {
+    state.recipe.guards_cfg.sparse_min_cell = 5;
+    state.recipe.guards_cfg.common_sample_lock = true;
+    state.recipe.spatial_engine.se_mode = "qml";
+    state.recipe.spatial_engine.lisa_fdr = true;
+    state.recipe.spatial_engine.gwr.prevalence_min_pct = 0.10;
+    state.recipe.spatial_engine.gwr.b_min_floor = 15;
+    state.recipe.spatial_engine.gwr.kappa_thresh = 1000;
+    if (state.recipe.spatial_engine.weights?.[0]?.type === "knn") {
+      state.recipe.spatial_engine.weights[0].dedup_colocated = true;
+    }
+    renderAdvancedDrawerBody();
+    actions.invalidateFromStage(1);
+    showToast("Best-Practice profil aktiválva (QML SE, τ=5, BH-FDR, parcel dedup).", "pass");
+  });
+
+  document.getElementById("btnPresetReplication")?.addEventListener("click", () => {
+    state.recipe.guards_cfg.sparse_min_cell = 0;
+    state.recipe.guards_cfg.common_sample_lock = true;
+    state.recipe.default_cov_type = "HC3";
+    state.covType = "HC3";
+    state.recipe.spatial_engine.se_mode = "ml";
+    state.recipe.spatial_engine.lisa_fdr = false;
+    state.recipe.spatial_engine.gwr.prevalence_min_pct = 0;
+    if (state.recipe.spatial_engine.weights?.[0]?.type === "knn") {
+      state.recipe.spatial_engine.weights[0].dedup_colocated = false;
+    }
+    renderAdvancedDrawerBody();
+    actions.invalidateFromStage(1);
+    showToast("Replication profil aktiválva (klasszikus HC3/ML replikációs alapok).", "info");
+  });
+
+  document.getElementById("btnApplyDrawerConfig")?.addEventListener("click", () => {
+    const grd = state.recipe.guards_cfg;
+    const ds = state.recipe.dataset_schema;
+    const sp = state.recipe.spatial_engine;
+    const gwr = sp.gwr;
+    grd.sparse_min_cell = Math.max(0, Math.round(Number(document.getElementById("drvSparseTau")?.value ?? 5)));
+    grd.hc3_leverage_warn = Math.min(0.999, Math.max(0.05, Number(document.getElementById("drvLevWarn")?.value || 0.85)));
+    grd.attenuation_warn_pct = Math.max(5, Number(document.getElementById("drvAttenPct")?.value || 50));
+    grd.common_sample_lock = Boolean(document.getElementById("drvCommonLock")?.checked);
+    const bcRaw = document.getElementById("drvBcLambda")?.value;
+    ds.y_spec.boxcox_lambda = bcRaw === "" || bcRaw == null ? null : Number(bcRaw);
+    ds.y_spec.log1p_shift = Math.max(0, Number(document.getElementById("drvLog1pShift")?.value || 1.0));
+    ds.selection_spec.enabled = Boolean(document.getElementById("drvHeckEnabled")?.checked);
+    ds.selection_spec.excluded_flag_col = document.getElementById("drvHeckExclCol")?.value || "";
+    grd.heckman_min_excluded = Math.max(1, Math.round(Number(document.getElementById("drvHeckMinExcl")?.value || 10)));
+    grd.heckman_min_analytic = Math.max(10, Math.round(Number(document.getElementById("drvHeckMinAnalytic")?.value || 30)));
+    sp.krinsky_robb_draws = Math.max(100, Math.round(Number(document.getElementById("drvKrDraws")?.value || 1000)));
+    gwr.b_min_floor = Math.max(10, Math.round(Number(document.getElementById("drvGwrFloor")?.value || 15)));
+    gwr.prevalence_min_pct = Math.max(0, Math.min(0.5, Number(document.getElementById("drvGwrPrev")?.value ?? 0.10)));
+    gwr.kappa_thresh = Math.max(1, Number(document.getElementById("drvGwrKappa")?.value || 1000));
+    actions.invalidateFromStage(2);
+    actions.invalidateFromStage(3);
+    toggleAdvancedDrawer(false);
+    actions.render();
+    showToast("Guard és módszertani beállítások alkalmazva.", "pass");
+  });
+
   window.addEventListener("dragover", (e) => {
     if (Array.from(e.dataTransfer?.types || []).includes("Files")) {
       e.preventDefault();
@@ -1265,12 +1741,12 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  document.getElementById("selMapLayer").addEventListener("change", () => {
+  document.getElementById("selMapLayer")?.addEventListener("change", () => {
     actions.render();
     restyleMap();
   });
 
-  document.getElementById("selGwrVarLayer").addEventListener("change", () => {
+  document.getElementById("selGwrVarLayer")?.addEventListener("change", () => {
     restyleMap();
   });
 
@@ -1278,12 +1754,12 @@ window.addEventListener("DOMContentLoaded", () => {
     restyleMap();
   });
 
-  document.getElementById("g1Pill").addEventListener("click", () => { state.activeStage = 3; actions.render(); });
-  document.getElementById("g2Pill").addEventListener("click", () => { state.activeStage = 3; actions.render(); });
-  document.getElementById("g3Pill").addEventListener("click", () => { state.activeStage = 2; actions.render(); });
-  document.getElementById("g4Pill").addEventListener("click", () => { state.activeStage = 3; actions.render(); });
-  document.getElementById("g5Pill").addEventListener("click", () => { state.activeStage = 4; actions.render(); });
-  document.getElementById("g6Pill").addEventListener("click", () => { state.activeStage = 5; actions.render(); });
+  document.getElementById("selRouteTarget")?.addEventListener("change", () => {
+    restyleMap();
+    if (mapInspector.selectedObsIdx !== null && mapInspector.selectedObsIdx !== undefined) {
+      actions.inspectObservation(mapInspector.selectedObsIdx);
+    }
+  });
 
   actions.render();
 });

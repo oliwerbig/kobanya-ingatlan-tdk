@@ -103,7 +103,7 @@ def test_guard6_singularity_guarded_gwr_native_recovery() -> None:
     )
     assert gwr["ok"] is True
     assert gwr["gwr_r2"] > gwr["global_ols_r2"]
-    assert gwr["n_regularized"] > 0  # Selective Ridge caught the identical-dummy condo cluster!
+    assert (gwr["n_regularized"] + gwr.get("n_local_dropped_locs", 0)) > 0  # Selective Ridge or local drop caught identical-dummy cluster!
 
     betas_x = np.array([row[1] for row in gwr["betas_native"]])
     assert np.all(np.isfinite(betas_x))

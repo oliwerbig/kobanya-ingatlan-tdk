@@ -43,10 +43,12 @@ def _sig_stars(p: float) -> str:
 def build_spatial_weight_matrix(
     coords_xy: np.ndarray,
     w_cfg: Dict[str, Any],
+    net_dist_mat: Optional[csr_matrix] = None,
 ) -> Dict[str, Any]:
     """
     Build row-standardized sparse CSR weight matrix W and compute topology & eigenvalues.
-    Supports: knn (with co-location audit & parcel dedup), idw (with auto_connectivity), adaptive_bisquare.
+    Supports: knn (with co-location audit & parcel dedup), idw (with auto_connectivity),
+    adaptive_bisquare, and network_idw (street-network barrier W_net).
     """
     n = len(coords_xy)
     if n < 6:
@@ -62,6 +64,7 @@ def build_spatial_weight_matrix(
     islands: List[int] = []
     is_symmetric_base = False
     meta_extra: Dict[str, Any] = {}
+    W: Optional[csr_matrix] = None
 
     if w_type == "knn":
         k = min(n - 1, max(1, int(w_cfg.get("k", 5))))
@@ -143,65 +146,73 @@ def build_spatial_weight_matrix(
         d1, _ = tree.query(coords_xy, k=2)
         d1_nn = d1[:, 1]
         d_conn = float(np.max(d1_nn)) * 1.001  # minimum distance guaranteeing 0 islands
-        if cutoff_mode in ("fixed", "fixed_m") and w_cfg.get("cutoff_m"):
-            d_cut = float(w_cfg["cutoff_m"])
-            if n > 50:
-                edge_cap = max(200000, 120 * n)
-                est_edges = int(np.sum(tree.query_ball_point(coords_xy, r=d_cut, return_length=True) - 1))
-                if est_edges > edge_cap:
-                    lo_r = max(1.0, float(np.median(d1_nn)))
-                    hi_r = d_cut
-                    for _ in range(12):
-                        mid_r = 0.5 * (lo_r + hi_r)
-                        ee = int(np.sum(tree.query_ball_point(coords_xy, r=mid_r, return_length=True) - 1))
-                        if ee <= edge_cap:
-                            lo_r = mid_r
-                        else:
-                            hi_r = mid_r
-                    d_cut = lo_r
+        edge_cap = max(200000, 120 * n)
+
+        def _cap_idw_radius(r_start: float) -> Tuple[float, bool, int]:
+            est = int(np.sum(tree.query_ball_point(coords_xy, r=r_start, return_length=True) - 1))
+            if est <= edge_cap:
+                return r_start, False, est
+            lo_r = max(0.05, float(np.median(d1_nn)))
+            while lo_r > 1e-3 and int(np.sum(tree.query_ball_point(coords_xy, r=lo_r, return_length=True) - 1)) > edge_cap:
+                lo_r *= 0.5
+            hi_r = r_start
+            if lo_r > hi_r:
+                lo_r = 0.05
+            for _ in range(12):
+                mid_r = 0.5 * (lo_r + hi_r)
+                ee = int(np.sum(tree.query_ball_point(coords_xy, r=mid_r, return_length=True) - 1))
+                if ee <= edge_cap:
+                    lo_r = mid_r
+                else:
+                    hi_r = mid_r
+            return lo_r, True, est
+
+        if cutoff_mode in ("fixed", "fixed_m") and w_cfg.get("cutoff_m") is not None:
+            d_cut = max(0.0, float(w_cfg["cutoff_m"]))
+            if n > 50 and d_cut > 0.0:
+                d_cut_new, capped, est_e = _cap_idw_radius(d_cut)
+                if capped:
+                    d_cut = d_cut_new
                     meta_extra["outlier_guard_triggered"] = True
                     meta_extra["outlier_guard_msg"] = (
-                        f"IDW '{w_id}' fixed cutoff capped at {d_cut:.1f}m (est. {est_edges} edges exceeded memory cap {edge_cap})."
+                        f"IDW '{w_id}' fixed cutoff capped at {d_cut:.1f}m (est. {est_e} edges exceeded memory cap {edge_cap})."
                     )
         else:
             d_cut = max(d_conn, float(w_cfg.get("min_cutoff_m", 0.0)))
             if n > 50:
                 p98 = max(1.0, float(np.percentile(d1_nn, 98)))
-                edge_cap = max(200000, 120 * n)
                 est_edges = int(np.sum(tree.query_ball_point(coords_xy, r=d_cut, return_length=True) - 1))
                 if d_conn > max(3000.0, 5.0 * p98) or est_edges > edge_cap:
                     d_robust = max(float(w_cfg.get("min_cutoff_m", 0.0)), p98 * 1.25, 100.0)
                     d_cut = min(d_cut, d_robust)
-                    est_edges2 = int(np.sum(tree.query_ball_point(coords_xy, r=d_cut, return_length=True) - 1))
-                    if est_edges2 > edge_cap:
-                        lo_r = max(1.0, float(np.median(d1_nn)))
-                        hi_r = d_cut
-                        for _ in range(12):
-                            mid_r = 0.5 * (lo_r + hi_r)
-                            ee = int(np.sum(tree.query_ball_point(coords_xy, r=mid_r, return_length=True) - 1))
-                            if ee <= edge_cap:
-                                lo_r = mid_r
-                            else:
-                                hi_r = mid_r
-                        d_cut = lo_r
+                    d_cut, _, _ = _cap_idw_radius(d_cut)
                     meta_extra["outlier_guard_triggered"] = True
                     meta_extra["outlier_guard_msg"] = (
                         f"IDW '{w_id}' connectivity radius capped at {d_cut:.1f}m "
                         f"(unbounded max 1-NN={d_conn:.1f}m, est. {est_edges} edges)."
                     )
 
-        pairs_list = tree.query_ball_point(coords_xy, r=d_cut)
-        for i, nbrs in enumerate(pairs_list):
-            nbr_valid = [int(j) for j in nbrs if int(j) != i]
-            if not nbr_valid:
-                islands.append(i)
-                continue
-            j_arr = np.asarray(nbr_valid, dtype=np.int32)
-            d_vec = np.hypot(coords_xy[j_arr, 0] - coords_xy[i, 0], coords_xy[j_arr, 1] - coords_xy[i, 1])
-            w_raw = np.power(np.maximum(1.0, d_vec), -power)
-            w_norm = w_raw / float(np.sum(w_raw))
-            for j, wv in zip(nbr_valid, w_norm):
-                rows.append(i); cols.append(j); vals.append(float(wv))
+        if d_cut > 0.0:
+            # Vectorized CSR construction via cKDTree.query_pairs
+            pair_set = tree.query_pairs(r=d_cut, output_type="ndarray")
+            if len(pair_set) > 0:
+                pi = pair_set[:, 0]
+                pj = pair_set[:, 1]
+                r_all = np.concatenate([pi, pj])
+                c_all = np.concatenate([pj, pi])
+                d_vec = np.hypot(coords_xy[c_all, 0] - coords_xy[r_all, 0], coords_xy[c_all, 1] - coords_xy[r_all, 1])
+                w_raw = np.power(np.maximum(1.0, d_vec), -power)
+                r_sums = np.bincount(r_all, weights=w_raw, minlength=n)
+                w_norm = w_raw / np.maximum(1e-18, r_sums[r_all])
+                W = csr_matrix((w_norm, (r_all, c_all)), shape=(n, n), dtype=np.float64)
+                islands = np.where(r_sums <= 1e-12)[0].astype(int).tolist()
+            else:
+                W = csr_matrix((n, n), dtype=np.float64)
+                islands = list(range(n))
+        else:
+            W = csr_matrix((n, n), dtype=np.float64)
+            islands = list(range(n))
+
         meta_extra["cutoff_m"] = round(d_cut, 2)
         meta_extra["d_conn_m"] = round(d_conn, 2)
         meta_extra["power"] = power
@@ -224,10 +235,38 @@ def build_spatial_weight_matrix(
                 if wv > 0.0:
                     rows.append(i); cols.append(int(j)); vals.append(float(wv))
         meta_extra["k"] = k
+
+    elif w_type == "network_idw":
+        if net_dist_mat is None:
+            raise ValueError(
+                f"Hálózati súlymátrix ('{w_id}', network_idw) nem építhető: nincs betöltött utcahálózati gráf."
+            )
+        power = float(w_cfg.get("power", 1.0))
+        d_cut = max(10.0, float(w_cfg.get("cutoff_m", 1000.0)))
+        profile = str(w_cfg.get("profile", "walk"))
+        is_symmetric_base = profile == "walk"
+        coo_nd = net_dist_mat.tocoo()
+        keep = (coo_nd.row != coo_nd.col) & np.isfinite(coo_nd.data) & (coo_nd.data <= d_cut)
+        if np.any(keep):
+            r_all = coo_nd.row[keep].astype(np.int32)
+            c_all = coo_nd.col[keep].astype(np.int32)
+            d_all = coo_nd.data[keep].astype(np.float64)
+            w_raw = np.power(np.maximum(1.0, d_all), -power)
+            r_sums = np.bincount(r_all, weights=w_raw, minlength=n)
+            w_norm = w_raw / np.maximum(1e-18, r_sums[r_all])
+            W = csr_matrix((w_norm, (r_all, c_all)), shape=(n, n), dtype=np.float64)
+            islands = np.where(r_sums <= 1e-12)[0].astype(int).tolist()
+        else:
+            W = csr_matrix((n, n), dtype=np.float64)
+            islands = list(range(n))
+        meta_extra["cutoff_m"] = round(d_cut, 2)
+        meta_extra["power"] = power
+        meta_extra["profile"] = profile
     else:
         raise ValueError(f"Unsupported weight type: {w_type}")
 
-    W = csr_matrix((vals, (rows, cols)), shape=(n, n), dtype=np.float64)
+    if W is None:
+        W = csr_matrix((vals, (rows, cols)), shape=(n, n), dtype=np.float64)
 
     # Audit co-located neighbor pairs (d_ij <= 0.5 m)
     coo = W.tocoo()
@@ -244,10 +283,10 @@ def build_spatial_weight_matrix(
     max_nbr = int(np.max(row_nnz)) if n > 0 else 0
     pct_nonzero = float(n_edges / (n * n) * 100.0) if n > 0 else 0.0
 
-    # Cache eigenvalues on W for Tier 1 (N <= 1500)
+    # Cache exact eigenvalues on W for Tier 1 (N <= 500, eliminating N=1500 dense cliff even with islands)
     eigvals: Optional[np.ndarray] = None
-    if n <= 1500 and len(islands) == 0:
-        if is_symmetric_base:
+    if n <= 500 and float(W.sum()) > 1e-12:
+        if is_symmetric_base and len(islands) == 0:
             # Similarity transform D^{-1/2} A D^{-1/2} = sqrt(W * W^T) yields exact real eigenvalues via eigh!
             W_dense = W.toarray()
             W_sym = np.sqrt(np.maximum(0.0, W_dense * W_dense.T))
@@ -330,8 +369,10 @@ def compute_moran_i(
 
     z = vec - float(np.mean(vec))
     z_ss = float(z @ z)
+    if s0 <= 1e-12:
+        return {"moran_i": 0.0, "expected_i": 0.0, "se": 0.0, "z": 0.0, "p": 1.0, "sig": "", "moments_mode": "empty_graph", "empty_graph": True}
     if z_ss < 1e-18:
-        return {"moran_i": 0.0, "expected_i": -1.0 / max(1.0, n - 1.0), "z": 0.0, "p": 1.0, "sig": "", "moments_mode": "cliff_ord_randomization"}
+        return {"moran_i": 0.0, "expected_i": -1.0 / max(1.0, n - 1.0), "se": 0.0, "z": 0.0, "p": 1.0, "sig": "", "moments_mode": "cliff_ord_randomization"}
 
     wz = W @ z
     moran_i = (n / max(1e-12, s0)) * float(z @ wz) / z_ss
@@ -548,47 +589,196 @@ def _rho_bounds(w_obj: Dict[str, Any]) -> Tuple[float, float]:
 def _compute_trace_moments(rho: float, w_obj: Dict[str, Any], n_probes: int = 64) -> Tuple[float, float, float]:
     """
     Compute T1 = tr(G), T2 = tr(G^2), and T3 = tr(G^T G) where G = W (I - rho W)^{-1},
-    without dense N x N inversion in Tier 2.
+    using exact dense solve for N <= 500 and symmetrized Hutchinson tr((G+G^T)^2)/2 >= 0 for Tier 2.
     """
     W: csr_matrix = w_obj["W"]
     n = w_obj["n"]
     eigvals = w_obj.get("eigvals")
-    if eigvals is not None:
+    if eigvals is not None and n <= 500:
         g_eigs = eigvals / (1.0 - rho * eigvals)
         tr_g = float(np.sum(np.real(g_eigs)))
         tr_g2 = float(np.sum(np.real(g_eigs * g_eigs)))
-        if n <= 800:
-            A = np.eye(n) - rho * W.toarray()
-            G = np.linalg.solve(A, W.toarray())
-            tr_gtg = float(np.sum(G * G))
-        else:
-            # Hutchinson probe with exact sparse solve
-            rng = np.random.default_rng(123)
-            V = rng.choice([-1.0, 1.0], size=(n, n_probes))
-            lu = splu((speye(n, format="csc") - rho * W.tocsc()), permc_spec="MMD_AT_PLUS_A")
-            GV = lu.solve(W @ V)
-            tr_gtg = float(np.mean(np.sum(GV * GV, axis=0)))
+        A = np.eye(n) - rho * W.toarray()
+        G = np.linalg.solve(A, W.toarray())
+        tr_gtg = float(np.sum(G * G))
         return tr_g, tr_g2, tr_gtg
 
-    # Tier 2: sparse splu + Hutchinson probes
+    # Tier 2 (N > 500): sparse splu + symmetrized Hutchinson probes (guarantees tr(G^2 + G^T G) >= 0)
     lu = splu((speye(n, format="csc") - rho * W.tocsc()), permc_spec="MMD_AT_PLUS_A")
     rng = np.random.default_rng(123)
     V = rng.choice([-1.0, 1.0], size=(n, n_probes))
-    WV = W @ V
-    GV = lu.solve(WV)
-    G2V = lu.solve(W @ GV)
+    GV = lu.solve(W @ V)
+    GTV = lu.solve(W.T @ V, trans="T")
     tr_g = float(np.mean(np.sum(V * GV, axis=0)))
-    tr_g2 = float(np.mean(np.sum(V * G2V, axis=0)))
-    tr_gtg = float(np.mean(np.sum(GV * GV, axis=0)))
-    return tr_g, tr_g2, tr_gtg
+    sym_norm_sq = 0.5 * float(np.mean(np.sum((GV + GTV) ** 2, axis=0)))
+    return tr_g, 0.5 * sym_norm_sq, 0.5 * sym_norm_sq
+
+
+def compute_anselin_kelejian_test(
+    resid: np.ndarray,
+    w_obj: Dict[str, Any],
+    X: np.ndarray,
+    rho_hat: float,
+    vcov_rho: float,
+    g_mat: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """
+    Anselin & Kelejian (1997) / Rao-Score residual spatial autocorrelation test for SAR & SDM,
+    accounting for both X (or [X, WX]) projection M_X and endogenous spatial lag estimation.
+    """
+    W: csr_matrix = w_obj["W"]
+    n_int = int(w_obj["n"])
+    n = float(n_int)
+    s0 = float(W.sum())
+    z = np.asarray(resid, dtype=np.float64)
+    z_ss = float(z @ z)
+    if s0 <= 1e-12 or z_ss < 1e-18 or n_int <= X.shape[1] + 2:
+        return {"moran_i": 0.0, "expected_i": 0.0, "se": 0.0, "z": 0.0, "p": 1.0, "sig": "", "moments_mode": "anselin_kelejian_1997"}
+
+    u, s_vals, _ = np.linalg.svd(X, full_matrices=False)
+    tol = 1e-10 * (s_vals[0] if len(s_vals) > 0 else 1.0)
+    q_mat = u[:, s_vals > tol]
+    r_rank = q_mat.shape[1]
+    df = max(1, n_int - r_rank)
+
+    wz = W @ z
+    moran_i = (n / s0) * float(z @ wz) / z_ss
+
+    wq = W @ q_mat
+    tr_w = float(W.diagonal().sum())
+    tr_mw = tr_w - float(np.sum(q_mat * wq))
+    ei = (n / (s0 * df)) * tr_mw
+
+    a_mat = 0.5 * (W + W.T)
+    aq = a_mat @ q_mat
+    tr_a2 = float(a_mat.multiply(a_mat).sum())
+    tr_qa2q = float(np.sum(aq * aq))
+    qaq = q_mat.T @ aq
+    tr_qaq2 = float(np.sum(qaq * qaq))
+    tr_mama = max(1e-12, tr_a2 - 2.0 * tr_qa2q + tr_qaq2)
+    ei2 = ((n / s0) ** 2) * (tr_mw * tr_mw + 2.0 * tr_mama) / (df * (df + 2.0))
+    var_mx = max(1e-15, ei2 - ei * ei)
+
+    # Rao-Score / Anselin-Kelejian variance reduction due to ML estimation of rho (T_{rho,lam} = tr(M_X (W+W^T) G))
+    if g_mat is not None and n_int <= 500:
+        wwt = (W + W.T).toarray()
+        wg = wwt @ g_mat
+        t_rho_lam = float(np.trace(wg)) - float(np.sum(q_mat * (wg @ q_mat)))
+    else:
+        lu = splu((speye(n_int, format="csc") - rho_hat * W.tocsc()), permc_spec="MMD_AT_PLUS_A")
+        rng = np.random.default_rng(77)
+        vp = rng.choice([-1.0, 1.0], size=(n_int, 48))
+        mvp = vp - q_mat @ (q_mat.T @ vp)
+        wgp = (W + W.T) @ lu.solve(W @ vp)
+        t_rho_lam = float(np.mean(np.sum(mvp * wgp, axis=0)))
+
+    # Scale covariance reduction cleanly onto Moran's I units (factor (n / (S0 * n)) = 1 / S0 -> in normalized units T_rl^2 * Var(rho) / (2 * S0^2))
+    # Note score I_{lam,lam} = tr((W+W^T)W) = 2 * tr(A^2) -> in Moran units, variance subtraction is (t_rho_lam^2 * vcov_rho) * (var_mx / (4 * tr_mama))
+    ak_frac = max(0.15, 1.0 - ((t_rho_lam * t_rho_lam * max(0.0, vcov_rho)) / max(1e-12, 4.0 * tr_mama)))
+    var_ak = max(1e-15, var_mx * ak_frac)
+    z_stat = (moran_i - ei) / math.sqrt(var_ak)
+    p_val = float(2.0 * stats.norm.sf(abs(z_stat)))
+
+    return {
+        "moran_i": round(float(moran_i), 4),
+        "expected_i": round(float(ei), 4),
+        "se": round(math.sqrt(var_ak), 4),
+        "z": round(float(z_stat), 3),
+        "p": round(p_val, 5),
+        "sig": _sig_stars(p_val),
+        "moments_mode": "anselin_kelejian_1997",
+    }
+
+
+def _compute_qml_sandwich(
+    info_mat: np.ndarray,
+    X_like: np.ndarray,
+    u_vec: np.ndarray,
+    sigma2: float,
+    rho_hat: float,
+    W: csr_matrix,
+    g_xb: Optional[np.ndarray],
+    G_dense: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Compute Kelejian-Prucha / White heteroskedasticity-robust QML sandwich V_QML = H^{-1} J H^{-1}
+    for SAR, SDM, and SEM Gaussian ML estimators.
+    """
+    n, k = X_like.shape
+    inv_h = np.linalg.pinv(info_mat)
+    df_scale = float(n) / max(1.0, float(n - k - 1))
+    u2 = u_vec * u_vec
+    sig_i_sq = df_scale * u2
+    s2_inv = 1.0 / max(1e-18, sigma2)
+    s4_inv = s2_inv * s2_inv
+    diff_u2 = u2 - sigma2
+
+    # Score variance-covariance J of dimension (k + 2, k + 2)
+    J = np.zeros_like(info_mat)
+    Xw = X_like * sig_i_sq[:, None]
+    J[:k, :k] = (Xw.T @ X_like) * s4_inv
+
+    # Symmetric G_tilde = Sigma^{1/2} G Sigma^{1/2} quadratic trace tr(Sigma G Sigma G + Sigma G Sigma G^T)
+    s_rt = np.sqrt(np.maximum(0.0, sig_i_sq))
+    if G_dense is not None and n <= 500:
+        G_tilde = s_rt[:, None] * G_dense * s_rt[None, :]
+        quad_tr = 0.5 * float(np.sum((G_tilde + G_tilde.T) ** 2))
+        g_diag = np.diag(G_dense)
+    else:
+        lu = splu((speye(n, format="csc") - rho_hat * W.tocsc()), permc_spec="MMD_AT_PLUS_A")
+        rng = np.random.default_rng(321)
+        vp = rng.choice([-1.0, 1.0], size=(n, 64))
+        sv = s_rt[:, None] * vp
+        GV_q = s_rt[:, None] * lu.solve(W @ sv)
+        GTV_q = s_rt[:, None] * lu.solve(W.T @ sv, trans="T")
+        quad_tr = 0.5 * float(np.mean(np.sum((GV_q + GTV_q) ** 2, axis=0)))
+        tr_g_approx = float(np.mean(np.sum(vp * lu.solve(W @ vp), axis=0)))
+        g_diag = np.full(n, tr_g_approx / max(1, n), dtype=np.float64)
+
+    lin_rho_sig = 0.0
+    if g_xb is not None:
+        J[:k, k] = (Xw.T @ g_xb) * s4_inv
+        # Add 3rd-moment cross-covariance E[u_i^3] * X_i * G_ii
+        u3_gdiag = (u_vec * u2) * g_diag
+        J[:k, k] += (X_like.T @ u3_gdiag) * s4_inv * df_scale
+        J[k, :k] = J[:k, k]
+        lin_rho = float(g_xb @ (sig_i_sq * g_xb))
+        lin_rho_sig = float(g_xb @ (u_vec * diff_u2))
+    else:
+        u3_gdiag = (u_vec * u2) * g_diag
+        J[:k, k] = (X_like.T @ u3_gdiag) * s4_inv * df_scale
+        J[k, :k] = J[:k, k]
+        lin_rho = 0.0
+
+    J[k, k] = (lin_rho + quad_tr) * s4_inv
+    # Cross and diagonal terms with sigma^2 score = 0.5 / sigma^4 * (u_i^2 - sigma^2)
+    s6_inv = s4_inv * s2_inv
+    s8_inv = s4_inv * s4_inv
+    J[:k, k + 1] = 0.5 * (X_like.T @ (u_vec * diff_u2)) * s6_inv * df_scale
+    J[k + 1, :k] = J[:k, k + 1]
+    J[k, k + 1] = 0.5 * (lin_rho_sig + float(np.sum(g_diag * (diff_u2 ** 2)))) * s6_inv * df_scale
+    J[k + 1, k] = J[k, k + 1]
+    J[k + 1, k + 1] = 0.25 * float(np.sum(diff_u2 ** 2)) * s8_inv * df_scale
+
+    J = 0.5 * (J + J.T)
+    ev, evec = np.linalg.eigh(J)
+    if np.min(ev) < 0.0:
+        ev = np.maximum(0.0, ev)
+        J = (evec * ev[None, :]) @ evec.T
+
+    vcov_qml = inv_h @ J @ inv_h
+    if not np.all(np.isfinite(vcov_qml)):
+        return inv_h, G_dense
+    return vcov_qml, G_dense
 
 
 def _fit_ml_sar_core(
     X: np.ndarray,
     y: np.ndarray,
     w_obj: Dict[str, Any],
+    se_mode: str = "qml",
 ) -> Dict[str, Any]:
-    """Pre-concentrated Maximum Likelihood SAR estimator (Ord 1975 / Anselin 1988)."""
+    """Pre-concentrated Maximum Likelihood SAR estimator (Ord 1975 / Anselin 1988) with optional QML sandwich SEs."""
     W: csr_matrix = w_obj["W"]
     n, k = X.shape
     wy = W @ y
@@ -617,16 +807,19 @@ def _fit_ml_sar_core(
     e_hat = e0 - rho_hat * e1
     sigma2 = max(1e-18, float(e_hat @ e_hat) / n)
 
-    # Exact asymptotic covariance matrix of (beta, rho, sigma2)
+    # Exact asymptotic information matrix of (beta, rho, sigma2)
     tr_g, tr_g2, tr_gtg = _compute_trace_moments(rho_hat, w_obj)
     x_beta = X @ beta_hat
-    # G (X beta) = (I - rho W)^{-1} W (X beta)
-    if n <= 1500:
+    G_dense: Optional[np.ndarray] = None
+    if n <= 500:
         A_dense = np.eye(n) - rho_hat * W.toarray()
-        g_xb = np.linalg.solve(A_dense, W @ x_beta)
+        G_dense = np.linalg.solve(A_dense, W.toarray())
+        g_xb = G_dense @ x_beta
+        yhat_red = np.linalg.solve(A_dense, x_beta)
     else:
         lu = splu((speye(n, format="csc") - rho_hat * W.tocsc()), permc_spec="MMD_AT_PLUS_A")
         g_xb = lu.solve(W @ x_beta)
+        yhat_red = lu.solve(x_beta)
 
     info_mat = np.zeros((k + 2, k + 2), dtype=np.float64)
     info_mat[:k, :k] = (X.T @ X) / sigma2
@@ -637,16 +830,15 @@ def _fit_ml_sar_core(
     info_mat[k + 1, k] = info_mat[k, k + 1]
     info_mat[k + 1, k + 1] = n / (2.0 * sigma2 * sigma2)
 
-    vcov_full = np.linalg.pinv(info_mat)
+    use_qml = str(se_mode).lower() == "qml"
+    if use_qml:
+        vcov_full, _ = _compute_qml_sandwich(info_mat, X, e_hat, sigma2, rho_hat, W, g_xb=g_xb, G_dense=G_dense)
+    else:
+        vcov_full = np.linalg.pinv(info_mat)
+
     vcov_br = vcov_full[: k + 1, : k + 1]
     se_br = np.sqrt(np.maximum(0.0, np.diag(vcov_br)))
 
-    # Pseudo R^2 = Corr(y, yhat_reduced)^2 and Nagelkerke/squared corr
-    if n <= 1500:
-        yhat_red = np.linalg.solve(np.eye(n) - rho_hat * W.toarray(), x_beta)
-    else:
-        lu = splu((speye(n, format="csc") - rho_hat * W.tocsc()), permc_spec="MMD_AT_PLUS_A")
-        yhat_red = lu.solve(x_beta)
     pseudo_r2 = float(np.corrcoef(y, yhat_red)[0, 1] ** 2) if np.std(yhat_red) > 1e-12 else 0.0
 
     k_total = k + 2  # beta + rho + sigma2
@@ -659,12 +851,15 @@ def _fit_ml_sar_core(
         "se_beta": se_br[:k],
         "se_rho": float(se_br[k]),
         "vcov_beta_rho": vcov_br,
+        "g_xb": g_xb,
+        "G_dense": G_dense,
         "sigma2": sigma2,
         "llf": ll_hat,
         "aic": aic,
         "bic": bic,
         "pseudo_r2": pseudo_r2,
         "resid": e_hat,
+        "se_mode": "qml" if use_qml else "ml",
         "n": n,
         "k": k,
     }
@@ -674,8 +869,9 @@ def fit_ml_sem(
     X: np.ndarray,
     y: np.ndarray,
     w_obj: Dict[str, Any],
+    se_mode: str = "qml",
 ) -> Dict[str, Any]:
-    """Pre-concentrated Maximum Likelihood Spatial Error Model (SEM: y = Xb + u, u = lam Wu + e)."""
+    """Pre-concentrated Maximum Likelihood Spatial Error Model (SEM) with optional QML sandwich SEs."""
     W: csr_matrix = w_obj["W"]
     n, k = X.shape
     wx = W @ X
@@ -699,7 +895,6 @@ def fit_ml_sem(
         A = xtx - lam * (xtwx + xtwx.T) + (lam * lam) * wxtwx
         b = xty - lam * (xtwy + wxty) + (lam * lam) * wxtwy
         beta_l = np.linalg.solve(A + 1e-12 * np.eye(k), b)
-        # Filtered residual norm ||(I - lam W)(y - X beta)||^2
         sse_y = yty - 2.0 * lam * ytwy + (lam * lam) * wytwy
         sse = max(1e-18, float(sse_y - 2.0 * float(beta_l @ b) + float(beta_l @ A @ beta_l)))
         log_det = _log_det_i_minus_rho_w(lam, w_obj)
@@ -721,17 +916,25 @@ def fit_ml_sem(
     info_mat[k + 1, k] = info_mat[k, k + 1]
     info_mat[k + 1, k + 1] = n / (2.0 * sigma2 * sigma2)
 
-    vcov_full = np.linalg.pinv(info_mat)
-    se_all = np.sqrt(np.maximum(0.0, np.diag(vcov_full)))
-
     yhat = X @ beta_hat
+    u_hat = y - yhat
+    e_hat = u_hat - lam_hat * (W @ u_hat)
+
+    use_qml = str(se_mode).lower() == "qml"
+    if use_qml:
+        X_filt = X - lam_hat * wx
+        G_dense: Optional[np.ndarray] = None
+        if n <= 500:
+            G_dense = np.linalg.solve(np.eye(n) - lam_hat * W.toarray(), W.toarray())
+        vcov_full, _ = _compute_qml_sandwich(info_mat, X_filt, e_hat, sigma2, lam_hat, W, g_xb=None, G_dense=G_dense)
+    else:
+        vcov_full = np.linalg.pinv(info_mat)
+
+    se_all = np.sqrt(np.maximum(0.0, np.diag(vcov_full)))
     pseudo_r2 = float(np.corrcoef(y, yhat)[0, 1] ** 2) if np.std(yhat) > 1e-12 else 0.0
     k_total = k + 2
     aic = 2.0 * k_total - 2.0 * ll_hat
     bic = k_total * math.log(n) - 2.0 * ll_hat
-
-    u_hat = y - yhat
-    e_hat = u_hat - lam_hat * (W @ u_hat)
 
     return {
         "beta": beta_hat,
@@ -744,6 +947,7 @@ def fit_ml_sem(
         "bic": bic,
         "pseudo_r2": pseudo_r2,
         "resid": e_hat,
+        "se_mode": "qml" if use_qml else "ml",
         "n": n,
         "k": k,
     }
@@ -891,6 +1095,45 @@ def compute_lesage_pace_impacts(
     return impacts_out
 
 
+def _build_spatial_params_table(
+    param_names: List[str],
+    est: np.ndarray,
+    se: np.ndarray,
+    spatial_name: Optional[str] = None,
+    spatial_est: Optional[float] = None,
+    spatial_se: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if spatial_name is not None and spatial_est is not None and spatial_se is not None:
+        s_se = max(1e-12, float(spatial_se))
+        s_z = float(spatial_est) / s_se
+        s_p = float(2.0 * stats.norm.sf(abs(s_z)))
+        rows.append({
+            "name": spatial_name,
+            "est": round(float(spatial_est), 4),
+            "se": round(float(s_se), 4),
+            "z": round(s_z, 3),
+            "p": round(s_p, 5),
+            "sig": _sig_stars(s_p),
+        })
+    for idx, pname in enumerate(param_names):
+        if idx >= len(est) or idx >= len(se):
+            break
+        b_i = float(est[idx])
+        se_i = max(1e-12, float(se[idx]))
+        z_i = b_i / se_i
+        p_i = float(2.0 * stats.norm.sf(abs(z_i)))
+        rows.append({
+            "name": pname,
+            "est": round(b_i, 4),
+            "se": round(float(se[idx]), 4),
+            "z": round(z_i, 3),
+            "p": round(p_i, 5),
+            "sig": _sig_stars(p_i),
+        })
+    return rows
+
+
 def run_spatial_pipeline(
     X: np.ndarray,
     y: np.ndarray,
@@ -899,28 +1142,58 @@ def run_spatial_pipeline(
     w_configs: List[Dict[str, Any]],
     krinsky_robb_draws: int = 1000,
     lisa_fdr: bool = True,
+    se_mode: str = "qml",
+    net_dist_mats: Optional[Dict[str, csr_matrix]] = None,
 ) -> Dict[str, Any]:
     """
     Guard #5 Full Spatial Econometrics Pipeline:
-    - Builds all configured W matrices (multi-matrix robustness)
+    - Builds all configured W matrices (multi-matrix robustness, including network_idw W_net)
     - Computes Moran's I, FDR-LISA, Anselin LM decision tree
-    - Estimates ML SAR, SEM, SDM + Elhorst Common-Factor LR/Wald tests
+    - Estimates ML SAR, SEM, SDM + Elhorst Common-Factor tests with QML or ML SEs
+    - Uses Anselin-Kelejian (1997) residual diagnostics on SAR/SDM and returns full parameter tables
     - Computes Krinsky-Robb LeSage-Pace impacts
     """
+    use_se_mode = "ml" if str(se_mode).lower() == "ml" else "qml"
     ols = fit_ols_core(X, y, cov_type="HC3")
-    w_objs = [build_spatial_weight_matrix(coords_xy, cfg) for cfg in w_configs]
+    nd_map = net_dist_mats or {}
+    w_objs = []
+    for cfg in w_configs:
+        nd_mat = nd_map.get(cfg.get("id", ""))
+        if nd_mat is None:
+            nd_mat = nd_map.get(cfg.get("profile", "walk"))
+        w_objs.append(build_spatial_weight_matrix(coords_xy, cfg, net_dist_mat=nd_mat))
     primary_w = w_objs[0]
 
-    # Moran's I on y and OLS residuals (using exact Cliff-Ord M_X moments for OLS residuals)
+    # Guard all-island empty spatial weights graph cleanly (no spurious rho=0.99!)
+    if float(primary_w["W"].sum()) <= 1e-12:
+        return {
+            "ok": False,
+            "reason": (
+                f"A primer térbeli súlymátrix ('{primary_w['id']}') üres (100% sziget-megfigyelés, S0 = 0). "
+                "Növeld a cutoff-sugarat vagy válassz másik W mátrixot."
+            ),
+            "primary_w_id": primary_w["id"],
+        }
+
+    # Moran's I on y and OLS residuals (using exact M_X moments for OLS residuals)
     moran_y = compute_moran_i(y, primary_w)
     moran_resid = compute_moran_i(ols["resid"], primary_w, X=X)
     lisa_y = compute_lisa(y, primary_w, use_fdr=lisa_fdr)
     lisa_resid = compute_lisa(ols["resid"], primary_w, use_fdr=lisa_fdr)
     anselin = compute_anselin_lm_tests(X, y, primary_w)
 
-    # Fit SAR, SEM, and SDM on primary W
-    sar_res = _fit_ml_sar_core(X, y, primary_w)
-    sem_res = fit_ml_sem(X, y, primary_w)
+    # Fit SAR & SEM on primary W
+    sar_res = _fit_ml_sar_core(X, y, primary_w, se_mode=use_se_mode)
+    sem_res = fit_ml_sem(X, y, primary_w, se_mode=use_se_mode)
+    sar_ak = compute_anselin_kelejian_test(
+        sar_res["resid"],
+        primary_w,
+        X,
+        sar_res["rho"],
+        float(sar_res["vcov_beta_rho"][-1, -1]),
+        g_mat=sar_res.get("G_dense"),
+    )
+    sem_resid_moran = compute_moran_i(sem_res["resid"], primary_w)
 
     # Spatial Durbin Model: y = rho Wy + X beta + W X_{-0} theta + eps
     W_prim: csr_matrix = primary_w["W"]
@@ -928,11 +1201,13 @@ def run_spatial_pipeline(
     k_no_int = X_no_int.shape[1]
     WX_no_int = W_prim @ X_no_int
     X_sdm = np.column_stack([X, WX_no_int])
+    sdm_col_names = list(col_names) + [f"W*{cname}" for cname in col_names[1:]]
     sdm_underdetermined = X.shape[0] <= X_sdm.shape[1] + 2
-    guard5_alerts = []
+    guard5_alerts: List[str] = []
 
     if sdm_underdetermined:
         sdm_res = None
+        sdm_ak = None
         lr_sar = None
         p_lr_sar = None
         lr_sem = None
@@ -950,13 +1225,19 @@ def run_spatial_pipeline(
             "SDM estimation and SDM LeSage-Pace impacts were skipped."
         )
     else:
-        sdm_res = _fit_ml_sar_core(X_sdm, y, primary_w)
+        sdm_res = _fit_ml_sar_core(X_sdm, y, primary_w, se_mode=use_se_mode)
+        sdm_ak = compute_anselin_kelejian_test(
+            sdm_res["resid"],
+            primary_w,
+            X_sdm,
+            sdm_res["rho"],
+            float(sdm_res["vcov_beta_rho"][-1, -1]),
+            g_mat=sdm_res.get("G_dense"),
+        )
 
         # Elhorst Common-Factor Tests on SDM:
-        # 1) H0: theta = 0 (SDM vs SAR) -> LR test (and Wald)
         lr_sar = max(0.0, 2.0 * (sdm_res["llf"] - sar_res["llf"]))
         p_lr_sar = float(stats.chi2.sf(lr_sar, df=max(1, k_no_int)))
-        # 2) H0: theta + rho * beta = 0 (SDM vs SEM) -> LR test (and Wald)
         lr_sem = max(0.0, 2.0 * (sdm_res["llf"] - sem_res["llf"]))
         p_lr_sem = float(stats.chi2.sf(lr_sem, df=max(1, k_no_int)))
 
@@ -968,7 +1249,6 @@ def run_spatial_pipeline(
         elif p_lr_sar >= 0.05 and p_lr_sem >= 0.05:
             elhorst_verdict = f"Either SAR/SEM acceptable ({anselin['recommended_model']} via LM)"
 
-        # LeSage & Pace impacts on SAR and SDM
         impacts_sar = compute_lesage_pace_impacts(
             sar_res, primary_w, col_names, is_sdm=False, krinsky_robb_draws=krinsky_robb_draws
         )
@@ -976,11 +1256,43 @@ def run_spatial_pipeline(
             sdm_res, primary_w, col_names, is_sdm=True, n_x_no_int=k_no_int, krinsky_robb_draws=krinsky_robb_draws
         )
 
+    # Full parameter tables (SAR, SEM, SDM)
+    sar_params = _build_spatial_params_table(
+        col_names, sar_res["beta"], sar_res["se_beta"], "rho (W*y)", sar_res["rho"], sar_res["se_rho"]
+    )
+    sem_params = _build_spatial_params_table(
+        col_names, sem_res["beta"], sem_res["se_beta"], "lambda (W*u)", sem_res["lambda"], sem_res["se_lambda"]
+    )
+    sdm_params = (
+        _build_spatial_params_table(
+            sdm_col_names, sdm_res["beta"], sdm_res["se_beta"], "rho (W*y)", sdm_res["rho"], sdm_res["se_rho"]
+        )
+        if sdm_res is not None
+        else []
+    )
+
     # Multi-W Robustness Comparison across all configured W matrices
     weights_robustness: List[Dict[str, Any]] = []
     for w_o in w_objs:
-        sar_w = sar_res if w_o["id"] == primary_w["id"] else _fit_ml_sar_core(X, y, w_o)
-        sem_w = sem_res if w_o["id"] == primary_w["id"] else fit_ml_sem(X, y, w_o)
+        if float(w_o["W"].sum()) <= 1e-12:
+            weights_robustness.append({
+                "w_id": w_o["id"],
+                "w_type": w_o["type"],
+                "mean_neighbors": 0.0,
+                "islands": len(w_o["islands"]),
+                "colocated_pairs_pct": 0.0,
+                "empty_graph": True,
+                "moran_resid_i": None,
+                "moran_resid_p": None,
+                "anselin_verdict": "Üres gráf (100% sziget)",
+                "sar_rho": None, "sar_rho_se": None, "sar_rho_p": None, "sar_aic": None, "sar_pseudo_r2": None,
+                "sem_lambda": None, "sem_lambda_se": None, "sem_lambda_p": None, "sem_aic": None,
+            })
+            guard5_alerts.append(f"'{w_o['id']}' térbeli súlymátrix üres (S0=0); összehasonlítás kihagyva.")
+            continue
+
+        sar_w = sar_res if w_o["id"] == primary_w["id"] else _fit_ml_sar_core(X, y, w_o, se_mode=use_se_mode)
+        sem_w = sem_res if w_o["id"] == primary_w["id"] else fit_ml_sem(X, y, w_o, se_mode=use_se_mode)
         ans_w = anselin if w_o["id"] == primary_w["id"] else compute_anselin_lm_tests(X, y, w_o)
         mor_w = moran_resid if w_o["id"] == primary_w["id"] else compute_moran_i(ols["resid"], w_o, X=X)
         rho_se = max(1e-12, sar_w["se_rho"])
@@ -993,6 +1305,7 @@ def run_spatial_pipeline(
             "mean_neighbors": w_o["mean_neighbors"],
             "islands": len(w_o["islands"]),
             "colocated_pairs_pct": w_o["colocated_pairs_pct"],
+            "empty_graph": False,
             "moran_resid_i": mor_w["moran_i"],
             "moran_resid_p": mor_w["p"],
             "anselin_verdict": ans_w["verdict"],
@@ -1029,6 +1342,7 @@ def run_spatial_pipeline(
             "bic": round(float(ols_bic_ml), 2),
             "resid_moran_i": moran_resid["moran_i"],
             "resid_moran_p": moran_resid["p"],
+            "resid_moran_method": "ols_mx_exact",
         },
         {
             "model": f"SAR (ML, {primary_w['id']})",
@@ -1039,8 +1353,9 @@ def run_spatial_pipeline(
             "llf": round(float(sar_res["llf"]), 2),
             "aic": round(float(sar_res["aic"]), 2),
             "bic": round(float(sar_res["bic"]), 2),
-            "resid_moran_i": compute_moran_i(sar_res["resid"], primary_w)["moran_i"],
-            "resid_moran_p": compute_moran_i(sar_res["resid"], primary_w)["p"],
+            "resid_moran_i": sar_ak["moran_i"],
+            "resid_moran_p": sar_ak["p"],
+            "resid_moran_method": "anselin_kelejian_1997",
         },
         {
             "model": f"SEM (ML, {primary_w['id']})",
@@ -1051,12 +1366,13 @@ def run_spatial_pipeline(
             "llf": round(float(sem_res["llf"]), 2),
             "aic": round(float(sem_res["aic"]), 2),
             "bic": round(float(sem_res["bic"]), 2),
-            "resid_moran_i": compute_moran_i(sem_res["resid"], primary_w)["moran_i"],
-            "resid_moran_p": compute_moran_i(sem_res["resid"], primary_w)["p"],
+            "resid_moran_i": sem_resid_moran["moran_i"],
+            "resid_moran_p": sem_resid_moran["p"],
+            "resid_moran_method": "post_filter_diagnostic",
         },
     ]
 
-    if sdm_res is not None:
+    if sdm_res is not None and sdm_ak is not None:
         sdm_rho_z = sdm_res["rho"] / max(1e-12, sdm_res["se_rho"])
         sdm_rho_p = float(2.0 * stats.norm.sf(abs(sdm_rho_z)))
         model_comparison.append({
@@ -1068,12 +1384,13 @@ def run_spatial_pipeline(
             "llf": round(float(sdm_res["llf"]), 2),
             "aic": round(float(sdm_res["aic"]), 2),
             "bic": round(float(sdm_res["bic"]), 2),
-            "resid_moran_i": compute_moran_i(sdm_res["resid"], primary_w)["moran_i"],
-            "resid_moran_p": compute_moran_i(sdm_res["resid"], primary_w)["p"],
+            "resid_moran_i": sdm_ak["moran_i"],
+            "resid_moran_p": sdm_ak["p"],
+            "resid_moran_method": "anselin_kelejian_1997",
         })
     else:
         model_comparison.append({
-            "model": f"SDM (ML, {primary_w['id']}) — Underdetermined (N <= K+2)",
+            "model": f"SDM (ML, {primary_w['id']}) -- Underdetermined (N <= K_sdm+2)",
             "spatial_param": None,
             "spatial_se": None,
             "spatial_p": None,
@@ -1083,6 +1400,7 @@ def run_spatial_pipeline(
             "bic": None,
             "resid_moran_i": None,
             "resid_moran_p": None,
+            "resid_moran_method": None,
             "underdetermined": True,
         })
 
@@ -1100,6 +1418,8 @@ def run_spatial_pipeline(
     return {
         "ok": True,
         "primary_w_id": primary_w["id"],
+        "se_mode": use_se_mode,
+        "n_obs": int(n_obs_comp),
         "sdm_underdetermined": sdm_underdetermined,
         "moran_y": moran_y,
         "moran_resid": moran_resid,
@@ -1114,6 +1434,9 @@ def run_spatial_pipeline(
             "verdict": elhorst_verdict,
         },
         "model_comparison": model_comparison,
+        "sar_params": sar_params,
+        "sem_params": sem_params,
+        "sdm_params": sdm_params,
         "weights_robustness": weights_robustness,
         "impacts_sar": impacts_sar,
         "impacts_sdm": impacts_sdm,
