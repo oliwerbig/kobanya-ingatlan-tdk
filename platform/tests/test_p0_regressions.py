@@ -1210,4 +1210,90 @@ def test_golden_cross_city_replication_and_best_practice():
             assert "spatial/style_gwr_r2.qml" in zf.namelist()
 
 
+def test_qa_fixes_boxcox_scaling_and_robustness_focal():
+    """Verify geometric-mean Box-Cox scaling at negative lambda on large HUF/m2 prices and robustness focal spatial picking."""
+    rng = np.random.default_rng(20261126)
+    n = 45
+    lat = 47.48 + rng.uniform(-0.005, 0.005, n)
+    lon = 19.14 + rng.uniform(-0.006, 0.006, n)
+    area = rng.uniform(35.0, 90.0, n)
+    d_station = rng.uniform(80.0, 900.0, n)
+    # Realistic ~1.4e6 HUF/m^2 dependent variable where unscaled Box-Cox at lam=-2 would underflow
+    y_huf = 1.4e6 * np.exp(-0.004 * (area - 55.0) - 0.00025 * (d_station - 400.0) + rng.normal(0.0, 0.08, n))
+    cols = {
+        "id": list(range(1001, 1001 + n)),
+        "lat": lat.tolist(),
+        "lon": lon.tolist(),
+        "fajlagos_ar": y_huf.tolist(),
+        "alapterulet": area.tolist(),
+        "d_allomas": d_station.tolist(),
+    }
+
+    # 1. Exact negative boundary lambda=-2 on large magnitude y preserves O(1) variance and non-zero OLS R^2
+    y_bc_m2 = build_dependent_variable(cols, {"mode": "column", "num_col": "fajlagos_ar", "transform": "boxcox", "boxcox_lambda": -2.0})
+    assert float(np.std(y_bc_m2["y"])) > 1e-3
+    assert y_bc_m2["boxcox_info"]["scale_geom_mean"] > 1e5
+    X = np.column_stack([np.ones(n), area, d_station])
+    ols_bc = fit_ols_core(X, y_bc_m2["y"], cov_type="HC3")
+    assert ols_bc["r2"] > 0.2 and abs(ols_bc["beta"][1]) > 1e-4 and ols_bc["se"][1] > 1e-6
+
+    # 2. Exact Jacobian-adjusted LLF parity at lam=0 vs log and lam=1 vs raw
+    y_log = build_dependent_variable(cols, {"mode": "column", "num_col": "fajlagos_ar", "transform": "log"})
+    y_bc0 = build_dependent_variable(cols, {"mode": "column", "num_col": "fajlagos_ar", "transform": "boxcox", "boxcox_lambda": 0.0})
+    ols_log = fit_ols_core(X, y_log["y"], cov_type="HC3")
+    ols_bc0 = fit_ols_core(X, y_bc0["y"], cov_type="HC3")
+    llf_log = float(ols_log["llf"]) + float(np.sum(y_log["jacobian_log"]))
+    llf_bc0 = float(ols_bc0["llf"]) + float(np.sum(y_bc0["jacobian_log"]))
+    assert llf_log == pytest.approx(llf_bc0, abs=1e-6)
+
+    y_raw = build_dependent_variable(cols, {"mode": "column", "num_col": "fajlagos_ar", "transform": "raw"})
+    y_bc1 = build_dependent_variable(cols, {"mode": "column", "num_col": "fajlagos_ar", "transform": "boxcox", "boxcox_lambda": 1.0})
+    ols_raw = fit_ols_core(X, y_raw["y"], cov_type="HC3")
+    ols_bc1 = fit_ols_core(X, y_bc1["y"], cov_type="HC3")
+    llf_raw = float(ols_raw["llf"]) + float(np.sum(y_raw["jacobian_log"]))
+    llf_bc1 = float(ols_bc1["llf"]) + float(np.sum(y_bc1["jacobian_log"]))
+    assert llf_raw == pytest.approx(llf_bc1, abs=1e-6)
+
+    # 3. Robustness matrix selects focal spatial term (AD(...)) instead of covariate index 1 and stays non-degenerate
+    sess = GeoSpecSession()
+    sess.load_dataset(cols, "lat", "lon")
+    rec = {
+        "dataset_schema": {
+            "row_id_col": "id",
+            "lat_col": "lat",
+            "lon_col": "lon",
+            "y_spec": {"mode": "column", "num_col": "fajlagos_ar", "transform": "log"},
+            "cluster_spec": {"mode": "coordinate_radius", "radius_m": 15.0},
+            "selection_spec": {"enabled": False},
+        },
+        "spatial_targets": [
+            {"id": "metro", "name": "Metro CSV", "source": "csv_column", "csv_col": "d_allomas", "distance_modes": "network_dijkstra"}
+        ],
+        "guards_cfg": {"sparse_min_cell": 5, "common_sample_lock": True},
+        "models": [
+            {
+                "id": "m_ad",
+                "name": "M_AD",
+                "active": True,
+                "covariates": [{"col": "alapterulet", "type": "numeric", "transform": "raw"}],
+                "spatial_terms": [{"target_id": "metro", "metric": "net", "transform": "andersson_day", "cutoff_m": 500.0}],
+                "interactions": [],
+            }
+        ],
+        "spatial_engine": {"active_model_id": "m_ad"},
+    }
+    rob = sess.run_robustness_matrix(rec, run_id=1)
+    assert rob["ok"] is True
+    assert rob["focal_term"].startswith("AD(metro,")
+    assert len(rob["rows"]) == 6
+    bc_rows = [r for r in rob["rows"] if r["y_transform"] == "boxcox"]
+    assert len(bc_rows) == 2
+    for br in bc_rows:
+        assert math.isfinite(br["aic_y_scale"])
+        assert br["r2"] > 0.1
+        assert abs(br["focal_beta"]) > 1e-4
+        assert br["focal_se"] > 1e-5
+
+
+
 

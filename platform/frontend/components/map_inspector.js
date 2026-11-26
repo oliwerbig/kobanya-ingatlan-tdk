@@ -1,5 +1,5 @@
 /* Docked MapLibre GL Map, Dynamic Legend, Co-located Parcel Paginator, BBox/Snap Overlay & Bidirectional Plot Focus */
-import { translateVerdict } from "../utils/i18n.js";
+import { getLang, translateVerdict } from "../utils/i18n.js";
 import { escapeHtml, parseNumericScalar } from "../utils/sanitize.js";
 
 const LISA_COLORS = {
@@ -147,6 +147,24 @@ export class MapInspector {
         this._flushSources();
       }
     });
+
+    const containerEl = typeof document !== "undefined" ? document.getElementById(this.containerId) : null;
+    if (containerEl && typeof ResizeObserver !== "undefined") {
+      this._resizeObserver = new ResizeObserver(() => {
+        try {
+          this.map?.resize();
+        } catch (_) {}
+      });
+      this._resizeObserver.observe(containerEl);
+    }
+    if (typeof window !== "undefined") {
+      this._onWinResize = () => {
+        try {
+          this.map?.resize();
+        } catch (_) {}
+      };
+      window.addEventListener("resize", this._onWinResize);
+    }
   }
 
   _applyFitBounds(bounds) {
@@ -639,19 +657,28 @@ export class MapInspector {
       return;
     }
     el.style.display = "block";
-    const fmt = (v) => (Number.isFinite(v) ? (Math.abs(v) >= 1000 ? v.toLocaleString("hu-HU", { maximumFractionDigits: 0 }) : v.toFixed(3)) : "—");
+    const isEn = getLang() === "en";
+    const loc = isEn ? "en-US" : "hu-HU";
+    const fmt = (v) => {
+      if (!Number.isFinite(v)) return "—";
+      const av = Math.abs(v);
+      if (av >= 1e6) return `${(v / 1e6).toFixed(2)}M`;
+      if (av >= 1e4) return `${Math.round(v / 1e3)}k`;
+      if (av >= 1000) return Math.round(v).toLocaleString(loc);
+      return v.toFixed(3);
+    };
 
     if (this.layerMode === "snap_status") {
       el.innerHTML = `
-        <div><strong>Hálózati illesztés (Snap &amp; BBox)</strong></div>
+        <div><strong>${isEn ? "Network Snapping (Snap & BBox)" : "Hálózati illesztés (Snap &amp; BBox)"}</strong></div>
         ${
           stage1?.ok
             ? `<div class="legend-swatches">
                  <span class="legend-swatch"><span class="legend-dot" style="background:${SNAP_COLORS[0]};"></span>OK (${snapCounts?.[0] ?? 0})</span>
                  <span class="legend-swatch"><span class="legend-dot" style="background:${SNAP_COLORS[2]};"></span>Snap &gt; limit (${snapCounts?.[2] ?? 0})</span>
-                 <span class="legend-swatch"><span class="legend-dot" style="background:${SNAP_COLORS[1]};"></span>Elszigetelt (${snapCounts?.[1] ?? 0})</span>
+                 <span class="legend-swatch"><span class="legend-dot" style="background:${SNAP_COLORS[1]};"></span>${isEn ? "Isolated" : "Elszigetelt"} (${snapCounts?.[1] ?? 0})</span>
                </div>`
-            : `<div class="card-subtitle">Futtasd az 1. fázist a hálózati snap diagnosztikához.</div>`
+            : `<div class="card-subtitle">${isEn ? "Run Stage 1 for network snap diagnostics." : "Futtasd az 1. fázist a hálózati snap diagnosztikához."}</div>`
         }
       `;
       return;
@@ -660,14 +687,14 @@ export class MapInspector {
     if (this.layerMode === "lisa") {
       const cnt = stage4?.ok ? stage4.lisa_resid?.counts || {} : null;
       const items = [
-        ["HH", "Magas–Magas", LISA_COLORS.HH],
-        ["LL", "Alacsony–Alacsony", LISA_COLORS.LL],
-        ["HL", "Magas–Alacsony", LISA_COLORS.HL],
-        ["LH", "Alacsony–Magas", LISA_COLORS.LH],
-        ["NS", "Nem szign.", LISA_COLORS.NS],
+        ["HH", isEn ? "High-High" : "Magas–Magas", LISA_COLORS.HH],
+        ["LL", isEn ? "Low-Low" : "Alacsony–Alacsony", LISA_COLORS.LL],
+        ["HL", isEn ? "High-Low" : "Magas–Alacsony", LISA_COLORS.HL],
+        ["LH", isEn ? "Low-High" : "Alacsony–Magas", LISA_COLORS.LH],
+        ["NS", isEn ? "Non-sig." : "Nem szign.", LISA_COLORS.NS],
       ];
       el.innerHTML = `
-        <div><strong>LISA Reziduális Klaszterek</strong>${stage4?.ok ? (stage4.lisa_resid?.fdr_applied ? " (BH-FDR)" : " (p&lt;0.05)") : ""}</div>
+        <div><strong>${isEn ? "LISA Residual Clusters" : "LISA Reziduális Klaszterek"}</strong>${stage4?.ok ? (stage4.lisa_resid?.fdr_applied ? " (BH-FDR)" : " (p&lt;0.05)") : ""}</div>
         ${
           cnt
             ? `<div class="legend-swatches">${items
@@ -676,7 +703,7 @@ export class MapInspector {
                     `<span class="legend-swatch"><span class="legend-dot" style="background:${col};"></span>${k} (${cnt[k] ?? 0})</span>`
                 )
                 .join("")}</div>`
-            : `<div class="card-subtitle">Futtasd a 4. fázist a LISA klaszterekhez.</div>`
+            : `<div class="card-subtitle">${isEn ? "Run Stage 4 for LISA clusters." : "Futtasd a 4. fázist a LISA klaszterekhez."}</div>`
         }
       `;
       return;
@@ -684,12 +711,12 @@ export class MapInspector {
 
     if (this.layerMode === "ols_resid") {
       if (!activeOlsModel) {
-        el.innerHTML = `<div><strong>OLS Reziduumok</strong></div><div class="card-subtitle">Futtasd a 3. fázist.</div>`;
+        el.innerHTML = `<div><strong>${isEn ? "OLS Residuals" : "OLS Reziduumok"}</strong></div><div class="card-subtitle">${isEn ? "Run Stage 3." : "Futtasd a 3. fázist."}</div>`;
         return;
       }
       const lim = Math.max(Math.abs(minV), Math.abs(maxV), 1e-6);
       el.innerHTML = `
-        <div><strong>Reziduum (${escapeHtml(activeOlsModel.model_name || activeOlsModel.model_id)})</strong></div>
+        <div><strong>${isEn ? "Residual" : "Reziduum"} (${escapeHtml(activeOlsModel.model_name || activeOlsModel.model_id)})</strong></div>
         <div class="legend-ramp" style="background:linear-gradient(90deg, rgb(50,130,235), rgb(230,230,230), rgb(220,80,60));"></div>
         <div class="legend-ticks"><span>${fmt(-lim)}</span><span>0</span><span>+${fmt(lim)}</span></div>
       `;
@@ -698,11 +725,14 @@ export class MapInspector {
 
     if (this.layerMode === "gwr_beta") {
       if (!stage5?.ok) {
-        el.innerHTML = `<div><strong>GWR Lokális β̂ᵢ</strong></div><div class="card-subtitle">Futtasd az 5. fázist.</div>`;
+        el.innerHTML = `<div><strong>${isEn ? "GWR Local β̂ᵢ" : "GWR Lokális β̂ᵢ"}</strong></div><div class="card-subtitle">${isEn ? "Run Stage 5." : "Futtasd az 5. fázist."}</div>`;
         return;
       }
       const lim = Math.max(Math.abs(minV), Math.abs(maxV), 1e-6);
-      const maskNote = this.gwrMaskMode === "fdr" ? "Halvány: BY-FDR p_adj ≥ 0.05" : `Halvány: |t| < ${stage5.t_crit_nom || 1.96}`;
+      const maskNote =
+        this.gwrMaskMode === "fdr"
+          ? (isEn ? "Faded: BY-FDR p_adj ≥ 0.05" : "Halvány: BY-FDR p_adj ≥ 0.05")
+          : `${isEn ? "Faded" : "Halvány"}: |t| < ${stage5.t_crit_nom || 1.96}`;
       el.innerHTML = `
         <div><strong>GWR β̂(${escapeHtml(gwrVarName)})</strong></div>
         <div class="legend-ramp" style="background:linear-gradient(90deg, rgb(50,130,235), rgb(230,230,230), rgb(220,80,60));"></div>
@@ -712,7 +742,10 @@ export class MapInspector {
       return;
     }
 
-    const title = this.layerMode === "gwr_r2" ? "GWR Lokális R²" : "Megfigyelt célváltozó (y)";
+    const title =
+      this.layerMode === "gwr_r2"
+        ? (isEn ? "GWR Local R²" : "GWR Lokális R²")
+        : (isEn ? "Observed Target (y)" : "Megfigyelt célváltozó (y)");
     el.innerHTML = `
       <div><strong>${title}</strong></div>
       <div class="legend-ramp" style="background:linear-gradient(90deg, rgb(37,99,235), rgb(132,149,145), rgb(227,99,55));"></div>
@@ -750,26 +783,39 @@ export class MapInspector {
   renderPointInspector(obsIdx, info) {
     const el = document.getElementById(this.inspectorId);
     if (!el) return;
+    const isEn = getLang() === "en";
+    const loc = isEn ? "en-US" : "hu-HU";
     if (obsIdx === null || !info) {
-      el.innerHTML = `<div class="card-subtitle">Kattints bármely megfigyelési pontra a térképen (vagy Stage 3-ban a reziduális ábrán) a pontos távolságok, Dijkstra sétaútvonal, co-located csoport, reziduum, LISA és GWR adatokhoz.</div>`;
+      el.innerHTML = `<div class="card-subtitle">${
+        isEn
+          ? "Click any observation point on the map (or Stage 3 residual plot) to inspect exact distances, Dijkstra walking route, co-located cluster, residual, LISA, and GWR values."
+          : "Kattints bármely megfigyelési pontra a térképen (vagy Stage 3-ban a reziduális ábrán) a pontos távolságok, Dijkstra sétaútvonal, co-located csoport, reziduum, LISA és GWR adatokhoz."
+      }</div>`;
       return;
     }
 
     const route = info.route;
-    let detourTxt = `<span class="card-subtitle">Nincs aktív célpont útvonal-visszajátszáshoz</span>`;
+    let detourTxt = `<span class="card-subtitle">${isEn ? "No active target for route replay" : "Nincs aktív célpont útvonal-visszajátszáshoz"}</span>`;
     if (route && route.ok && route.inside_zero) {
-      detourTxt = `<span class="mono">Belső zóna (d<sub>eucl</sub>=0 m | d<sub>net</sub>=0 m | 0 perc)</span>`;
+      detourTxt = `<span class="mono">${isEn ? "Inside zone" : "Belső zóna"} (d<sub>eucl</sub>=0 m | d<sub>net</sub>=0 m | 0 ${isEn ? "min" : "perc"})</span>`;
     } else if (route && route.ok && route.dist_net_m !== null) {
-      const timeStr = route.travel_time_min != null ? ` | ~${escapeHtml(route.travel_time_min)} perc` : "";
+      const timeStr = route.travel_time_min != null ? ` | ~${escapeHtml(route.travel_time_min)} ${isEn ? "min" : "perc"}` : "";
       detourTxt = `<span class="mono">d<sub>eucl</sub>=${escapeHtml(route.dist_eucl_m)} m | d<sub>net</sub>=${escapeHtml(route.dist_net_m)} m | Δd=${escapeHtml(route.detour_m)} m${timeStr}</span>`;
     } else if (route && route.ok) {
-      const reasonMap = {
-        SNAP_EXCEEDED: "távolabb a hálózattól mint max_snap_m",
-        SNAP_DISCONNECTED: "szigetkomponens (nem elérhető célpont)",
-        SNAP_NO_GRAPH: "Dijkstra utcahálózat nincs betöltve",
-        SNAP_TARGET_EMPTY: "minden célpont elem kizárva",
-      };
-      const reasonLbl = reasonMap[route.snap_reason] || translateVerdict(route.snap_reason || "Dijkstra nem elérhető");
+      const reasonMap = isEn
+        ? {
+            SNAP_EXCEEDED: "farther from network than max_snap_m",
+            SNAP_DISCONNECTED: "island component (unreachable target)",
+            SNAP_NO_GRAPH: "Dijkstra street graph not loaded",
+            SNAP_TARGET_EMPTY: "all target features excluded",
+          }
+        : {
+            SNAP_EXCEEDED: "távolabb a hálózattól mint max_snap_m",
+            SNAP_DISCONNECTED: "szigetkomponens (nem elérhető célpont)",
+            SNAP_NO_GRAPH: "Dijkstra utcahálózat nincs betöltve",
+            SNAP_TARGET_EMPTY: "minden célpont elem kizárva",
+          };
+      const reasonLbl = reasonMap[route.snap_reason] || translateVerdict(route.snap_reason || (isEn ? "Dijkstra unavailable" : "Dijkstra nem elérhető"));
       detourTxt = `<span class="mono">d<sub>eucl</sub>=${escapeHtml(route.dist_eucl_m)} m (${escapeHtml(reasonLbl)})</span>`;
     }
 
@@ -778,10 +824,10 @@ export class MapInspector {
     const clusterBar =
       group.length > 1
         ? `<div style="display:flex;align-items:center;justify-content:space-between;background:var(--surface-alt);border:1px solid var(--border);border-radius:6px;padding:4px 8px;margin-bottom:6px;font-size:11px;">
-             <span>🏢 Épületben / azonos ponton <strong>${group.length}</strong> megfigyelés — <strong>[${posInGroup + 1}/${group.length}]</strong></span>
+             <span>🏢 ${isEn ? `Co-located building/point: <strong>${group.length}</strong> observations` : `Épületben / azonos ponton <strong>${group.length}</strong> megfigyelés`} — <strong>[${posInGroup + 1}/${group.length}]</strong></span>
              <span style="display:flex;gap:4px;">
-               <button type="button" class="btn btn-sm" id="btnInspPrevCluster" aria-label="Előző co-located megfigyelés">◀</button>
-               <button type="button" class="btn btn-sm" id="btnInspNextCluster" aria-label="Következő co-located megfigyelés">▶</button>
+               <button type="button" class="btn btn-sm" id="btnInspPrevCluster" aria-label="${isEn ? "Previous co-located observation" : "Előző co-located megfigyelés"}">◀</button>
+               <button type="button" class="btn btn-sm" id="btnInspNextCluster" aria-label="${isEn ? "Next co-located observation" : "Következő co-located megfigyelés"}">▶</button>
              </span>
            </div>`
         : "";
@@ -794,13 +840,13 @@ export class MapInspector {
     el.innerHTML = `
       ${clusterBar}
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-        <strong>📍 Megfigyelés #${escapeHtml(info.row_id)} <span class="card-subtitle">(sor ${escapeHtml(obsIdx)})</span></strong>
-        <span class="mono">y = ${info.y_raw !== null && Number.isFinite(Number(info.y_raw)) ? Number(info.y_raw).toLocaleString("hu-HU", { maximumFractionDigits: 2 }) : "—"}</span>
+        <strong>📍 ${isEn ? "Observation" : "Megfigyelés"} #${escapeHtml(info.row_id)} <span class="card-subtitle">(${isEn ? "row" : "sor"} ${escapeHtml(obsIdx)})</span></strong>
+        <span class="mono">y = ${info.y_raw !== null && Number.isFinite(Number(info.y_raw)) ? Number(info.y_raw).toLocaleString(loc, { maximumFractionDigits: 2 }) : "—"}</span>
       </div>
       <div style="margin-bottom:5px;">${detourTxt}</div>
       <div class="grid-3" style="font-size:11px;">
-        <div><strong>OLS reziduum${info.modelLabel ? ` (${escapeHtml(info.modelLabel)})` : ""}:</strong> <span class="mono">${info.resid !== null ? escapeHtml(info.resid) : "—"}</span></div>
-        <div><strong>LISA klaszter:</strong> <span class="mono">${info.lisa ? escapeHtml(info.lisa) : "—"}</span></div>
+        <div><strong>${isEn ? "OLS residual" : "OLS reziduum"}${info.modelLabel ? ` (${escapeHtml(info.modelLabel)})` : ""}:</strong> <span class="mono">${info.resid !== null ? escapeHtml(info.resid) : "—"}</span></div>
+        <div><strong>${isEn ? "LISA cluster" : "LISA klaszter"}:</strong> <span class="mono">${info.lisa ? escapeHtml(info.lisa) : "—"}</span></div>
         <div><strong>GWR β̂/t/R²:</strong> <span class="mono">${info.gwr_beta !== null ? `${escapeHtml(info.gwr_beta)} (t=${escapeHtml(info.gwr_t)}, R²=${escapeHtml(info.gwr_r2 ?? "—")}, κ=${escapeHtml(info.gwr_kappa ?? "—")})` : "—"}</span></div>
       </div>
       ${covLine}

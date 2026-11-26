@@ -1153,7 +1153,7 @@ class GeoSpecSession:
         x_cond_mat[probe_design["valid_mask"]] = probe_design["X"]
         cond_mask = probe_design["valid_mask"]
 
-        focal_idx = next((i for i, m in enumerate(probe_design["col_meta"]) if m.get("kind") == "spatial"), None)
+        focal_idx = next((i for i, m in enumerate(probe_design["col_meta"]) if str(m.get("kind", "")).startswith("spatial")), None)
         if focal_idx is None:
             focal_idx = 1 if len(probe_design["col_meta"]) > 1 else 0
         focal_term = probe_design["col_meta"][focal_idx]["name"]

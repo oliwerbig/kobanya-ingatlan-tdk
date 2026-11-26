@@ -383,6 +383,10 @@ export function renderStage2(container, ctx) {
       }
       if (Number.isFinite(v)) yValsRaw.push(v);
     }
+    const posRaw = yValsRaw.filter((v) => v > 0);
+    const geomMeanY =
+      Number(s2.descriptives?.boxcox_info?.scale_geom_mean) ||
+      (posRaw.length ? Math.exp(posRaw.reduce((acc, v) => acc + Math.log(v), 0) / posRaw.length) : 1);
     const yValsTrans = yValsRaw
       .filter((v) => ySpec.transform === "raw" || (ySpec.transform === "log1p" ? v + (ySpec.log1p_shift ?? 1) > 0 : v > 0))
       .map((v) => {
@@ -390,7 +394,8 @@ export function renderStage2(container, ctx) {
         if (ySpec.transform === "log1p") return Math.log(v + (ySpec.log1p_shift ?? 1));
         if (ySpec.transform === "boxcox") {
           const lam = s2.descriptives?.boxcox_info?.lambda_used ?? ySpec.boxcox_lambda ?? 0;
-          return Math.abs(lam) < 1e-8 ? Math.log(v) : (Math.pow(v, lam) - 1) / lam;
+          const vs = v / (geomMeanY > 0 ? geomMeanY : 1);
+          return Math.abs(lam) < 1e-8 ? Math.log(vs) : (Math.pow(vs, lam) - 1) / lam;
         }
         return v;
       });

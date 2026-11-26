@@ -22,7 +22,7 @@ function walkJsFiles(dir, out = []) {
 
 test("sw.js PWA shell manifest, cache policy & asset existence on disk", () => {
   const swSrc = fs.readFileSync(path.join(PLATFORM_DIR, "sw.js"), "utf8");
-  assert.match(swSrc, /const CACHE_NAME = "geospec-wasm-v9"/);
+  assert.match(swSrc, /const CACHE_NAME = "geospec-wasm-v10"/);
   assert.match(swSrc, /event\.waitUntil\([\s\S]*?self\.skipWaiting\(\)/);
   assert.match(swSrc, /resp\.type\s*!==\s*"opaque"/);
   assert.match(swSrc, /ALLOWED_CDN_PREFIXES/);
@@ -218,4 +218,49 @@ print(json.dumps({"ok": bool(r1["ok"] and r2["ok"] and r3["ok"] and r4["ok"] and
   const parsed = JSON.parse(res.stdout.trim().split(/\r?\n/).at(-1));
   assert.equal(parsed.ok, true);
   assert.equal(parsed.rob_rows, 6);
+});
+
+test("Visual QA regressions: hidden banner, 4D est, i18n verdicts, toast/mobile CSS & Escape", async () => {
+  const css = fs.readFileSync(path.join(PLATFORM_DIR, "frontend", "styles", "theme.css"), "utf8");
+  const html = fs.readFileSync(path.join(PLATFORM_DIR, "index.html"), "utf8");
+  const s4Src = fs.readFileSync(path.join(PLATFORM_DIR, "frontend", "components", "stage4_5_spatial_gwr.js"), "utf8");
+  const appSrc = fs.readFileSync(path.join(PLATFORM_DIR, "frontend", "app.js"), "utf8");
+
+  // 1. Crash banner [hidden] & global [hidden] must win over display:flex; toast-stack must not occupy top-right header
+  assert.match(css, /\.worker-crash-banner\[hidden\][\s\S]*display:\s*none\s*!important/);
+  assert.match(css, /\[hidden\]\s*\{\s*display:\s*none\s*!important;/);
+  assert.doesNotMatch(css, /\.toast-stack\s*\{[^}]*top:\s*14px;\s*right:\s*14px;/);
+  assert.match(css, /\.stage-rail\s*\{[^}]*overflow-x:\s*auto/);
+  assert.match(css, /\.legend-ticks\s*\{[^}]*gap:\s*10px/);
+  assert.match(css, /@media\s*\(max-width:\s*720px\)[\s\S]*\.console-strip\s*\{/);
+
+  // 2. Dynamic wasmStatusText must not carry data-i18n="worker.booting"
+  assert.doesNotMatch(html, /id="wasmStatusText"[^>]*data-i18n="worker\.booting"/);
+
+  // 3. Stage 4D uses p.est (not broken p.beta) and 4C checks resid_moran_method
+  assert.match(s4Src, /p\.est\s*\?\?\s*p\.beta/);
+  assert.match(s4Src, /resid_moran_method/);
+
+  // 4. Stage 3C post_selection_note & Guard #6 warnings translate completely in HU without mixed English phrases
+  const i18nUrl = pathToFileURL(path.join(PLATFORM_DIR, "frontend", "utils", "i18n.js")).href;
+  const { setLang, translateVerdict } = await import(`${i18nUrl}?qa=${Date.now()}`);
+  setLang("hu");
+  const noteHu = translateVerdict(
+    "Profile-MLE cutoff c* maximizes likelihood over the grid; standard errors at c* treat c as fixed (post-selection inference caveat applies; inspect the 95% profile-likelihood CI)."
+  );
+  assert.doesNotMatch(noteHu, /over the grid|treat c as fixed|post-selection inference caveat/i);
+
+  const g6Hu = translateVerdict("Guard #6 pre-screened 3 low-prevalence dummies before GWR: d1 (min cell 5 < 20)");
+  assert.doesNotMatch(g6Hu, /pre-screened|low-prevalence|min cell/i);
+  assert.match(g6Hu, /min\. cella 5 < 20/);
+
+  setLang("en");
+  assert.equal(translateVerdict("Starting Pyodide..."), "Starting Pyodide...");
+  setLang("hu");
+  assert.equal(translateVerdict("Starting Pyodide..."), "Pyodide indítása...");
+
+  // 5. Escape handler & updateBootIndicator called on language switch + inspector refresh after Stages 3-5
+  assert.match(appSrc, /e\.key\s*===\s*"Escape"/);
+  assert.match(appSrc, /btnLangToggle[\s\S]*?updateBootIndicator/);
+  assert.match(appSrc, /refreshSelectedInspector\(\)/);
 });

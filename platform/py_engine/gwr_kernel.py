@@ -553,13 +553,13 @@ def fit_adaptive_gwr(
 
     if final_res.get("n_local_dropped_locs", 0) > 0:
         warnings.append(
-            f"Lokálisan invariáns dummy változók automatikusan kizárva {final_res['n_local_dropped_locs']}/{n} "
-            f"helyszínen a lokális szomszédságból (torzításmentes helyi becslés, Ridge-büntetés nélkül)."
+            f"Guard #6 locally excluded invariant dummy variables at {final_res['n_local_dropped_locs']}/{n} "
+            "locations (unbiased local fit without Ridge penalty)."
         )
     if final_res["n_regularized"] > 0:
         warnings.append(
-            f"Guard #6 Szelektív Ridge alkalmazva {final_res['n_regularized']}/{n} ({final_res['pct_regularized']}%) "
-            f"helyszínen a folytonos lokális kollinearitás miatt (κ > {kappa_thresh:g})."
+            f"Guard #6 Selective Ridge applied at {final_res['n_regularized']}/{n} ({final_res['pct_regularized']}%) "
+            f"locations due to continuous local collinearity (κ > {kappa_thresh:g})."
         )
 
     # Fast Monte Carlo spatial non-stationarity permutation test (at opt_bw)

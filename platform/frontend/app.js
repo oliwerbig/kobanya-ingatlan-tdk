@@ -58,7 +58,9 @@ const state = {
   stage4ParamKind: "sem",
   pipelineRunning: false,
   wasmStatus: "booting",
+  wasmRawMessage: "Starting Pyodide...",
   wasmMessage: "Pyodide indítása...",
+  lastInspectedRoute: null,
   logLine: "Várakozás saját CSV / GeoJSON adatbázis, recept vagy .geospec.json projekt betöltésére.",
 };
 
@@ -91,7 +93,14 @@ function setLog(msg) {
 
 function updateBootIndicator(status, message) {
   state.wasmStatus = status;
-  const localizedMsg = translateVerdict(message || "");
+  const fallbackRaw =
+    status === "ready"
+      ? "Pyodide NumPy+SciPy kernel ready"
+      : status === "error"
+        ? "WASM engine error"
+        : "Starting Pyodide...";
+  state.wasmRawMessage = message || fallbackRaw;
+  const localizedMsg = translateVerdict(state.wasmRawMessage);
   state.wasmMessage = localizedMsg;
   const dot = document.getElementById("wasmDot");
   const lbl = document.getElementById("wasmStatusText");
@@ -101,7 +110,7 @@ function updateBootIndicator(status, message) {
   if (lbl) lbl.textContent = localizedMsg;
   if (crashBanner) {
     crashBanner.hidden = status !== "error";
-    if (status === "error" && crashMsg && message) {
+    if (status === "error" && crashMsg && state.wasmRawMessage) {
       crashMsg.textContent = `${t("worker.crash_msg")} (${localizedMsg})`;
     }
   }
@@ -133,7 +142,7 @@ function parseGwrColIdx(rawVal) {
   return Number.isFinite(n) && n >= 0 ? n : 1;
 }
 
-function restyleMap() {
+function restyleMap(opts = {}) {
   const layerMode = document.getElementById("selMapLayer")?.value;
   const gwrColIdx = parseGwrColIdx(document.getElementById("selGwrVarLayer")?.value);
   const gwrMaskMode = document.getElementById("selGwrMaskMode")?.value || "fdr";
@@ -149,6 +158,9 @@ function restyleMap() {
     activeModelId: state.activeSpecId,
     routeTargetId,
   });
+  if (!opts.skipInspectorRefresh) {
+    actions.refreshSelectedInspector();
+  }
 }
 
 function resetAnalysisResults() {
@@ -161,6 +173,7 @@ function resetAnalysisResults() {
   state.staleStages.clear();
   state.stage3AdKey = "";
   state.stage3DiagModelId = "";
+  state.lastInspectedRoute = null;
 }
 
 function patchOsmListDom(targetId) {
@@ -985,22 +998,19 @@ const actions = {
     }
   },
 
-  async inspectObservation(obsIdx) {
-    const tgtId = document.getElementById("selRouteTarget")?.value || state.recipe.spatial_targets?.[0]?.id;
-    let route = null;
-    if (tgtId) {
-      try {
-        await dag.waitUntilReady();
-        route = await dag.call("get_single_route", { obs_idx: obsIdx, target_id: tgtId, recipe: state.recipe });
-        mapInspector.showRoute(route);
-      } catch {
-        route = null;
-      }
-    } else {
-      mapInspector.clearRoute();
+  refreshSelectedInspector() {
+    const obsIdx = mapInspector.selectedObsIdx;
+    if (obsIdx === null || obsIdx === undefined) {
+      mapInspector.renderPointInspector(null, null);
+      return;
     }
-
+    const tgtId = document.getElementById("selRouteTarget")?.value || state.recipe.spatial_targets?.[0]?.id || "";
+    const route =
+      state.lastInspectedRoute && state.lastInspectedRoute.obsIdx === obsIdx && state.lastInspectedRoute.tgtId === tgtId
+        ? state.lastInspectedRoute.route
+        : null;
     const feat = mapInspector.obsByIdx.get(Number(obsIdx)) || mapInspector.obsFeatures.find((f) => f.properties.obs_idx === obsIdx);
+
     let resid = null;
     let modelLabel = "";
     if (state.stage3Res?.models?.length) {
@@ -1040,7 +1050,6 @@ const actions = {
       }
     }
 
-    restyleMap();
     mapInspector.renderPointInspector(obsIdx, {
       row_id: feat?.properties?.row_id ?? obsIdx,
       y_raw: feat?.properties?.y_raw ?? null,
@@ -1054,6 +1063,26 @@ const actions = {
       gwr_kappa,
       covSummary,
     });
+  },
+
+  async inspectObservation(obsIdx) {
+    const tgtId = document.getElementById("selRouteTarget")?.value || state.recipe.spatial_targets?.[0]?.id || "";
+    let route = null;
+    if (tgtId) {
+      try {
+        await dag.waitUntilReady();
+        route = await dag.call("get_single_route", { obs_idx: obsIdx, target_id: tgtId, recipe: state.recipe });
+        mapInspector.showRoute(route);
+      } catch {
+        route = null;
+      }
+    } else {
+      mapInspector.clearRoute();
+    }
+
+    state.lastInspectedRoute = { obsIdx, tgtId, route };
+    restyleMap({ skipInspectorRefresh: true });
+    this.refreshSelectedInspector();
   },
 
   async copyLatexTable(kindOverride = null) {
@@ -1437,6 +1466,7 @@ const actions = {
 };
 
 function renderGuardStrip() {
+  const en = getLang() === "en";
   const s2 = state.stage2Res;
   const s3 = state.stage3Res;
   const s4 = state.stage4Res;
@@ -1457,12 +1487,12 @@ function renderGuardStrip() {
     el.textContent = text;
   };
 
-  setPill("g1Pill", s3 ? (g1Warn ? "warn" : "pass") : "", s3 ? (g1Warn ? "G1 ⚠ Konfound/VIF" : "G1 ✓ VIF/RESET") : "G1 Diagnosztika");
-  setPill("g2Pill", s3 ? (g2Count > 0 ? "warn" : "pass") : "", s3 ? (g2Count > 0 ? `G2 ⚡ ${g2Count} összevonás (τ=${tau})` : `G2 ✓ Sűrűség ≥${tau}`) : `G2 Ritka (τ=${tau})`);
+  setPill("g1Pill", s3 ? (g1Warn ? "warn" : "pass") : "", s3 ? (g1Warn ? (en ? "G1 ⚠ Confound/VIF" : "G1 ⚠ Konfound/VIF") : "G1 ✓ VIF/RESET") : (en ? "G1 Diagnostics" : "G1 Diagnosztika"));
+  setPill("g2Pill", s3 ? (g2Count > 0 ? "warn" : "pass") : "", s3 ? (g2Count > 0 ? (en ? `G2 ⚡ ${g2Count} merges (τ=${tau})` : `G2 ⚡ ${g2Count} összevonás (τ=${tau})`) : (en ? `G2 ✓ Cell ≥${tau}` : `G2 ✓ Sűrűség ≥${tau}`)) : (en ? `G2 Sparse (τ=${tau})` : `G2 Ritka (τ=${tau})`));
   setPill("g3Pill", g3Atten !== null ? (Math.abs(g3Atten) > (state.recipe.guards_cfg?.attenuation_warn_pct ?? 50) ? "warn" : "pass") : "", g3Atten !== null ? `G3 ${g3Atten}% atten.` : "G3 Gelbach/Step");
   setPill("g4Pill", g4Heck ? (g4Heck.activated && g4Heck.selection_bias_detected ? "warn" : "pass") : "", g4Heck?.activated ? `G4 λ p=${g4Heck.imr_p}` : "G4 Heckman/SE");
-  setPill("g5Pill", s4?.ok ? (g5Warn ? "warn" : "pass") : "", s4?.ok ? (g5Warn ? "G5 ⚠ Co-loc W" : `G5 ✓ ${s4.anselin?.recommended_model || "OK"}`) : "G5 Térbeli W");
-  setPill("g6Pill", s5?.ok ? (g6Reg > 0 ? "warn" : "pass") : "", s5?.ok ? (g6Reg > 0 ? `G6 🛡️ Ridge (${g6Reg})` : "G6 ✓ GWR Stabil") : "G6 GWR Ridge");
+  setPill("g5Pill", s4?.ok ? (g5Warn ? "warn" : "pass") : "", s4?.ok ? (g5Warn ? "G5 ⚠ Co-loc W" : `G5 ✓ ${s4.anselin?.recommended_model || "OK"}`) : (en ? "G5 Spatial W" : "G5 Térbeli W"));
+  setPill("g6Pill", s5?.ok ? (g6Reg > 0 ? "warn" : "pass") : "", s5?.ok ? (g6Reg > 0 ? `G6 🛡️ Ridge (${g6Reg})` : (en ? "G6 ✓ GWR Stable" : "G6 ✓ GWR Stabil")) : "G6 GWR Ridge");
 }
 
 function renderAdvancedDrawerBody() {
@@ -1639,20 +1669,37 @@ window.addEventListener("DOMContentLoaded", () => {
       btnSaveMenu?.setAttribute("aria-expanded", "false");
     }
   });
-  document.getElementById("menuSaveRecipe")?.addEventListener("click", () => { saveMenu.hidden = true; actions.exportRecipe(); });
-  document.getElementById("menuSaveProject")?.addEventListener("click", () => { saveMenu.hidden = true; actions.exportWorkspace(); });
-  document.getElementById("menuSaveOsmBundle")?.addEventListener("click", () => { saveMenu.hidden = true; actions.exportOsmBundle(); });
-  document.getElementById("menuSaveLatexMain")?.addEventListener("click", () => { saveMenu.hidden = true; actions.copyLatexTable(); });
-  document.getElementById("menuSaveGeojson")?.addEventListener("click", () => { saveMenu.hidden = true; actions.exportGeojsonOnly(); });
-  document.getElementById("menuSaveZip")?.addEventListener("click", () => { saveMenu.hidden = true; actions.exportBundle("zip"); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      if (saveMenu && !saveMenu.hidden) {
+        saveMenu.hidden = true;
+        btnSaveMenu?.setAttribute("aria-expanded", "false");
+        btnSaveMenu?.focus();
+      }
+      const drawer = document.getElementById("advancedDrawer");
+      if (drawer && !drawer.hidden) {
+        toggleAdvancedDrawer(false);
+      }
+    }
+  });
+  document.getElementById("menuSaveRecipe")?.addEventListener("click", () => { saveMenu.hidden = true; btnSaveMenu?.setAttribute("aria-expanded", "false"); actions.exportRecipe(); });
+  document.getElementById("menuSaveProject")?.addEventListener("click", () => { saveMenu.hidden = true; btnSaveMenu?.setAttribute("aria-expanded", "false"); actions.exportWorkspace(); });
+  document.getElementById("menuSaveOsmBundle")?.addEventListener("click", () => { saveMenu.hidden = true; btnSaveMenu?.setAttribute("aria-expanded", "false"); actions.exportOsmBundle(); });
+  document.getElementById("menuSaveLatexMain")?.addEventListener("click", () => { saveMenu.hidden = true; btnSaveMenu?.setAttribute("aria-expanded", "false"); actions.copyLatexTable(); });
+  document.getElementById("menuSaveGeojson")?.addEventListener("click", () => { saveMenu.hidden = true; btnSaveMenu?.setAttribute("aria-expanded", "false"); actions.exportGeojsonOnly(); });
+  document.getElementById("menuSaveZip")?.addEventListener("click", () => { saveMenu.hidden = true; btnSaveMenu?.setAttribute("aria-expanded", "false"); actions.exportBundle("zip"); });
 
   // HU | EN Language toggle
   document.getElementById("btnLangToggle")?.addEventListener("click", () => {
     const next = getLang() === "hu" ? "en" : "hu";
     setLang(next);
     applyI18nDOM();
+    updateBootIndicator(state.wasmStatus, state.wasmRawMessage);
     renderGuardStrip();
     actions.render();
+    restyleMap();
+    const drawer = document.getElementById("advancedDrawer");
+    if (drawer && !drawer.hidden) renderAdvancedDrawerBody();
     showToast(next === "en" ? "Language switched to English" : "Nyelv átváltva magyarra", "info");
   });
 

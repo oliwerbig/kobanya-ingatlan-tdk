@@ -129,7 +129,7 @@ export function renderStage4(container, ctx) {
         </div>
         <div class="table-wrap" style="margin-bottom:10px;">
           <table class="academic">
-            <thead><tr><th>Modell</th><th class="num">ρ / λ</th><th class="num">SE (p)</th><th class="num">Pseudo R²</th><th class="num">LL</th><th class="num">AIC</th><th class="num">Resid. Diagnosztika (Moran / AK 1997)</th></tr></thead>
+            <thead><tr><th>Modell</th><th class="num">ρ / λ</th><th class="num">SE (p)</th><th class="num">Pseudo R²</th><th class="num">LL</th><th class="num">AIC</th><th class="num" title="Reziduális térbeli autokorreláció (Moran's I / Anselin–Kelejian 1997)">Resid. Moran / AK</th></tr></thead>
             <tbody>
               ${(s4.model_comparison || [])
                 .map(
@@ -139,7 +139,7 @@ export function renderStage4(container, ctx) {
                     <td class="num">${r.spatial_se !== null ? `${r.spatial_se} (p=${r.spatial_p})` : "—"}</td>
                     <td class="num">${r.r2_or_pseudo ?? "—"}</td>
                     <td class="num">${r.llf ?? "—"}</td><td class="num">${r.aic ?? "—"}</td>
-                    <td class="num">${r.resid_test_type === "anselin_kelejian_1997" ? `AK=${r.resid_moran_i}` : `I=${r.resid_moran_i ?? "—"}`} ${r.resid_moran_p != null ? `(p=${r.resid_moran_p})` : ""}</td>
+                    <td class="num">${(r.resid_moran_method || r.resid_test_type) === "anselin_kelejian_1997" ? `AK=${r.resid_moran_i}` : `I=${r.resid_moran_i ?? "—"}`} ${r.resid_moran_p != null ? `(p=${r.resid_moran_p})` : ""}</td>
                   </tr>`
                 )
                 .join("")}
@@ -400,7 +400,7 @@ function renderSpatialParamsCard(s4, paramKind) {
                     .map(
                       (p) => `<tr>
                         <td><strong>${escapeHtml(p.name)}</strong></td>
-                        <td class="num">${p.beta}<span class="sig-stars">${escapeHtml(p.sig)}</span></td>
+                        <td class="num">${p.est ?? p.beta ?? "—"}<span class="sig-stars">${escapeHtml(p.sig || "")}</span></td>
                         <td class="num">${p.se}</td>
                         <td class="num">${p.z}</td>
                         <td class="num">${p.p}</td>

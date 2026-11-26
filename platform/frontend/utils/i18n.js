@@ -88,20 +88,86 @@ const DICT = {
 };
 
 const VERDICT_MAP_HU = [
+  ["Starting Pyodide...", "Pyodide indítása..."],
   ["Loading WebAssembly Python runtime...", "WebAssembly Python futtatókörnyezet betöltése..."],
   ["Loading NumPy & SciPy kernels...", "NumPy és SciPy kernelek betöltése..."],
   ["Mounting GeoSpec py_engine...", "GeoSpec py_engine modulok betöltése..."],
   ["Pyodide NumPy+SciPy kernel ready", "Pyodide NumPy+SciPy kernel kész"],
+  ["WASM engine error", "WASM motor hiba"],
   ["Classic OLS (No spatial dependence)", "Klasszikus OLS (nincs szignifikáns térbeli függőség)"],
+  ["SAR (Spatial Lag)", "SAR (Térbeli késleltetés)"],
+  ["SEM (Spatial Error)", "SEM (Térbeli hiba)"],
+  ["SAR (Robust LM-Lag dominant)", "SAR (Robusztus LM-Lag domináns)"],
+  ["SEM (Robust LM-Error dominant)", "SEM (Robusztus LM-Error domináns)"],
   ["SDM (Neither SAR nor SEM restriction accepted)", "SDM javasolt (sem SAR, sem SEM redukció nem elfogadható)"],
   ["SAR accepted (H0: θ = 0 not rejected)", "SAR elfogadva (H0: θ = 0 nem elvethető)"],
   ["SEM accepted (H0: θ + ρβ = 0 not rejected)", "SEM elfogadva (H0: θ + ρβ = 0 nem elvethető)"],
   ["Either SAR/SEM acceptable", "SAR vagy SEM redukció is elfogadható"],
   ["SDM underdetermined", "SDM alulhatározott (kevés megfigyelés K_sdm-hez)"],
   ["Complete or minimal exclusion sample", "Teljes vagy minimális kizárási minta"],
-  ["Profile-MLE cutoff c* maximizes likelihood", "Profil-MLE c* küszöb maximalizálja a log-likelihoodot"],
-  ["Guard #2", "Guard #2 (Ritka cella összevonás)"],
-  ["Guard #6", "Guard #6 (GWR helyi stabilizálás)"],
+  [
+    "Profile-MLE cutoff c* maximizes likelihood over the grid; standard errors at c* treat c as fixed (post-selection inference caveat applies; inspect the 95% profile-likelihood CI).",
+    "A Profil-MLE c* küszöb maximalizálja a log-likelihoodot a rácson; a c* pontbeli standard hibák fixként kezelik a c küszöböt (poszt-szelekciós fenntartás: vizsgáld a 95%-os profil-likelihood CI-t).",
+  ],
+];
+
+const VERDICT_REGEX_HU = [
+  [
+    /^Guard #6 pre-screened (\d+) low-prevalence dummies before GWR:\s*(.+)$/,
+    (_, cnt, rest) => {
+      const cleaned = rest.replace(/\(min cell (\d+) < (\d+)\)/g, "(min. cella $1 < $2)");
+      return `Guard #6: ${cnt} alacsony gyakoriságú dummy változó kiszűrve a GWR előtt: ${cleaned}`;
+    },
+  ],
+  [
+    /^Guard #6 locally excluded invariant dummy variables at (\d+)\/(\d+) locations.*$/,
+    (_, nLoc, nTot) =>
+      `Guard #6: lokálisan invariáns dummy változók automatikusan kizárva ${nLoc}/${nTot} helyszínen (torzításmentes helyi becslés, Ridge-büntetés nélkül).`,
+  ],
+  [
+    /^Guard #6 Selective Ridge applied at (\d+)\/(\d+) \(([^)]+)\) locations due to continuous local collinearity \(κ > ([^)]+)\)\.?$/,
+    (_, nLoc, nTot, pct, kappa) =>
+      `Guard #6 Szelektív Ridge alkalmazva ${nLoc}/${nTot} (${pct}) helyszínen folytonos lokális kollinearitás miatt (κ > ${kappa}).`,
+  ],
+  [
+    /^Complete or minimal exclusion sample \(N_excluded=(\d+) < (\d+)\)\.?$/,
+    (_, nEx, thr) => `Teljes vagy minimális kizárási minta (kizárt N=${nEx} < ${thr}).`,
+  ],
+  [
+    /^Small cluster count \(G=(\d+) < 30\);.*$/,
+    (_, g) =>
+      `Kis klaszterszám (G=${g} < 30); a klaszterezett SE alulbecsülheti a szóródást (használd a Wild Cluster Bootstrap p-értékeket).`,
+  ],
+  [
+    /^SDM underdetermined \(N=(\d+) <= K_sdm\+2=(\d+)\); rely on Anselin LM \(([^)]+)\)\.?$/,
+    (_, n, kPlus, rec) => `SDM alulhatározott (N=${n} ≤ K_sdm+2=${kPlus}); az Anselin LM (${rec}) irányadó.`,
+  ],
+  [
+    /^SDM underdetermined for N=(\d+) and K_sdm=(\d+);.*$/,
+    (_, n, k) => `SDM alulhatározott (N=${n}, K_sdm=${k}); az SDM becslés és spillover hatásfelbontás kihagyva.`,
+  ],
+  [
+    /^Guard #2 pooled sparse levels (.+) \(N=(\d+)\) of '(.+)' into '(.+)'\.?$/,
+    (_, lvls, n, col, other) => `Guard #2: a '${col}' változó ritka szintjei (${lvls}, N=${n}) összevonva: '${other}'.`,
+  ],
+  [
+    /^Guard #2 merged tiny levels (.+) \(sum N=(\d+) < (\d+)\) of '(.+)' into reference '(.+)'\.?$/,
+    (_, lvls, n, tau, col, ref) => `Guard #2: a '${col}' változó ritka szintjei (${lvls}, N=${n} < ${tau}) a '${ref}' referenciába olvasztva.`,
+  ],
+  [
+    /^Guard #2 dropped sparse binary dummy '(.+)' \(N1=(\d+), N0=(\d+) < (\d+)\)\.?$/,
+    (_, col, n1, n0, tau) => `Guard #2: a ritka '${col}' bináris dummy elhagyva (N1=${n1}, N0=${n0} < ${tau}).`,
+  ],
+  [
+    /^Guard #2 sparse reference fallback on '(.+)': requested reference '(.+)' \(N=(\d+) < (\d+)\) replaced by modal level '(.+)' \(N=(\d+)\)\.?$/,
+    (_, col, req, nReq, tau, mod, nMod) =>
+      `Guard #2: a '${col}' ritka '${req}' referenciája (N=${nReq} < ${tau}) helyett a modális '${mod}' (N=${nMod}) lett a referencia.`,
+  ],
+  [
+    /^Co-located coordinates: ([\d.]+)% of (\S+) neighbor links.*$/,
+    (_, pct, wid) =>
+      `Co-located koordináták: a '${wid}' szomszédsági élek ${pct}%-a d_ij ≤ 0.5 m (épületen belüli klaszter). Ellenőrizd a stabilitást az IDW mátrixszal.`,
+  ],
 ];
 
 let currentLang = "hu";
@@ -149,6 +215,10 @@ export function t(key, params = null) {
 export function translateVerdict(text) {
   const s = String(text ?? "");
   if (currentLang !== "hu") return s;
+  for (const [rx, fn] of VERDICT_REGEX_HU) {
+    const m = s.match(rx);
+    if (m) return fn(...m);
+  }
   for (const [enPrefix, huPrefix] of VERDICT_MAP_HU) {
     if (s === enPrefix) return huPrefix;
     if (s.startsWith(enPrefix)) return huPrefix + s.slice(enPrefix.length);

@@ -222,8 +222,12 @@ def build_dependent_variable(
         else:
             lam_mle, ll_mle, p_log, p_lin = _boxcox_profile_mle(yv)
         lam_use = float(fixed_lam) if fixed_lam is not None else lam_mle
-        y_trans[valid_y] = _boxcox_transform(yv, lam_use)
-        jacobian_log[valid_y] = (lam_use - 1.0) * np.log(yv)
+        log_yv = np.log(yv)
+        mean_log_y = float(np.mean(log_yv))
+        geom_mean = math.exp(mean_log_y)
+        yv_scaled = yv / geom_mean
+        y_trans[valid_y] = _boxcox_transform(yv_scaled, lam_use)
+        jacobian_log[valid_y] = (lam_use - 1.0) * log_yv - lam_use * mean_log_y
         label = f"BoxCox({base_label}, λ={lam_use:.3f})"
         boxcox_info = {
             "mode": bc_mode,
@@ -232,6 +236,7 @@ def build_dependent_variable(
             "ll_mle": round(ll_mle, 3),
             "p_vs_log": round(p_log, 5),
             "p_vs_linear": round(p_lin, 5),
+            "scale_geom_mean": round(geom_mean, 4),
         }
     else:
         raise ValueError(f"Unsupported dependent transform: {transform}")
