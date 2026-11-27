@@ -82,6 +82,18 @@ export function createDefaultRecipe() {
       heckman_min_excluded: 10,
       heckman_min_analytic: 30,
     },
+    ml_shap: {
+      enabled: true,
+      focal_model_id: "spec_a",
+      n_estimators: 150,
+      max_depth: 3,
+      learning_rate: 0.05,
+      subsample: 0.8,
+      min_samples_leaf: 5,
+      l2_reg: 1.0,
+      cv_folds: 5,
+      random_seed: 42,
+    },
   };
 }
 

@@ -30,6 +30,7 @@ from .exporters import (
     build_zip_bundle,
     dict_rows_to_csv,
     generate_gwr_summary_latex,
+    generate_ml_shap_latex,
     generate_multi_model_latex,
     generate_qgis_qml_gwr,
     generate_qgis_qml_lisa,
@@ -38,6 +39,7 @@ from .exporters import (
     generate_spatial_params_latex,
 )
 from .gwr_kernel import fit_adaptive_gwr
+from .ml_shap_kernel import run_ml_shap_pipeline
 from .ols_kernel import (
     build_cluster_ids,
     compute_descriptive_and_normality,
@@ -102,17 +104,19 @@ class GeoSpecSession:
     def _invalidate_outputs_from(self, stage: int) -> None:
         """Clear last_outputs for this stage and all downstream outputs (keeping DAGCache intact for upstream hits)."""
         if stage == 1:
-            for k in ("stage1", "stage2", "stage3", "stage4", "stage5"):
+            for k in ("stage1", "stage2", "stage3", "stage4", "stage5", "stage6"):
                 self.last_outputs.pop(k, None)
         elif stage == 2:
             self.last_outputs.pop("stage2", None)
         elif stage == 3:
-            for k in ("stage2", "stage3", "stage4", "stage5"):
+            for k in ("stage2", "stage3", "stage4", "stage5", "stage6"):
                 self.last_outputs.pop(k, None)
         elif stage == 4:
             self.last_outputs.pop("stage4", None)
         elif stage == 5:
             self.last_outputs.pop("stage5", None)
+        elif stage == 6:
+            self.last_outputs.pop("stage6", None)
 
     def _invalidate_from_stage(self, stage: int, clear_cache: bool = True) -> None:
         """Canonical DAG invalidation helper across last_outputs, _stage_hashes, and DAGCache layers."""
@@ -120,11 +124,11 @@ class GeoSpecSession:
         if not clear_cache:
             return
         if stage == 1:
-            for s in (1, 2, 3, 4, 5):
+            for s in (1, 2, 3, 4, 5, 6):
                 self._stage_hashes.pop(s, None)
             self.cache.invalidate_from("ols")
         elif stage == 3:
-            for s in (2, 3, 4, 5):
+            for s in (2, 3, 4, 5, 6):
                 self._stage_hashes.pop(s, None)
             self.cache.invalidate_from("ols")
         elif stage == 4:
@@ -133,6 +137,9 @@ class GeoSpecSession:
         elif stage == 5:
             self._stage_hashes.pop(5, None)
             self.cache._store.get("gwr", {}).clear()
+        elif stage == 6:
+            self._stage_hashes.pop(6, None)
+            self.cache._store.get("ml_shap", {}).clear()
 
     def reset_session(self) -> Dict[str, Any]:
         """Reset all dataset, GIS targets, graphs, caches, and stage outputs cleanly."""
@@ -1100,6 +1107,78 @@ class GeoSpecSession:
         self.last_outputs["stage5"] = res
         return res
 
+    def run_stage_6_ml_shap(self, recipe: Dict[str, Any], run_id: int = 1) -> Dict[str, Any]:
+        """Stage 6: Cached Deterministic Pure-NumPy GBRT & Exact Lundberg TreeSHAP on locked sample."""
+        self._invalidate_outputs_from(6)
+        if self.proj is None:
+            raise ValueError("No dataset loaded.")
+        self.cache.start_run(run_id)
+        prep = self._prepare_y_and_masks(recipe)
+        y_info = prep["y_info"]
+        analytic_base = prep["analytic_base"]
+        ds = recipe.get("dataset_schema", {})
+        guards_cfg = recipe.get("guards_cfg", {})
+        tau = int(guards_cfg.get("sparse_min_cell", 5))
+        ml_cfg = recipe.get("ml_shap", {})
+        sp_cfg = recipe.get("spatial_engine", {})
+        active_specs = [m for m in recipe.get("models", []) if m.get("active", True)]
+        if not active_specs:
+            return {"ok": False, "reason": "No active model specification."}
+
+        focal_mid = (
+            ml_cfg.get("focal_model_id")
+            or sp_cfg.get("gwr", {}).get("focal_model_id")
+            or sp_cfg.get("active_model_id")
+        )
+        ref_spec = next((m for m in active_specs if m["id"] == focal_mid), active_specs[-1])
+        common_mask = None
+        if guards_cfg.get("common_sample_lock", True):
+            common_mask = compute_common_sample_mask(
+                self.columns, self.dist_results, active_specs, y_info, analytic_base, tau
+            )
+
+        design = build_model_design(
+            self.columns, self.dist_results, ref_spec, y_info, analytic_base, tau, common_mask
+        )
+        if design["n_obs"] <= design["k_params"] + 4:
+            return {"ok": False, "reason": f"Too few observations (N={design['n_obs']}) for Stage 6 ML & TreeSHAP."}
+
+        cluster_spec = ds.get("cluster_spec", {})
+        cluster_ids, _ = build_cluster_ids(self.columns, self.obs_xy, design["valid_indices"], cluster_spec)
+        col_names = [m["name"] for m in design["col_meta"]]
+
+        ml_key = hash_payload({
+            "kind": "ml_shap_fit",
+            "mid": ref_spec["id"],
+            "n": design["n_obs"],
+            "k": design["k_params"],
+            "cols": col_names,
+            "ml_cfg": ml_cfg,
+            "cluster_spec": cluster_spec,
+            "x_sha": _array_sha256(design["X"]),
+            "y_sha": _array_sha256(design["y"]),
+        })
+        cached_res = self.cache.get_or_compute(
+            "ml_shap",
+            ml_key,
+            lambda: run_ml_shap_pipeline(
+                design["X"],
+                design["y"],
+                col_names,
+                cluster_ids=cluster_ids,
+                valid_indices=design["valid_indices"],
+                is_log_scale=bool(y_info.get("is_log_scale", True)),
+                ml_cfg=ml_cfg,
+            ),
+            run_id=run_id,
+        )
+        res = dict(cached_res)
+        if res.get("ok"):
+            res["focal_model_id"] = ref_spec["id"]
+        self._stage_hashes[6] = ml_key
+        self.last_outputs["stage6"] = res
+        return res
+
     def run_robustness_matrix(self, recipe: Dict[str, Any], run_id: int = 1) -> Dict[str, Any]:
         """Run 3 y-transforms (log, boxcox, raw) x 2 SE types (HC3, cluster) on identical N."""
         if self.proj is None:
@@ -1223,6 +1302,7 @@ class GeoSpecSession:
         s3 = self.last_outputs.get("stage3", {})
         s4 = self.last_outputs.get("stage4", {})
         s5 = self.last_outputs.get("stage5", {})
+        s6 = self.last_outputs.get("stage6", {})
         rob = self.last_outputs.get("robustness", {})
         ols_models = [m for m in s3.get("models", []) if "params" in m]
 
@@ -1241,6 +1321,8 @@ class GeoSpecSession:
             tex = generate_spatial_params_latex(s4)
         elif kind == "stage5":
             tex = generate_gwr_summary_latex(s5)
+        elif kind == "stage6":
+            tex = generate_ml_shap_latex(s6)
         elif kind == "robustness":
             tex = generate_robustness_matrix_latex(rob)
         else:
@@ -1294,6 +1376,7 @@ class GeoSpecSession:
         s3 = self.last_outputs.get("stage3", {})
         s4 = self.last_outputs.get("stage4", {})
         s5 = self.last_outputs.get("stage5", {})
+        s6 = self.last_outputs.get("stage6", {})
         s2 = self.last_outputs.get("stage2", {})
         rob = self.last_outputs.get("robustness", {})
 
@@ -1367,6 +1450,10 @@ class GeoSpecSession:
             tables["robustness_matrix"] = rob.get("rows", [])
         if s5.get("ok"):
             tables["gwr_parameter_summary"] = s5.get("param_summaries", [])
+        if s6.get("ok"):
+            tables["ml_benchmark"] = s6.get("benchmark", [])
+            tables["shap_global_importance"] = s6.get("feature_importance", [])
+            tables["shap_grouped_importance"] = s6.get("grouped_rows", [])
 
         latex_tables = {}
         if ols_models:
@@ -1388,6 +1475,8 @@ class GeoSpecSession:
             latex_tables["robustness_matrix"] = rob.get("latex") or generate_robustness_matrix_latex(rob)
         if s5.get("ok"):
             latex_tables["gwr_summary"] = generate_gwr_summary_latex(s5)
+        if s6.get("ok"):
+            latex_tables["ml_shap_summary"] = generate_ml_shap_latex(s6)
 
         qml_styles: Dict[str, str] = {}
         if s4.get("ok"):

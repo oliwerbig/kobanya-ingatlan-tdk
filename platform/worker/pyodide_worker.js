@@ -18,6 +18,7 @@ const ENGINE_FILES = [
   "ols_kernel.py",
   "spatial_kernel.py",
   "gwr_kernel.py",
+  "ml_shap_kernel.py",
   "exporters.py",
   "engine.py",
 ];
@@ -141,6 +142,8 @@ def _rpc_dispatch(method, payload_json):
         res = _SESSION.run_stage_4_spatial_econometrics(payload["recipe"], int(payload.get("run_id", 1)))
     elif method == "run_stage_5":
         res = _SESSION.run_stage_5_gwr(payload["recipe"], int(payload.get("run_id", 1)), progress_cb=_gwr_progress_cb)
+    elif method == "run_stage_6":
+        res = _SESSION.run_stage_6_ml_shap(payload["recipe"], int(payload.get("run_id", 1)))
     elif method == "generate_m1_m4":
         res = _SESSION.generate_m1_m4(
             payload["covariates"], payload["spatial_targets"], payload.get("default_rings"), float(payload.get("default_cutoff_m", 300.0))

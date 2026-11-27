@@ -1,7 +1,7 @@
 /* GeoSpec Service Worker — caches Pyodide WASM + pinned CDN assets cleanly (never opaque),
  * and full same-origin app shell + py_engine (network-first with timeout & offline/5xx fallback).
  */
-const CACHE_NAME = "geospec-wasm-v12";
+const CACHE_NAME = "geospec-wasm-v13";
 const FETCH_TIMEOUT_MS = 10000;
 
 const CORE_SHELL_ASSETS = [
@@ -20,6 +20,7 @@ const CORE_SHELL_ASSETS = [
   "./frontend/components/stage2_composition.js",
   "./frontend/components/stage3_model_composer.js",
   "./frontend/components/stage4_5_spatial_gwr.js",
+  "./frontend/components/stage6_ml_shap.js",
   "./worker/pyodide_worker.js",
   "./py_engine/__init__.py",
   "./py_engine/dag_cache.py",
@@ -29,6 +30,7 @@ const CORE_SHELL_ASSETS = [
   "./py_engine/ols_kernel.py",
   "./py_engine/spatial_kernel.py",
   "./py_engine/gwr_kernel.py",
+  "./py_engine/ml_shap_kernel.py",
   "./py_engine/exporters.py",
   "./py_engine/engine.py",
 ];

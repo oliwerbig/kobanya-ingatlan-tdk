@@ -5,7 +5,7 @@ export const SUPPORTED_LANGS = ["hu", "en"];
 const DICT = {
   hu: {
     "app.brand_sub": "Parametrikus Térökonometriai Munkaállomás",
-    "nav.run_all": "▶ Teljes Pipeline Futtatása (1–5)",
+    "nav.run_all": "▶ Teljes Pipeline Futtatása (1–6)",
     "nav.load": "📥 Betöltés",
     "nav.save": "💾 Mentés ▾",
     "nav.save_recipe": "💾 Recept (_recipe.json)",
@@ -20,6 +20,7 @@ const DICT = {
     "stage.3": "3. Modell-Műhely & Diagnosztika",
     "stage.4": "4. Térökonometria (SAR/SEM/SDM)",
     "stage.5": "5. Adaptív GWR/MGWR & Export",
+    "stage.6": "6. ML & TreeSHAP",
     "tab.stale": "Elavult",
     "worker.ready": "Pyodide NumPy+SciPy kernel kész",
     "worker.booting": "Pyodide indítása...",
@@ -46,7 +47,7 @@ const DICT = {
   },
   en: {
     "app.brand_sub": "Parametric Spatial Econometric Workbench",
-    "nav.run_all": "▶ Run Full Pipeline (1–5)",
+    "nav.run_all": "▶ Run Full Pipeline (1–6)",
     "nav.load": "📥 Load",
     "nav.save": "💾 Save ▾",
     "nav.save_recipe": "💾 Recipe (_recipe.json)",
@@ -61,6 +62,7 @@ const DICT = {
     "stage.3": "3. Model Composer & Diagnostics",
     "stage.4": "4. Spatial Econometrics (SAR/SEM/SDM)",
     "stage.5": "5. Adaptive GWR/MGWR & Export",
+    "stage.6": "6. ML & TreeSHAP",
     "tab.stale": "Stale",
     "worker.ready": "Pyodide NumPy+SciPy kernel ready",
     "worker.booting": "Starting Pyodide...",

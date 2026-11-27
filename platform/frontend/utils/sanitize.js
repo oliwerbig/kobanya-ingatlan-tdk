@@ -84,6 +84,19 @@ export function sanitizeRecipe(loaded, defaults) {
   const gwrIn = safeObj(spIn.gwr);
   const ccIn = safeObj(src.composition_chain);
   const grdIn = safeObj(src.guards_cfg);
+  const mlIn = safeObj(src.ml_shap);
+  const dMl = defaults.ml_shap || {
+    enabled: true,
+    focal_model_id: "spec_a",
+    n_estimators: 150,
+    max_depth: 3,
+    learning_rate: 0.05,
+    subsample: 0.8,
+    min_samples_leaf: 5,
+    l2_reg: 1.0,
+    cv_folds: 5,
+    random_seed: 42,
+  };
 
   const dDs = defaults.dataset_schema;
   const dSp = defaults.spatial_engine;
@@ -148,6 +161,8 @@ export function sanitizeRecipe(loaded, defaults) {
     recipe_meta: {
       title: cleanStr(src.recipe_meta?.title, defaults.recipe_meta.title),
       created_utc: cleanStr(src.recipe_meta?.created_utc, new Date().toISOString()),
+      ...(src.recipe_meta?.seal_version ? { seal_version: cleanStr(src.recipe_meta.seal_version) } : {}),
+      ...(src.recipe_meta?.sealed_utc ? { sealed_utc: cleanStr(src.recipe_meta.sealed_utc) } : {}),
     },
     dataset_schema: {
       row_id_col: cleanStr(dsIn.row_id_col, dDs.row_id_col),
@@ -220,6 +235,18 @@ export function sanitizeRecipe(loaded, defaults) {
       hc3_leverage_warn: clampNum(grdIn.hc3_leverage_warn, 0.05, 0.999, defaults.guards_cfg.hc3_leverage_warn),
       heckman_min_excluded: Math.round(clampNum(grdIn.heckman_min_excluded, 1, 5000, defaults.guards_cfg.heckman_min_excluded)),
       heckman_min_analytic: Math.round(clampNum(grdIn.heckman_min_analytic, 10, 5000, defaults.guards_cfg.heckman_min_analytic)),
+    },
+    ml_shap: {
+      enabled: mlIn.enabled !== false,
+      focal_model_id: cleanStr(mlIn.focal_model_id, dSp.gwr?.focal_model_id || dMl.focal_model_id),
+      n_estimators: Math.round(clampNum(mlIn.n_estimators, 10, 500, dMl.n_estimators)),
+      max_depth: Math.round(clampNum(mlIn.max_depth, 1, 6, dMl.max_depth)),
+      learning_rate: clampNum(mlIn.learning_rate, 0.005, 0.5, dMl.learning_rate),
+      subsample: clampNum(mlIn.subsample, 0.3, 1.0, dMl.subsample),
+      min_samples_leaf: Math.round(clampNum(mlIn.min_samples_leaf, 2, 50, dMl.min_samples_leaf)),
+      l2_reg: clampNum(mlIn.l2_reg, 0.0, 100.0, dMl.l2_reg),
+      cv_folds: Math.round(clampNum(mlIn.cv_folds, 2, 10, dMl.cv_folds)),
+      random_seed: Math.round(clampNum(mlIn.random_seed, 0, 999999, dMl.random_seed)),
     },
   };
 }

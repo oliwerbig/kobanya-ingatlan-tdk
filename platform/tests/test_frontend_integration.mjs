@@ -22,7 +22,7 @@ function walkJsFiles(dir, out = []) {
 
 test("sw.js PWA shell manifest, cache policy & asset existence on disk", () => {
   const swSrc = fs.readFileSync(path.join(PLATFORM_DIR, "sw.js"), "utf8");
-  assert.match(swSrc, /const CACHE_NAME = "geospec-wasm-v12"/);
+  assert.match(swSrc, /const CACHE_NAME = "geospec-wasm-v13"/);
   assert.match(swSrc, /event\.waitUntil\([\s\S]*?self\.skipWaiting\(\)/);
   assert.match(swSrc, /resp\.type\s*!==\s*"opaque"/);
   assert.match(swSrc, /ALLOWED_CDN_PREFIXES/);
@@ -74,7 +74,7 @@ test("pyodide_worker.js SRI SHA-384 fetch+Blob, error recovery & Round-4 RPC dis
   assert.match(wSrc, /URL\.createObjectURL\(new Blob\(/);
   assert.match(wSrc, /initPromise = null/);
   assert.match(wSrc, /def _json_safe\(/);
-  for (const rpc of ["remove_target", "reset_session", "export_latex", "export_geojson", "run_robustness_matrix"]) {
+  for (const rpc of ["remove_target", "reset_session", "export_latex", "export_geojson", "run_robustness_matrix", "run_stage_6"]) {
     assert.ok(wSrc.includes(`"${rpc}"`), `Worker RPC handler missing method '${rpc}'`);
   }
 });

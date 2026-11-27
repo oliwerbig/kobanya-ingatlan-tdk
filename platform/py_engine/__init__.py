@@ -8,6 +8,7 @@ Zero-backend, WebAssembly-compatible computational kernel implementing:
 - OLS/HC3/CR1, Kennedy/HP, AD profile-MLE, Gelbach OVB, Heckman V (ols_kernel.py)
 - Sparse CSR W, Moran/LISA, Anselin/Elhorst, ML SAR/SEM/SDM, Krinsky-Robb (spatial_kernel.py)
 - Singularity-guarded batched Adaptive Bisquare GWR & Leung/IQR tests (gwr_kernel.py)
+- Deterministic Pure-NumPy GBRT & Exact Lundberg TreeSHAP (ml_shap_kernel.py)
 - Overleaf booktabs LaTeX, RFC-7946 QGIS GeoJSON & recipe exporters (exporters.py)
 """
 

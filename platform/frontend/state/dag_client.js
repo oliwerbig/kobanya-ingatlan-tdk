@@ -145,4 +145,8 @@ export class DagClient {
       this.worker.postMessage({ id, type: "rpc", method, payload });
     });
   }
+
+  runStage6(recipe, runId = this.nextRunId()) {
+    return this.call("run_stage_6", { recipe, run_id: runId });
+  }
 }

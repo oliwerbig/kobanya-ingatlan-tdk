@@ -50,8 +50,8 @@ def hash_payload(obj: Any) -> str:
 class DAGCache:
     """Layered content-addressed LRU memoization cache for GeoSpec computation nodes."""
 
-    LAYERS = ("geo", "osm", "graph", "dist", "weights", "design", "ols", "spatial", "gwr")
-    HEAVY_LAYERS = frozenset({"dist", "weights", "spatial", "gwr"})
+    LAYERS = ("geo", "osm", "graph", "dist", "weights", "design", "ols", "spatial", "gwr", "ml_shap")
+    HEAVY_LAYERS = frozenset({"dist", "weights", "spatial", "gwr", "ml_shap"})
     DEFAULT_MAX_ENTRIES = 16
     HEAVY_MAX_ENTRIES = 8
 

@@ -2,7 +2,9 @@
   "schema_version": "1.0.0",
   "recipe_meta": {
     "title": "TDK 2026 — Budapest X. Kőbánya (Tudományos Best-Practice)",
-    "created_utc": "2026-11-26T12:30:00Z"
+    "created_utc": "2026-11-26T12:30:00Z",
+    "seal_version": "v1.0-sealed",
+    "sealed_utc": "2026-11-27T16:10:00Z"
   },
   "dataset_schema": {
     "row_id_col": "listing_id",
@@ -500,6 +502,18 @@
     "attenuation_warn_pct": 50.0,
     "heckman_min_excluded": 10,
     "heckman_min_analytic": 30
+  },
+  "ml_shap": {
+    "enabled": true,
+    "focal_model_id": "m3_log",
+    "n_estimators": 150,
+    "max_depth": 3,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "min_samples_leaf": 5,
+    "l2_reg": 1.0,
+    "cv_folds": 5,
+    "random_seed": 42
   },
   "default_cov_type": "cluster"
 }

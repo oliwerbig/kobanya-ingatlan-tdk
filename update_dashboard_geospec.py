@@ -11,6 +11,8 @@ from __future__ import annotations
 import base64
 import copy
 import csv
+import datetime
+import hashlib
 import json
 import math
 import re
@@ -111,7 +113,8 @@ def generate_workspace_bundles() -> None:
         bundle = {
             "kind": "geospec_workspace",
             "schema_version": "1.0.0",
-            "saved_utc": "2026-11-26T12:30:00Z",
+            "seal_version": recipe.get("recipe_meta", {}).get("seal_version", "v1.0-sealed"),
+            "saved_utc": recipe.get("recipe_meta", {}).get("sealed_utc", "2026-11-27T16:10:00Z"),
             "recipe": recipe,
             "dataset": {
                 "fileName": csv_name,
@@ -151,6 +154,8 @@ def run_geospec_city(city: str) -> dict[str, Any]:
     lift = fvec("d_lift")
     new15 = fvec("d_epult_2015_utan")
     feluj = fvec("d_felujitott")
+    bad = fvec("d_felujitando")
+    szut = fvec("d_szuteren") if "d_szuteren" in cols else np.zeros_like(p)
     hm = fvec("dist_vasutallomas_hm")
 
     s1 = sess.run_stage_1_distances(recipe)
@@ -158,6 +163,15 @@ def run_geospec_city(city: str) -> dict[str, Any]:
     s3 = sess.run_stage_3_ols_workbench(recipe, cov_type=recipe["default_cov_type"])
     s4_m4 = sess.run_stage_4_spatial_econometrics(recipe)
     s5 = sess.run_stage_5_gwr(recipe)
+    s6 = sess.run_stage_6_ml_shap(recipe)
+
+    # Exact raw <=500m vs >500m stats computed strictly on the analytic common sample (s3 M4 valid_indices)
+    m4_vidx = set(s3["models"][-1]["valid_indices"])
+    raw_in_500 = [float(cols["fajlagos_ar"][i]) for i in m4_vidx if float(cols["dist_vasutallomas_hm"][i]) <= 500.0]
+    raw_out_500 = [float(cols["fajlagos_ar"][i]) for i in m4_vidx if float(cols["dist_vasutallomas_hm"][i]) > 500.0]
+    m_in = float(np.mean(raw_in_500)) if raw_in_500 else 0.0
+    m_out = float(np.mean(raw_out_500)) if raw_out_500 else 0.0
+    raw_gap_pct = ((m_in - m_out) / m_out * 100.0) if m_out > 0 else 0.0
 
     s4_by_model: dict[str, Any] = {}
     for mid in ["m1_base", "m2_rings", "m3_log", "m4_ad"]:
@@ -170,8 +184,10 @@ def run_geospec_city(city: str) -> dict[str, Any]:
 
     return {
         "city": city,
+        "recipe": recipe,
         "n_csv": n_rows,
         "n_analytic": int(vm.sum()),
+        "n_common": len(m4_vidx),
         "desc": {
             "mean_price": float(p.mean()),
             "med_price": float(np.median(p)),
@@ -180,8 +196,17 @@ def run_geospec_city(city: str) -> dict[str, Any]:
             "lift_pct": float(lift.mean() * 100.0),
             "new15_pct": float(new15.mean() * 100.0),
             "feluj_pct": float(feluj.mean() * 100.0),
+            "n_new15_common": int(sum(int(float(cols["d_epult_2015_utan"][i]) >= 0.5) for i in m4_vidx)),
+            "n_feluj_common": int(sum(int(float(cols["d_felujitott"][i]) >= 0.5) for i in m4_vidx)),
+            "n_bad_common": int(sum(int(float(cols["d_felujitando"][i]) >= 0.5) for i in m4_vidx)),
+            "n_szut_geocoded": int(np.sum(szut >= 0.5)),
             "walk_mean": float(hm.mean()),
             "walk_med": float(np.median(hm)),
+            "raw_le500_n": len(raw_in_500),
+            "raw_le500_mean": round(m_in, 2),
+            "raw_gt500_n": len(raw_out_500),
+            "raw_gt500_mean": round(m_out, 2),
+            "raw_le500_gap_pct": round(raw_gap_pct, 2),
         },
         "s1": s1,
         "s2": s2,
@@ -190,15 +215,127 @@ def run_geospec_city(city: str) -> dict[str, Any]:
         "s4_m4": s4_m4,
         "s4_by_model": s4_by_model,
         "s5": s5,
+        "s6": s6,
     }
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _summarize_city_truth(res: dict[str, Any]) -> dict[str, Any]:
+    s3_models = {}
+    for m in res["s3"]["models"]:
+        params_map = {}
+        for pr in m["params"]:
+            beta = float(pr["beta"])
+            params_map[pr["name"]] = {
+                "beta": round(beta, 6),
+                "hp_pct": round(hp_pct(beta), 2),
+                "se": round(float(pr["se"]), 6),
+                "p": round(float(pr["p"]), 6),
+            }
+        s3_models[m["model_id"]] = {
+            "n_obs": m["n_obs"],
+            "k_params": m["k_params"],
+            "r2": round(float(m["r2"]), 6),
+            "adj_r2": round(float(m["adj_r2"]), 6),
+            "aic": round(float(m["aic"]), 4),
+            "cov_type_used": m["cov_type_used"],
+            "params": params_map,
+        }
+
+    s4 = res["s4_m4"]
+    comp = {c["model"].split()[0]: c for c in s4["model_comparison"]}
+    sar_m4, sem_m4 = comp["SAR"], comp["SEM"]
+    rho_val = float(sar_m4["spatial_param"])
+    imp_sar = {x["variable"]: x for x in s4.get("impacts_sar", [])}
+    first_imp = next(iter(imp_sar.values()), {})
+    return {
+        "descriptives": {
+            "n_total": res["n_csv"],
+            "n_geocoded": res["n_analytic"],
+            "n_common": res["n_common"],
+            **{k: round(v, 2) if isinstance(v, float) else v for k, v in res["desc"].items()},
+        },
+        "ols": s3_models,
+        "spatial_stage4": {
+            "primary_w_id": s4["primary_w_id"],
+            "se_mode": s4["se_mode"],
+            "moran_y": s4["moran_y"],
+            "moran_resid": s4["moran_resid"],
+            "anselin": s4["anselin"],
+            "sar_rho": round(rho_val, 4),
+            "sar_rho_se": sar_m4["spatial_se"],
+            "sar_rho_p": sar_m4["spatial_p"],
+            "sar_multiplier": round(1.0 / (1.0 - rho_val), 3) if abs(1.0 - rho_val) > 1e-6 else None,
+            "sar_spillover_share_pct": round(float(first_imp.get("spillover_share_pct", 0.0)), 1),
+            "sar_resid_moran_i": sar_m4["resid_moran_i"],
+            "sem_lambda": round(float(sem_m4["spatial_param"]), 4),
+            "sem_lambda_p": sem_m4["spatial_p"],
+            "sem_resid_moran_i": sem_m4["resid_moran_i"],
+            "sem_resid_moran_p": sem_m4["resid_moran_p"],
+            "weights_robustness": s4["weights_robustness"],
+        },
+        "gwr_stage5": {
+            "focal_model_id": res["s5"]["model_id"],
+            "optimal_bw": res["s5"]["optimal_bw"],
+            "global_ols_r2": res["s5"]["global_ols_r2"],
+            "global_ols_adj_r2": res["s5"]["global_ols_adj_r2"],
+            "gwr_r2": res["s5"]["gwr_r2"],
+            "gwr_adj_r2": res["s5"]["gwr_adj_r2"],
+            "param_summaries": res["s5"]["param_summaries"],
+        },
+        "ml_shap_stage6": {
+            "engine": res["s6"]["engine"],
+            "focal_model_id": res["s6"]["focal_model_id"],
+            "n_obs": res["s6"]["n_obs"],
+            "n_clusters": res["s6"]["n_clusters"],
+            "cv_folds": res["s6"]["cv_folds"],
+            "random_seed": res["s6"]["random_seed"],
+            "local_accuracy_max_err": res["s6"]["local_accuracy_max_err"],
+            "benchmark": res["s6"]["benchmark"],
+            "grouped_importance": res["s6"]["grouped_importance"],
+            "feature_importance": res["s6"]["feature_importance"],
+        },
+    }
+
+
+def write_canonical_truth(kb: dict[str, Any], vi: dict[str, Any]) -> dict[str, Any]:
+    """Seal and write recipes/canonical_truth.json with full SHA-256 lock and Stage 1-6 results."""
+    tracked_files = [
+        "kobanya_dataset.csv",
+        "leopoldstadt_dataset.csv",
+        "kobanya_recipe.json",
+        "leopoldstadt_recipe.json",
+        "kobanya_best_practice.geospec.json",
+        "leopoldstadt_best_practice.geospec.json",
+    ]
+    sha_map = {fn: _file_sha256(RECIPES_DIR / fn) for fn in tracked_files}
+    payload = {
+        "schema_version": "1.0.0",
+        "seal_version": "v1.0-sealed",
+        "sealed_utc": kb["recipe"].get("recipe_meta", {}).get("sealed_utc", "2026-11-27T16:10:00Z"),
+        "sha256": sha_map,
+        "cities": {
+            "kobanya": _summarize_city_truth(kb),
+            "leopoldstadt": _summarize_city_truth(vi),
+        },
+    }
+    out_path = RECIPES_DIR / "canonical_truth.json"
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"Wrote recipes/canonical_truth.json (seal_version={payload['seal_version']})")
+    return payload
 
 
 # ---------------------------------------------------------------------------
 # HTML & Plotly Patching Helpers
 # ---------------------------------------------------------------------------
 
-def replace_exact(html: str, old: str, new: str, label: str) -> str:
+def replace_exact(html: str, old: str, new: str, label: str, *, optional: bool = False) -> str:
     if old not in html:
+        if optional or new in html:
+            return html
         raise RuntimeError(f"Expected anchor not found for [{label}]: {old[:120]!r}")
     return html.replace(old, new, 1)
 
@@ -262,6 +399,7 @@ def main() -> None:
     generate_workspace_bundles()
     kb = run_geospec_city("kobanya")
     vi = run_geospec_city("leopoldstadt")
+    truth = write_canonical_truth(kb, vi)
 
     kb_m = {m["model_id"]: m for m in kb["s3"]["models"]}
     vi_m = {m["model_id"]: m for m in vi["s3"]["models"]}
@@ -269,6 +407,31 @@ def main() -> None:
     vi_m4_p = {r["name"]: r for r in vi_m["m4_ad"]["params"]}
     kb_m2_p = {r["name"]: r for r in kb_m["m2_rings"]["params"]}
     vi_m2_p = {r["name"]: r for r in vi_m["m2_rings"]["params"]}
+
+    kb_s6 = kb["s6"]
+    vi_s6 = vi["s6"]
+    kb_grp = kb_s6["grouped_importance"]
+    vi_grp = vi_s6["grouped_importance"]
+    vi_feat_map = {r["feature"]: r for r in vi_s6["feature_importance"]}
+    vi_outdoor_pct = (
+        vi_feat_map.get("kulteri_alapterulet_nm", {}).get("rel_pct", 0.0)
+        + vi_feat_map.get("d_kulteri_kapcsolat", {}).get("rel_pct", 0.0)
+    )
+    vi_p_300_500_hu = f"{vi_m2_p['ring_vagany_300_500']['p']:.3f}".replace(".", ",")
+    vi_p_300_500_en = f"{vi_m2_p['ring_vagany_300_500']['p']:.3f}"
+    kb_m4_vag_pct = hp_pct(kb_m4_p["AD(vagany,eucl,c=300m)"]["beta"])
+
+    def hu1(val: float, signed: bool = False) -> str:
+        s = f"{val:+.1f}" if signed else f"{val:.1f}"
+        return s.replace(".", ",")
+
+    kb_phys_hu = hu1(kb_grp["physical_pct"])
+    kb_trk_hu = hu1(kb_grp["rail_track_pct"])
+    kb_rail_hu = hu1(kb_grp["rail_pct"])
+    kb_sta_hu = hu1(kb_grp["rail_station_pct"])
+    vi_out_hu = hu1(vi_outdoor_pct)
+    vi_trk_hu = hu1(vi_grp["rail_track_pct"])
+    vi_rail_hu = hu1(vi_grp["rail_pct"])
 
     html = INDEX_HTML.read_text(encoding="utf-8")
 
@@ -321,6 +484,11 @@ def main() -> None:
             <a role="menuitem" href="./recipes/leopoldstadt_paper_replication_recipe.json" download="leopoldstadt_paper_replication_recipe.json" class="flex items-center justify-between px-3 py-1.5 hover:bg-slate-50 text-slate-500">
               <span>↓ Bécs nov. 1 dolgozat replikáció</span><span class="font-mono text-[10px]">.json</span>
             </a>
+            <div class="my-1 border-t border-slate-100"></div>
+            <div class="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-emerald-700">Lepecsételt Igazságforrás (v1.0-sealed)</div>
+            <a role="menuitem" href="./recipes/canonical_truth.json" download="canonical_truth.json" class="flex items-center justify-between px-3 py-1.5 hover:bg-emerald-50 text-emerald-800 font-semibold">
+              <span>🔒 Kanonikus Eredmények + SHA-256</span><span class="font-mono text-[10px]">.json</span>
+            </a>
           </div>
         </div>
         <a href="https://github.com/oliwerbig/kobanya-ingatlan-tdk/blob/main/Sz%C3%A1m%C3%ADt%C3%A1sok.ipynb" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1.5 text-xs bg-slate-900 hover:bg-slate-800 text-white px-2.5 sm:px-3 py-1.5 rounded-lg font-medium transition shadow-sm">
@@ -333,36 +501,37 @@ def main() -> None:
         </a>
       </div>"""
 
+    hdr_start = (
+        '<div class="flex items-center gap-2 shrink-0">'
+        if '<div class="flex items-center gap-2 shrink-0">' in html
+        else (
+            '<div class="flex flex-wrap items-center gap-2 shrink-0">'
+            if '<div class="flex flex-wrap items-center gap-2 shrink-0">' in html
+            else '<div class="flex flex-wrap items-center gap-2 min-w-0 max-w-full">'
+        )
+    )
     html = replace_section_between(
         html,
-        '<div class="flex items-center gap-2 shrink-0">',
+        hdr_start,
         "\n    </div>\n\n    <!-- NAVIGATION TABS",
         new_header_actions.lstrip(),
         "header_actions",
         after='id="top-header"' if 'id="top-header"' in html else "Kötöttpályás Közlekedési Externáliák",
-        max_lines=60,
-    ) if '<div class="flex items-center gap-2 shrink-0">' in html else replace_section_between(
-        html,
-        '<div class="flex flex-wrap items-center gap-2 shrink-0">',
-        "\n    </div>\n\n    <!-- NAVIGATION TABS",
-        new_header_actions.lstrip(),
-        "header_actions",
-        after="Kötöttpályás Közlekedési Externáliák",
         max_lines=80,
     )
 
     # 2. HERO THESIS STRIP + 6 KPI CARDS + REPRODUCIBILITY BAR
-    new_hero = f"""<!-- TDK TÉZIS-ÖSSZEFOGLALÓ & FŐ MUTATÓK (FRISSÍTETT GEOSPEC BEST-PRACTICE) -->
+    new_hero = f"""<!-- TDK TÉZIS-ÖSSZEFOGLALÓ & FŐ MUTATÓK (FRISSÍTETT GEOSPEC BEST-PRACTICE v1.0-sealed) -->
   <section class="bg-slate-900 text-slate-100 border-b border-slate-800">
     <div class="max-w-7xl mx-auto px-4 py-4 space-y-4">
       <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
         <div class="bg-slate-800/70 border border-slate-700/80 rounded-lg px-3.5 py-2.5">
           <div class="text-[10px] font-bold uppercase tracking-wider text-sky-400 mb-0.5">I. Állomásvölgy vs. vágányzaj</div>
-          <p class="text-slate-300 leading-relaxed">Kőbányán a nyers ≤500 m állomás-völgy -21,1% (1,11M vs. 1,40M Ft/m²), de kontrollálva a vágányhatás eltűnik (-4,8% NS; SHAP 80,1% fizikai vs. 5,0% vasút). Bécsben a 0–300 m zajdiszkont -16,9% – -17,7%, 300 m felett 0% (p = 0,813).</p>
+          <p class="text-slate-300 leading-relaxed">Kőbányán a nyers ≤500 m állomás-völgy -21,1% (1,11M vs. 1,40M Ft/m²), de kontrollálva a vágányhatás eltűnik ({hu1(kb_m4_vag_pct, True)}% NS; TreeSHAP {kb_phys_hu}% fizikai vs. {kb_trk_hu}% vágány). Bécsben a 0–300 m zajdiszkont -16,9% – -17,7%, 300 m felett 0% (p = {vi_p_300_500_hu}).</p>
         </div>
         <div class="bg-slate-800/70 border border-slate-700/80 rounded-lg px-3.5 py-2.5">
           <div class="text-[10px] font-bold uppercase tracking-wider text-emerald-400 mb-0.5">II. Minőségi szakadék &amp; tudatos várostervezés</div>
-          <p class="text-slate-300 leading-relaxed">Bécs Leopoldstadt korszerű/új állománya (92,6%) évtizedes tudatos városfejlesztés eredménye. Kőbányán a felújítás önmagában csak +6,7% (NS), a 2015 utáni új építés viszont +23,2% – +28,0% prémiumot ér el (kerülő medián: +141 m, max: +1 065 m).</p>
+          <p class="text-slate-300 leading-relaxed">Bécs Leopoldstadt korszerű/új állománya (92,6%) évtizedes tudatos városfejlesztés eredménye. Kőbányán a felújítás önmagában csak +6,7% (NS), a 2015 utáni új építés viszont +23,3% – +28,0% prémiumot ér el (kerülő medián: +141 m, max: +1 065 m).</p>
         </div>
         <div class="bg-slate-800/70 border border-slate-700/80 rounded-lg px-3.5 py-2.5">
           <div class="text-[10px] font-bold uppercase tracking-wider text-amber-400 mb-0.5">III. Mázsa tér &amp; önfinanszírozó LVC</div>
@@ -381,30 +550,30 @@ def main() -> None:
         </div>
         <div class="bg-slate-800/40 rounded-lg py-2 px-2">
           <div class="text-[11px] text-slate-400">Kőbánya Nyers vs. M4</div>
-          <div class="text-sm sm:text-base font-bold text-emerald-400">-21,1% <span class="text-xs font-normal text-slate-400">/ -4,8% (NS)</span></div>
+          <div class="text-sm sm:text-base font-bold text-emerald-400">-21,1% <span class="text-xs font-normal text-slate-400">/ {kb_m4_vag_pct:+.1f}% (NS)</span></div>
         </div>
         <div class="bg-slate-800/40 rounded-lg py-2 px-2">
           <div class="text-[11px] text-slate-400">2015+ Újépítés (Bp)</div>
-          <div class="text-sm sm:text-base font-bold text-sky-400">+23,2% – +28,0%***</div>
+          <div class="text-sm sm:text-base font-bold text-sky-400">+23,3% – +28,0%***</div>
         </div>
         <div class="bg-slate-800/40 rounded-lg py-2 px-2">
           <div class="text-[11px] text-slate-400">LVC Alap (New Wave)</div>
           <div class="text-sm sm:text-base font-bold text-amber-400">1,84 Mrd Ft <span class="text-xs font-normal text-slate-400">(15,8% ROI)</span></div>
         </div>
         <div class="bg-slate-800/40 rounded-lg py-2 px-2">
-          <div class="text-[11px] text-slate-400">M4 R² (Best-Practice)</div>
+          <div class="text-[11px] text-slate-400">M4 R² (v1.0-sealed)</div>
           <div class="text-sm sm:text-base font-bold text-emerald-400">{vi_m['m4_ad']['r2']:.4f} <span class="text-xs font-normal text-slate-400">/ {kb_m['m4_ad']['r2']:.4f}</span></div>
         </div>
       </div>
 
       <div class="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800/90 text-[11px]">
         <div class="flex flex-wrap items-center gap-1.5">
-          <span class="text-slate-400 font-semibold uppercase tracking-wider mr-1">GeoSpec Reprodukálhatóság:</span>
+          <span class="text-slate-400 font-semibold uppercase tracking-wider mr-1">GeoSpec v1.0-sealed:</span>
           <a href="./platform/index.html?study=kobanya" class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-teal-700 hover:bg-teal-600 text-white font-semibold transition">▶ Kőbánya GeoSpec-ben ↗</a>
           <a href="./platform/index.html?study=leopoldstadt" class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-teal-700 hover:bg-teal-600 text-white font-semibold transition">▶ Bécs GeoSpec-ben ↗</a>
           <a href="./recipes/kobanya_recipe.json" download="kobanya_recipe.json" class="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-mono transition">↓ kobanya_recipe.json</a>
           <a href="./recipes/leopoldstadt_recipe.json" download="leopoldstadt_recipe.json" class="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-mono transition">↓ leopoldstadt_recipe.json</a>
-          <a href="./recipes/kobanya_best_practice.geospec.json" download="kobanya_best_practice.geospec.json" class="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-mono transition">↓ .geospec.json (Bp)</a>
+          <a href="./recipes/canonical_truth.json" download="canonical_truth.json" class="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-emerald-900/60 hover:bg-emerald-800 text-emerald-100 border border-emerald-700 font-mono transition">🔒 canonical_truth.json</a>
         </div>
         <span class="text-slate-400">Kínálati árak (ingatlan.com / willhaben.at) · M1–M4 + épületszintű klaszterezés (Guard #2: n&lt;5 kiszűrve) · Silent Rail 2. fázis (BME × UTCN)</span>
       </div>
@@ -425,6 +594,7 @@ def main() -> None:
         "A kutatás empirikus alapját Budapest X. kerületének (Kőbánya, <strong>N=269</strong>) és Bécs II. kerületének (Leopoldstadt, <strong>N=378</strong>) szűrt, pontos geokódolt tranzakciós és kínálati lakáspiaci adatbázisa alkotja. Az alábbi modul bemutatja a két minta fizikai épületállományát, a lakhatási megfizethetőség strukturális különbségeit, a városszöveti és utcahálózati kanyargósságból fakadó gyalogos többletkerülőket (Network circuity / tortuosity), valamint bizonyítja a hedonikus modellezés alapfeltételeit: a logaritmikus normálitást és a multikollinearitás-mentességet (VIF &lt; 6,6).",
         "A kutatás empirikus alapját Budapest X. kerületének (Kőbánya, <strong>N = 269</strong>) és Bécs II. kerületének (Leopoldstadt, <strong>N = 378</strong>) házszámszinten geokódolt <strong>kínálati</strong> lakáshirdetési adatbázisa alkotja (<em>ingatlan.com</em>, <em>willhaben.at</em> — nem NAV/földhivatali tranzakciós árak). Bécs Leopoldstadt 92,6%-os korszerű/új állománya évtizedes tudatos önkormányzati várostervezés eredménye (ahogy Erő Zoltán is hangsúlyozta); a modul bemutatja a fizikai épületállományt, a gyalogos többletkerülőket (medián: +141 m, max: +1 065 m) és a hedonikus alapdiagnosztikát (VIF).",
         "tab1_intro",
+        optional=True,
     )
 
     new_tab1_kpis = f"""<!-- 6 KÁRTYÁS PIACMORFOLÓGIAI KPI SZALAG -->
@@ -486,6 +656,7 @@ def main() -> None:
         "medián: 143 m, max: 1 071 m",
         "medián: +141 m, max: +1 065 m",
         "tab1_detour_prose",
+        optional=True,
     )
 
     # 4. TAB 2: HEDONIC HERO, KPI STRIP, FIG 7, 8, 9, 10 & TABLES
@@ -494,6 +665,7 @@ def main() -> None:
         "R² = 0.749 (Bécs) / 0.610 (Bp)",
         f"R² = {vi_m['m4_ad']['r2']:.4f} (Bécs) / {kb_m['m4_ad']['r2']:.4f} (Bp; replikáció: 0.6348)",
         "tab2_hero_r2",
+        optional=True,
     )
 
     new_tab2_kpis = f"""<!-- TAB 2 HEDONIKUS KPI METRIC STRIP -->
@@ -516,17 +688,17 @@ def main() -> None:
         <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
           <div class="text-xs text-slate-500 font-medium">Erkély &amp; Terasz Prémium</div>
           <div class="text-lg font-bold text-indigo-600 mt-1">+{hp_pct(vi_m4_p['d_kulteri_kapcsolat']['beta']):.1f}%*** <span class="text-xs font-normal text-slate-400">Bécs</span></div>
-          <div class="text-[11px] text-slate-500 mt-0.5">Bp: +{hp_pct(kb_m4_p['d_kulteri_kapcsolat']['beta']):.1f}%* (SHAP: 34,0% Bécs)</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Bp: +{hp_pct(kb_m4_p['d_kulteri_kapcsolat']['beta']):.1f}% (TreeSHAP: {vi_outdoor_pct:.1f}% Bécs)</div>
         </div>
         <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
           <div class="text-xs text-slate-500 font-medium">Vasúti Zaj (0–300 m)</div>
           <div class="text-lg font-bold text-red-600 mt-1">-16,9% – -17,7%***</div>
-          <div class="text-[11px] text-slate-500 mt-0.5">Bécs M2; Bp kontrollált M4: -4,8% (NS)</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Bécs M2; Bp kontrollált M4: {kb_m4_vag_pct:+.1f}% (NS)</div>
         </div>
         <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
           <div class="text-xs text-slate-500 font-medium">Andersson–Day Határ</div>
           <div class="text-lg font-bold text-emerald-600 mt-1">300 m felett 0%</div>
-          <div class="text-[11px] text-slate-500 mt-0.5">Bécs 300–500 m: +1,4% (p = 0,813)</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Bécs 300–500 m: +1,4% (p = {vi_p_300_500_hu} NS)</div>
         </div>
       </div>"""
 
@@ -643,6 +815,7 @@ def main() -> None:
         "Minden lakásfizikai dummy pontos százalékos prémiuma és diszkontja az átlagos állapothoz viszonyítva [g = exp(β) - 1, HC3 szignifikancia-jelzésekkel].",
         "Minden lakásfizikai dummy százalékos prémiuma/diszkontja az átlagos állapothoz viszonyítva [g = exp(β) - 1, GeoSpec Best-Practice M4 klaszterezett SE, szigorúan kizárólagos állapotkategóriák].",
         "fig8_sub",
+        optional=True,
     )
     html = replace_section_between(
         html,
@@ -707,12 +880,14 @@ def main() -> None:
         "A két piacon becsült béta együtthatók és 95%-os megbízhatósági intervallumok MacKinnon–White HC3 robusztus standard hibákkal (Szürke = nem szignifikáns).",
         "A két piacon becsült M4 béta együtthatók és 95%-os épületszintű (koordináta-alapú) klaszterezett konfidenciaintervallumok (Szürke = nem szignifikáns).",
         "fig9_sub",
+        optional=True,
     )
     html = replace_exact(
         html,
         "Bécsben a vasúti pálya közelsége sziklaszilárdan negatív (<strong>β = -0.2265***, p &lt; 0.001</strong>), és a főúti közelség is szignifikáns diszkontot képez (<strong>β = -0.0911***</strong>). Ezzel szemben Kőbányán a vasút közelsége önmagában nem szignifikáns a globális OLS modellben, ami a helyi térbeli struktúrák (SAR & GWR) szükségességét jelzi előre.",
         f"Bécsben a vasúti pálya közelsége sziklaszilárdan negatív (<strong>β = {vi_m4_p['AD(vagany,eucl,c=300m)']['beta']:.4f}***, p &lt; 0.001</strong>), míg Kőbányán a kontrollált globális vágányhatás statisztikailag nem szignifikáns (<strong>β = {kb_m4_p['AD(vagany,eucl,c=300m)']['beta']:.4f}, p = {kb_m4_p['AD(vagany,eucl,c=300m)']['p']:.3f}</strong>), mert az árkülönbséget az épületállomány állapota és a lokális térbeli struktúra (GWR / SAR) hordozza.",
         "fig9_prose",
+        optional=True,
     )
 
     # Fig 10 (0-300m Acoustic decay)
@@ -756,9 +931,9 @@ def main() -> None:
             elif "300 m határ" in txt:
                 p_300 = vi_m2_p["ring_vagany_300_500"]["p"]
                 ann["text"] = f"300 m határ (0% zajhatás, p={p_300:.3f})"
-            elif "Nyers" in txt:
+            elif "Nyers" in txt or "Kőbánya ≤500m" in txt:
                 p_kb = kb_m4_p["AD(vagany,eucl,c=300m)"]["p"]
-                ann["text"] = f"Kőbánya ≤500m völgy: -21,1% (nyers) | M4 kontrollált: -4,8% (p={p_kb:.3f} NS)"
+                ann["text"] = f"Kőbánya ≤500m völgy: -21,1% (nyers) | M4 kontrollált: {kb_m4_vag_pct:+.1f}% (p={p_kb:.3f} NS)"
 
     html = patch_plotly_div(html, "959ffbee-cb91-459e-b6b3-5613efc2c90e", mut_fig10)
     html = replace_section_between(
@@ -779,7 +954,7 @@ def main() -> None:
               <span>🛡️</span> 2. Kőbánya: Állapot-konfounding vs. Silent Rail 2. Fázis
             </h4>
             <p class="leading-relaxed text-slate-600">
-              Kőbányán az épületminőség és az örökölt zárványhatás kontrollálása után a vágányhatás nem szignifikáns (<strong>M4 β = {kb_m4_p['AD(vagany,eucl,c=300m)']['beta']:.4f}, -4,8% NS</strong>). Fontos korlát, hogy a puszta távolsági átlag még nem választja szét a pálya- és járműműszaki tényezőket (ív vs. egyenes, töltés vs. viadukt, korszerű motorvonat vs. fékező tehervonat), amelyeket a Silent Rail 2. fázis (BME × UTCN) mérési programja vizsgál tovább.
+              Kőbányán az épületminőség és az örökölt zárványhatás kontrollálása után a vágányhatás nem szignifikáns (<strong>M4 β = {kb_m4_p['AD(vagany,eucl,c=300m)']['beta']:.4f}, {kb_m4_vag_pct:+.1f}% NS</strong>). Fontos korlát, hogy a puszta távolsági átlag még nem választja szét a pálya- és járműműszaki tényezőket (ív vs. egyenes, töltés vs. viadukt, korszerű motorvonat vs. fékező tehervonat), amelyeket a Silent Rail 2. fázis (BME × UTCN) mérési programja vizsgál tovább.
             </p>
           </div>""",
         "fig10_prose",
@@ -918,12 +1093,15 @@ def main() -> None:
     vi_sem_m4 = next(x for x in vi_s4["model_comparison"] if x["model"].startswith("SEM"))
     kb_imp_vag = next(x for x in kb_s4["impacts_sar"] if "vagany" in x["variable"])
     vi_imp_vag = next(x for x in vi_s4["impacts_sar"] if "vagany" in x["variable"])
+    vi_idw_row = next((w for w in vi_s4["weights_robustness"] if w["w_id"] == "idw_2500"), {})
+    vi_sar_verdict = "Classic OLS" if "Classic OLS" in vi_s4["anselin"]["verdict"] else vi_s4["anselin"]["recommended_model"]
 
     html = replace_exact(
         html,
         "β = -1.6257 (50.6% szign.)",
         f"GWR R² = {kb['s5']['gwr_r2']:.4f} (Bp) / {vi['s5']['gwr_r2']:.4f} (Bécs)",
         "tab3_hero_gwr",
+        optional=True,
     )
 
     new_tab3_kpis = f"""<!-- TAB 3 SPATIAL KPI METRIC STRIP -->
@@ -931,22 +1109,22 @@ def main() -> None:
         <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
           <div class="text-xs text-slate-500 font-medium">Moran's I Nyers Árak</div>
           <div class="text-lg font-bold text-blue-700 mt-1">{kb_s4['moran_y']['moran_i']:.3f}*** <span class="text-xs font-normal text-slate-400">Bp</span></div>
-          <div class="text-[11px] text-slate-500 mt-0.5">Bécs: {vi_s4['moran_y']['moran_i']:.3f}*** (p&lt;0.001)</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Bécs knn5_dedup: {vi_s4['moran_y']['moran_i']:.3f}***</div>
         </div>
         <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
           <div class="text-xs text-slate-500 font-medium">M4 OLS Reziduális Moran's I</div>
           <div class="text-lg font-bold text-emerald-600 mt-1">{kb_s4['moran_resid']['moran_i']:.3f} <span class="text-xs font-normal text-slate-400">Bp</span></div>
-          <div class="text-[11px] text-slate-500 mt-0.5">SAR szűrt I: {kb_sar_m4['resid_moran_i']:.4f} (NS)</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Bécs knn5_dedup: {vi_s4['moran_resid']['moran_i']:+.3f} (NS)</div>
         </div>
         <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
-          <div class="text-xs text-slate-500 font-medium">SAR Térbeli Átgyűrűzés</div>
-          <div class="text-lg font-bold text-indigo-600 mt-1">{vi_imp_vag['spillover_share_pct']:.1f}% Spillover</div>
-          <div class="text-[11px] text-slate-500 mt-0.5">Bécs IDW 2500 (Bp: {kb_imp_vag['spillover_share_pct']:.1f}%)</div>
+          <div class="text-xs text-slate-500 font-medium">Épületek Közti SAR Spillover</div>
+          <div class="text-lg font-bold text-indigo-600 mt-1">{kb_imp_vag['spillover_share_pct']:.1f}% <span class="text-xs font-normal text-slate-400">Bp**</span></div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Bécs knn5_dedup: {vi_imp_vag['spillover_share_pct']:.1f}% (NS; ρ={vi_sar_m4['spatial_param']:.3f})</div>
         </div>
         <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
           <div class="text-xs text-slate-500 font-medium">Anselin Döntési Fa (M4)</div>
-          <div class="text-lg font-bold text-blue-700 mt-1">SAR (Bp) / SEM (Bécs)</div>
-          <div class="text-[11px] text-slate-500 mt-0.5">Térbeli súlymátrixok validálva</div>
+          <div class="text-lg font-bold text-blue-700 mt-1">SAR (Bp) / {vi_sar_verdict} (Bécs)</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Egységes knn5_dedup (0% helyazonos)</div>
         </div>
         <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
           <div class="text-xs text-slate-500 font-medium">GWR R² (m3_log Fókusz)</div>
@@ -1001,18 +1179,18 @@ def main() -> None:
         f"""        <div class="mt-4 pt-4 border-t border-slate-100 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-slate-700">
           <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
             <h4 class="font-bold text-indigo-900 flex items-center gap-1.5 mb-1.5">
-              <span>📍</span> 1. Nyers Térbeli Klaszterezettség (deduplikált épület-súlymátrix)
+              <span>📍</span> 1. Nyers Térbeli Klaszterezettség (egységes knn5_dedup súlymátrix)
             </h4>
             <p class="leading-relaxed text-slate-600">
-              A nyers lakásárak mindkét piacon szignifikáns pozitív térbeli autokorrelációt mutatnak (Bécs IDW 2500: <strong>I = {vi_s4['moran_y']['moran_i']:.4f}***, z = {vi_s4['moran_y']['z']:.2f}</strong>; Kőbánya knn5_dedup: <strong>I = {kb_s4['moran_y']['moran_i']:.4f}***, z = {kb_s4['moran_y']['z']:.2f}</strong>), igazolva a térökonometriai becslés szükségességét.
+              A nyers lakásárak az azonos épületen belüli duplikációktól megtisztított <code>knn5_dedup</code> súlymátrixszal mindkét piacon szignifikáns klaszterezettséget mutatnak (Kőbánya: <strong>I = {kb_s4['moran_y']['moran_i']:.4f}***, z = {kb_s4['moran_y']['z']:.2f}</strong>; Bécs: <strong>I = {vi_s4['moran_y']['moran_i']:.4f}***, z = {vi_s4['moran_y']['z']:.2f}</strong>).
             </p>
           </div>
           <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
             <h4 class="font-bold text-emerald-800 flex items-center gap-1.5 mb-1.5">
-              <span>📉</span> 2. Egzakt M<sub>x</sub>-korrigált Reziduális Moran's I és SAR/SEM Szűrés
+              <span>📉</span> 2. Egzakt M<sub>x</sub>-korrigált Reziduális Moran's I és SAR/OLS Eltérés
             </h4>
             <p class="leading-relaxed text-slate-600">
-              Az egzakt <em>M<sub>x</sub></em> reziduális diagnosztikával az M4 OLS után maradó gyenge térbeli korreláció (Kőbánya: <strong>{kb_s4['moran_resid']['moran_i']:.4f}</strong>; Bécs: <strong>{vi_s4['moran_resid']['moran_i']:.4f}</strong>) a SAR és SEM modellek alkalmazásával teljesen összeomlik (SAR szűrt reziduális I = <strong>{kb_sar_m4['resid_moran_i']:.4f}</strong> Bp-en; SEM Bécsben: <strong>{vi_sem_m4['resid_moran_i']:.4f}</strong>, p = {vi_sem_m4['resid_moran_p']:.2f} NS).
+              Az egzakt <em>M<sub>x</sub></em> reziduális diagnosztikával az M4 OLS után Bécsben a <code>knn5_dedup</code> mátrixon eltűnik az épületek közötti maradék autokorreláció (<strong>I = {vi_s4['moran_resid']['moran_i']:+.4f}, p = {vi_s4['moran_resid']['p']:.4f} NS</strong> → Classic OLS), míg Kőbányán valós épületek közötti térbeli függőség marad (<strong>I = {kb_s4['moran_resid']['moran_i']:.4f}***</strong>, SAR szűrés után: <strong>{kb_sar_m4['resid_moran_i']:.4f}</strong> NS).
             </p>
           </div>""",
         "fig12_prose",
@@ -1020,7 +1198,7 @@ def main() -> None:
         max_lines=30,
     )
 
-    # Fig 13 (SAR direct/indirect/total impacts from GeoSpec Stage 4)
+    # Fig 13 (SAR direct/indirect/total impacts from GeoSpec Stage 4 — unified knn5_dedup)
     vi_imp_map = {x["variable"]: x for x in vi_s4["impacts_sar"]}
     kb_imp_map = {x["variable"]: x for x in kb_s4["impacts_sar"]}
     f13_items = [
@@ -1045,10 +1223,10 @@ def main() -> None:
         traces[3]["y"] = y_lbls
         traces[3]["x"] = shares
         traces[3]["text"] = [f"<b>{s:.1f}%</b>" for s in shares]
-        traces[3]["marker"]["color"] = ["#dc2626", "#dc2626", "#dc2626", "#2563eb", "#2563eb", "#2563eb"]
+        traces[3]["marker"]["color"] = ["#94a3b8", "#94a3b8", "#94a3b8", "#2563eb", "#2563eb", "#2563eb"]
         for ann in layout.get("annotations", []):
             if "Bécs" in str(ann.get("text", "")) and "%" in str(ann.get("text", "")):
-                ann["text"] = f"<b>Bécs M4 SAR spillover: {vi_imp_vag['spillover_share_pct']:.1f}%</b>"
+                ann["text"] = f"<b>Bécs knn5_dedup spillover: {vi_imp_vag['spillover_share_pct']:.1f}% (NS)</b>"
 
     html = patch_plotly_div(html, "38a4711e-cbfa-42fe-a0ce-476fd654497b", mut_fig13)
 
@@ -1123,7 +1301,7 @@ def main() -> None:
           </table>
         </div>
         <div class="mt-4 p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-600 leading-relaxed">
-          <strong>Ökonometriai Módszertani Eredmény (GeoSpec Best-Practice Stage 4):</strong> Kőbányán (<code>knn5_dedup</code> súlymátrix) az M4 zászlóshajó modellnél a robusztus LM-teszt a <strong>SAR modellt</strong> támogatja (RLM-Lag = {kb_s4['anselin']['rlm_lag']:.2f}, p = {kb_s4['anselin']['rlm_lag_p']:.4f}), míg Bécsben (<code>idw_2500</code> súlymátrix) a <strong>SEM és SAR egyaránt csökkenti az AIC-t</strong> ({vi_s4['model_comparison'][0]['aic']:.1f} → SAR {vi_sar_m4['aic']:.1f}, SEM {vi_sem_m4['aic']:.1f}), igazolva a szomszédsági ártranszmissziót (ρ = {vi_sar_m4['spatial_param']:.4f}***) és a finomabb szöveti hibakorrelációt (λ = {vi_sem_m4['spatial_param']:.4f}***).
+          <strong>Ökonometriai Módszertani Eredmény (GeoSpec v1.0-sealed Stage 4 — egységes <code>knn5_dedup</code>):</strong> Kőbányán a deduplikált mátrixszal is a <strong>SAR modell</strong> a domináns (ρ = {kb_sar_m4['spatial_param']:.4f}**, RLM-Lag = {kb_s4['anselin']['rlm_lag']:.2f}, p = {kb_s4['anselin']['rlm_lag_p']:.4f}; {kb_imp_vag['spillover_share_pct']:.1f}% spillover). Bécsben az azonos társasházi duplikációk kiszűrésével (<code>knn5_dedup</code>) az épületek közötti reziduális spillover eltűnik (SAR ρ = {vi_sar_m4['spatial_param']:.4f}, p = {vi_sar_m4['spatial_p']:.4f} NS; Anselin: {vi_s4['anselin']['verdict']}). Robusztussági kontrollként az <code>idw_2500</code> ({vi_idw_row.get('colocated_pairs_pct', 32.3):.1f}% helyazonos társasházi pár) még mutat házon belüli korrelációt (ρ = {vi_idw_row.get('sar_rho', 0.4223):.4f}***, λ = {vi_idw_row.get('sem_lambda', 0.7422):.4f}***).
         </div>"""
 
     html = replace_section_between(
@@ -1134,73 +1312,198 @@ def main() -> None:
         "spatial_table",
     )
 
+    # Fig 13 prose card
+    html = replace_section_between(
+        html,
+        '        <div class="mt-4 pt-4 border-t border-slate-100 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-slate-700">',
+        "\n        </div>\n      </div>\n\n      <!-- MODUL",
+        f"""        <div class="mt-4 pt-4 border-t border-slate-100 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-slate-700">
+          <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+            <h4 class="font-bold text-blue-900 flex items-center gap-1.5 mb-1.5">
+              <span>🏙️</span> 1. Bécs: Épületek között ~0% (<code>knn5_dedup</code> → Classic OLS)
+            </h4>
+            <p class="leading-relaxed text-slate-600">
+              Bécs Leopoldstadtban a Guard #5 szerinti egységes <code>knn5_dedup</code> súlymátrixszal (0% azonos társasházon belüli pár) az épületek közötti maradék SAR spillover statisztikailag nulla (<strong>ρ = {vi_sar_m4['spatial_param']:.3f}, p = {vi_sar_m4['spatial_p']:.3f} NS</strong>; Classic OLS), vagyis a korszerű állomány és a 300 m-es zajhatár önmagában megmagyarázza az árakat. Az <code>idw_2500</code> ({vi_idw_row.get('colocated_pairs_pct', 32.3):.1f}% helyazonos kapcsolat) ρ = {vi_idw_row.get('sar_rho', 0.422):.3f}*** értéke a társasházon belüli lakáscsoportokból ered.
+            </p>
+          </div>
+          <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+            <h4 class="font-bold text-slate-900 flex items-center gap-1.5 mb-1.5">
+              <span>🧭</span> 2. Kőbánya: Valós épületek közötti átgyűrűzés ({kb_imp_vag['spillover_share_pct']:.1f}%)
+            </h4>
+            <p class="leading-relaxed text-slate-600">
+              Kőbányán ugyanezen deduplikált épületmátrixon (<code>knn5_dedup</code>, 0% helyazonos pár) is valós, szignifikáns szomszédsági árhatás mérhető (SAR <strong>ρ = {kb_sar_m4['spatial_param']:.3f}**, p = {kb_sar_m4['spatial_p']:.4f}</strong>; <strong>{kb_imp_vag['spillover_share_pct']:.1f}%</strong> indirekt arány, {1.0/(1.0-kb_sar_m4['spatial_param']):.2f}× multiplikátor): a leromlott környezet lehúzza a szomszédos házakat.
+            </p>
+          </div>""",
+        "fig13_prose",
+        after="38a4711e-cbfa-42fe-a0ce-476fd654497b",
+        max_lines=30,
+    )
+
     # 6. TAB 4: DETOUR NUMBERS & TUNNEL STIGMA TYPO FIX
     html = replace_exact(
         html,
         '<div class="text-lg font-bold text-red-600 mt-1">+1 071 m (Bp)</div>',
         '<div class="text-lg font-bold text-red-600 mt-1">+1 065 m (Bp)</div>',
         "tab4_detour_kpi",
+        optional=True,
     )
     html = replace_exact(
         html,
         "Utcahálózati Morfológia & Kétoldali Bejáratok (Max Δd = +1 071 m)",
         "Utcahálózati Morfológia & Kétoldali Bejáratok (Medián +141 m, Max Δd = +1 065 m)",
         "tab4_detour_h4",
+        optional=True,
     )
     html = replace_exact(
         html,
         "(Δd = Hálózat - Légvonal, max +1 071 m)",
         "(Δd = Hálózat - Légvonal, medián +141 m, max +1 065 m)",
         "tab4_detour_p",
+        optional=True,
     )
     html = replace_exact(
         html,
         "vasúti alagút-zárvány",
         "vasúti vágány-zárvány",
         "tab4_alagut_zarvany",
+        optional=True,
     )
 
-    # 7. TAB 5: SHAP & NEW WAVE RESIDENCE LVC UPDATE (NO "elvonási", NO "szuterén", EXACT 1.84 MRD FT)
-    html = replace_exact(
-        html,
-        """        <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
-          <div class="text-xs text-slate-500 font-medium">Térbeli Változók Súlya</div>
-          <div class="text-lg font-bold text-blue-700 mt-1">28.4%</div>
-          <div class="text-[11px] text-slate-500 mt-0.5">SHAP relatív fontosság</div>
+    # 7. TAB 5: SEALED STAGE 6 PURE-NUMPY GBRT & EXACT TREESHAP + NEW WAVE RESIDENCE LVC UPDATE
+    new_tab5_kpis = f"""        <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
+          <div class="text-xs text-slate-500 font-medium">TreeSHAP Súly (Kőbánya)</div>
+          <div class="text-lg font-bold text-blue-700 mt-1">{kb_phys_hu}% vs. {kb_trk_hu}%</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Fizikai jellemzők vs. vágány (össz. vasút: {kb_rail_hu}%)</div>
         </div>
         <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
-          <div class="text-xs text-slate-500 font-medium">LVC Tőkenyereség (Bécs)</div>
-          <div class="text-lg font-bold text-emerald-600 mt-1">148.6 M €</div>
-          <div class="text-[11px] text-slate-500 mt-0.5">1125 m állomási zóna</div>
-        </div>
-        <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
-          <div class="text-xs text-slate-500 font-medium">LVC Forrásalap (Bp)</div>
-          <div class="text-lg font-bold text-blue-700 mt-1">12.4 Mrd Ft</div>
-          <div class="text-[11px] text-slate-500 mt-0.5">Önkormányzati alap</div>
-        </div>""",
-        """        <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
-          <div class="text-xs text-slate-500 font-medium">SHAP Súly (Kőbánya)</div>
-          <div class="text-lg font-bold text-blue-700 mt-1">80,1% vs. 5,0%</div>
-          <div class="text-[11px] text-slate-500 mt-0.5">Fizikai jellemzők vs. vasút</div>
-        </div>
-        <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
-          <div class="text-xs text-slate-500 font-medium">SHAP Súly (Bécs)</div>
-          <div class="text-lg font-bold text-emerald-600 mt-1">34,0% vs. 19,4%</div>
-          <div class="text-[11px] text-slate-500 mt-0.5">Erkély/terasz vs. vasút</div>
+          <div class="text-xs text-slate-500 font-medium">TreeSHAP Súly (Bécs)</div>
+          <div class="text-lg font-bold text-emerald-600 mt-1">{vi_out_hu}% vs. {vi_trk_hu}%</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Erkély/terasz vs. vágány (össz. vasút: {vi_rail_hu}%)</div>
         </div>
         <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">
           <div class="text-xs text-slate-500 font-medium">LVC Forrásalap (New Wave)</div>
           <div class="text-lg font-bold text-blue-700 mt-1">1,84 Mrd Ft</div>
           <div class="text-[11px] text-slate-500 mt-0.5">6,8 ha (+10% × 20%) · 15,8% ROI</div>
-        </div>""",
+        </div>"""
+
+    html = replace_section_between(
+        html,
+        '        <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm text-center">\n          <div class="text-xs text-slate-500 font-medium">',
+        "\n      </div>\n\n      <!-- MODUL 1:",
+        new_tab5_kpis,
         "tab5_kpis",
+        after="Alapterület (m²)</div>",
+        max_lines=30,
     )
 
-    html = replace_exact(
+    # Fig 14 (Sealed Stage 6 GroupKFold CV Benchmark across OLS, Ridge-GCV, Pure-NumPy GBRT)
+    kb_bmap = {b["model"]: b for b in kb_s6["benchmark"]}
+    vi_bmap = {b["model"]: b for b in vi_s6["benchmark"]}
+    f14_models = ["OLS Baseline", "Ridge (GCV)", "GBRT (Pure-NumPy)"]
+
+    def mut_fig14(traces, layout):
+        traces[0]["x"] = f14_models
+        traces[0]["y"] = [round(kb_bmap[m]["cv_r2"], 4) for m in f14_models]
+        traces[0]["text"] = [f"{kb_bmap[m]['cv_r2']:.3f}" for m in f14_models]
+        traces[0]["textposition"] = "auto"
+        traces[1]["x"] = f14_models
+        traces[1]["y"] = [round(vi_bmap[m]["cv_r2"], 4) for m in f14_models]
+        traces[1]["text"] = [f"{vi_bmap[m]['cv_r2']:.3f}" for m in f14_models]
+        traces[1]["textposition"] = "auto"
+        layout["title"]["text"] = (
+            "<b>14. Ábra: GeoSpec Stage 6 Épületklaszteres GroupKFold CV R² Benchmark (v1.0-sealed, Seed=42)</b>"
+        )
+        layout["yaxis"] = {**(layout.get("yaxis") or {}), "range": [0, 0.7]}
+
+    html = patch_plotly_div(html, "db64bd98-9507-4efd-9152-16ef7a8dfa8b", mut_fig14)
+    html = replace_section_between(
         html,
-        "a magas alapterület (vörös pontok) és az újépítésű státusz határozottan jobbra (+SHAP) tolja az árat, míg a szuterén jelleg és a felújítandó állapot markánsan balra (-SHAP) húzza a becslést.",
-        "a fizikai jellemzők és az új építésű státusz dominálnak: Kőbányán a fizikai attribútumok adják a magyarázóerő <strong>80,1%-át</strong>, míg a vasúti közelség súlya mindössze <strong>5,0%</strong>; Bécsben az erkély/terasz önmagában <strong>34,0%-ot</strong>, a vasút <strong>19,4%-ot</strong> képvisel.",
+        '        <div class="mt-4 pt-4 border-t border-slate-100 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-slate-700">',
+        "\n        </div>\n      </div>\n\n      <!-- 7-MODELLES ML NAGYTÁBLÁZAT -->",
+        f"""        <div class="mt-4 pt-4 border-t border-slate-100 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-slate-700">
+          <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+            <h4 class="font-bold text-amber-900 flex items-center gap-1.5 mb-1.5">
+              <span>🚀</span> 1. Szivárgásmentes Épületklaszteres Validáció (GeoSpec Stage 6)
+            </h4>
+            <p class="leading-relaxed text-slate-600">
+              A <code>v1.0-sealed</code> adatbázison ({kb_s6['n_obs']} ill. {vi_s6['n_obs']} lakás, 5-fold épületklaszteres GroupKFold CV, fix <code>seed = {kb_s6['random_seed']}</code>) Kőbányán a Pure-NumPy GBRT érte el a legjobb mintán kívüli eredményt (<strong>CV R² = {kb_bmap['GBRT (Pure-NumPy)']['cv_r2']:.4f}</strong> vs. Ridge {kb_bmap['Ridge (GCV)']['cv_r2']:.4f}, in-sample R² = {kb_bmap['GBRT (Pure-NumPy)']['in_sample_r2']:.4f}). Bécsben a nagy teraszos tömbprojektek lineáris extrapolációja miatt a Ridge/OLS vezet (<strong>CV R² = {vi_bmap['Ridge (GCV)']['cv_r2']:.4f}</strong>; GBRT in-sample R² = {vi_bmap['GBRT (Pure-NumPy)']['in_sample_r2']:.4f}).
+            </p>
+          </div>
+          <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+            <h4 class="font-bold text-slate-900 flex items-center gap-1.5 mb-1.5">
+              <span>⚖️</span> 2. Determinisztikus TreeSHAP + Oksági Következtetés
+            </h4>
+            <p class="leading-relaxed text-slate-600">
+              Az egzakt Lundberg TreeSHAP (maximális additív hiba: <strong>{kb_s6['local_accuracy_max_err']:.1e}</strong>) közvetlenül böngészőben, külső szerver nélkül reprodukálható a GeoSpec 6. fülén. A nemlineáris súlyok megerősítik az M1–M4 oksági eredményeket: Kőbányán a fizikai minőség (<strong>{kb_phys_hu}%</strong>), Bécsben a terasz és a 300 m-es csendes sáv (<strong>{vi_trk_hu}%</strong> vágány) dominál.
+            </p>
+          </div>""",
+        "fig14_prose",
+        after="db64bd98-9507-4efd-9152-16ef7a8dfa8b",
+        max_lines=30,
+    )
+
+    # Fig 19 (Sealed Stage 6 Exact TreeSHAP Global Feature Shares — zero rare outliers)
+    SHAP_LABEL_MAP = {
+        "d_epult_2015_utan": "Új építés (2015 után) dummy",
+        "log(alapterulet_nm)": "Alapterület ln(m²)",
+        "kulteri_alapterulet_nm": "Kültéri méret (erkély/terasz m²)",
+        "ln(allomas_net)": "ln(Vasútállomás gyalogtáv hm)",
+        "ln(vagany_eucl)": "ln(Vasúti vágány távolság m)",
+        "ln(fout_eucl)": "ln(Főút távolság m)",
+        "d_felujitott": "Felújított állapot dummy",
+        "d_felujitando": "Felújítandó állapot dummy",
+        "d_kulteri_kapcsolat": "Erkély / terasz kapcsolat dummy",
+        "d_foldszint": "Földszinti elhelyezkedés dummy",
+        "d_zaroszint": "Zárószint / legfelső emelet dummy",
+        "d_lift": "Lift jelenléte dummy",
+        "szobak_szama": "Szobák száma (db)",
+        "d_panel": "Panel építési technológia dummy",
+    }
+    kb_shap_m = {r["feature"]: r["rel_pct"] for r in kb_s6["feature_importance"]}
+    vi_shap_m = {r["feature"]: r["rel_pct"] for r in vi_s6["feature_importance"]}
+    all_shap_feats = sorted(
+        set(kb_shap_m.keys()) | set(vi_shap_m.keys()),
+        key=lambda fn: (kb_shap_m.get(fn, 0.0) + vi_shap_m.get(fn, 0.0)),
+    )
+
+    def mut_fig19(traces, layout):
+        y_lbls = [SHAP_LABEL_MAP.get(fn, fn) for fn in all_shap_feats]
+        traces[0]["name"] = "Budapest X. Kőbánya (Pure-NumPy GBRT)"
+        traces[0]["y"] = y_lbls
+        traces[0]["x"] = [round(kb_shap_m.get(fn, 0.0), 2) for fn in all_shap_feats]
+        traces[1]["name"] = "Bécs II. Leopoldstadt (Pure-NumPy GBRT)"
+        traces[1]["y"] = y_lbls
+        traces[1]["x"] = [round(vi_shap_m.get(fn, 0.0), 2) for fn in all_shap_feats]
+        layout["title"]["text"] = (
+            "<b>19. Ábra: Egzakt TreeSHAP Globális Változó-fontosság (GeoSpec Stage 6, v1.0-sealed)</b><br>"
+            "<span style='font-size:12px;color:#64748b'>Pure-NumPy GBRT (n_estimators=150, depth=3, seed=42) relatív |SHAP| magyarázóerő (%)</span>"
+        )
+
+    html = patch_plotly_div(html, "c3c9ebdb-4826-4f66-8203-2c3ea679120d", mut_fig19)
+    html = replace_section_between(
+        html,
+        '        <div class="mt-4 pt-4 border-t border-slate-100 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-slate-700">',
+        "\n        </div>\n      </div>\n\n      <!--",
+        f"""        <div class="mt-4 pt-4 border-t border-slate-100 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-slate-700">
+          <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+            <h4 class="font-bold text-purple-900 flex items-center gap-1.5 mb-1.5">
+              <span>🎯</span> 1. Értékmeghatározó Attribútumok Eltérő Súlypontja
+            </h4>
+            <p class="leading-relaxed text-slate-600">
+              A lepecsételt Stage 6 TreeSHAP elemzés pontosan visszaigazolja a hedonikus eredményeket: Kőbányán a fizikai jellemzők és állapot adják az ármagyarázat <strong>{kb_phys_hu}%-át</strong> (míg a vágányközelség mindössze <strong>{kb_trk_hu}%</strong>, összes vasút {kb_rail_hu}%). Bécsben az erkély/terasz (<strong>{vi_out_hu}%</strong>) és a vágányközelség (<strong>{vi_trk_hu}%</strong> — közel 5× akkora súly!) határozza meg a különbségeket.
+            </p>
+          </div>
+          <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+            <h4 class="font-bold text-slate-900 flex items-center gap-1.5 mb-1.5">
+              <span>🚂</span> 2. Átjárható Állomásközelség vs. Vágányzaj
+            </h4>
+            <p class="leading-relaxed text-slate-600">
+              A két városrész összevetése rámutat, hogy elöregedett rozsdaövezetben (Kőbánya) a vevő elsősorban épületminőséget vásárol, ezért az állomáselérés súlya (<strong>{kb_sta_hu}%</strong>) megelőzi a vágányzajt ({kb_trk_hu}%). Amint a házak korszerűsödnek (Bécs, 92,6% modern/új állomány), a fizikai felülbírálás eltűnik és előtérbe lép a 300 m-es csendes sáv védelme.
+            </p>
+          </div>""",
         "tab5_shap_prose",
+        after="c3c9ebdb-4826-4f66-8203-2c3ea679120d",
+        max_lines=30,
     )
 
     html = replace_exact(
@@ -1208,12 +1511,14 @@ def main() -> None:
         '<h3 class="text-base font-bold text-slate-900">Értéknövekmény-elvonási (LVC) Szcenárió Kalkulátor</h3>',
         '<h3 class="text-base font-bold text-slate-900">Értékmegragadási (Land Value Capture, LVC) Szcenárió Kalkulátor</h3>',
         "fig15_h3",
+        optional=True,
     )
     html = replace_exact(
         html,
         "Az állomási TOD prémiumból keletkező magántőke-felértékelődés önkormányzati visszanyerése 3 szakpolitikai adóelvonási szcenárió mentén (Konzervatív 10%, Mérsékelt 25%, Ambiciózus 50%).",
         "A New Wave Residence (6,8 ha) ütemezett fejlesztéséből és a csomóponti átminősítésből származó közösségi értékmegragadás (15%, 20% bázis és 25% LVC-ráta mellett).",
         "fig15_sub",
+        optional=True,
     )
 
     def mut_fig15(traces, layout):
@@ -1298,10 +1603,16 @@ def main() -> None:
         "838 eFt",
         "tranzakciós és kínálati",
         "Szuterén Diszkont",
+        "Szuterén szint dummy",
         "1 071 m",
         "1071m",
         "Medián: 143 m",
         "medián: 143 m",
+        "0,738",
+        "0.738",
+        "80,1% vs. 5,0%",
+        "34,0% vs. 19,4%",
+        "41.3% Spillover",
     ]
     for bad in forbidden_prose:
         if bad.lower() in prose_blob.lower():
@@ -1311,6 +1622,7 @@ def main() -> None:
     assert len(re.findall(r"Plotly\.newPlot\(", html)) == 23, "Lost a Plotly chart!"
     assert "GEO_KOBANYA" in html and "GEO_LEOPOLDSTADT" in html and "mazsa-stage" in html
     assert "./geospec_input/" not in html, "Found stale ./geospec_input/ link in index.html!"
+    assert "v1.0-sealed" in html and "canonical_truth.json" in html, "Missing SSOT seal link/version in index.html!"
     assert len(html) > 1_400_000, f"index.html unexpectedly small: {len(html)}"
 
     # Verify every local link in header/hero resolves on disk

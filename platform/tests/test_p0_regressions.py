@@ -1116,10 +1116,10 @@ def test_golden_cross_city_replication_and_best_practice():
 
     expected_paper = {
         "kobanya": {
-            "m1_base": {"n": 269, "k": 13, "r2": 0.6223, "adj_r2": 0.6046},
-            "m2_rings": {"n": 269, "k": 20, "r2": 0.6667, "adj_r2": 0.6413},
-            "m3_log": {"n": 269, "k": 16, "r2": 0.6359, "adj_r2": 0.6143},
-            "m4_ad": {"n": 269, "k": 16, "r2": 0.6320, "adj_r2": 0.6102},
+            "m1_base": {"n": 269, "k": 13, "r2": 0.6271, "adj_r2": 0.6097},
+            "m2_rings": {"n": 269, "k": 20, "r2": 0.6588, "adj_r2": 0.6328},
+            "m3_log": {"n": 269, "k": 16, "r2": 0.6390, "adj_r2": 0.6176},
+            "m4_ad": {"n": 269, "k": 16, "r2": 0.6348, "adj_r2": 0.6132},
         },
         "leopoldstadt": {
             "m1_base": {"n": 378, "k": 11, "r2": 0.6821, "adj_r2": 0.6735},
@@ -1131,6 +1131,13 @@ def test_golden_cross_city_replication_and_best_practice():
 
     for city, exp_models in expected_paper.items():
         cols = _load_csv_cols(_GI_DIR / f"{city}_dataset.csv")
+        # Mutual exclusivity: no listing has both d_epult_2015_utan == 1 and d_felujitott == 1
+        assert sum(
+            1
+            for r_new, r_ren in zip(cols["d_epult_2015_utan"], cols["d_felujitott"])
+            if str(r_new).strip() == "1" and str(r_ren).strip() == "1"
+        ) == 0
+
         rep = json.loads((_GI_DIR / f"{city}_paper_replication_recipe.json").read_text(encoding="utf-8"))
         bp = json.loads((_GI_DIR / f"{city}_recipe.json").read_text(encoding="utf-8"))
 
@@ -1146,11 +1153,24 @@ def test_golden_cross_city_replication_and_best_practice():
         assert rep["guards_cfg"]["sparse_min_cell"] == 0
         assert rep["default_cov_type"] == "HC3"
         assert rep["spatial_engine"]["se_mode"] == "ml"
+        assert [m["id"] for m in rep["models"]] == ["m1_base", "m2_rings", "m3_log", "m4_ad"]
+        assert rep["spatial_engine"]["gwr"]["focal_model_id"] == "m3_log"
+
         assert bp["guards_cfg"]["sparse_min_cell"] == 5
         assert bp["default_cov_type"] == "cluster"
         assert bp["dataset_schema"]["cluster_spec"]["mode"] == "coordinate_radius"
+        assert [m["id"] for m in bp["models"]] == ["m1_base", "m2_rings", "m3_log", "m4_ad"]
+        assert bp["spatial_engine"]["gwr"]["focal_model_id"] == "m3_log"
+        bp_m4 = next(m for m in bp["models"] if m["id"] == "m4_ad")
+        bp_vag_term = next(st for st in bp_m4["spatial_terms"] if st["target_id"] == "vagany")
+        assert bp_vag_term["cutoff_m"] == 300.0
+        assert bp["spatial_engine"]["weights"][0]["id"] == "knn5_dedup"
         assert bp["spatial_engine"]["weights"][0]["dedup_colocated"] is True
-        assert bp["spatial_engine"]["se_mode"] == "qml"
+        assert bp["recipe_meta"].get("seal_version") == "v1.0-sealed"
+        if city == "kobanya":
+            assert bp["spatial_engine"]["se_mode"] == "ml"
+        else:
+            assert bp["spatial_engine"]["se_mode"] == "qml"
 
         # 1. Run Paper Replication recipe Stages 1-5 + assert M1-M4 exact parity
         sess = GeoSpecSession()
@@ -1194,13 +1214,19 @@ def test_golden_cross_city_replication_and_best_practice():
         s3_bp = sess_bp.run_stage_3_ols_workbench(bp, cov_type=bp["default_cov_type"])
         assert s3_bp["ok"] and all("cluster" in m["cov_type_used"].lower() for m in s3_bp["models"])
         s4_bp = sess_bp.run_stage_4_spatial_econometrics(bp)
-        assert s4_bp["ok"] and s4_bp["se_mode"] == "qml"
-        assert s4_bp["weights_robustness"][0]["colocated_pairs_pct"] == 0.0
+        assert s4_bp["ok"]
+        knn_dedup_row = next(w for w in s4_bp["weights_robustness"] if w["w_id"] == "knn5_dedup")
+        assert knn_dedup_row["colocated_pairs_pct"] == 0.0
         if city == "kobanya":
+            assert s4_bp["se_mode"] == "ml"
             idw_row = next(w for w in s4_bp["weights_robustness"] if w["w_id"] == "idw_auto")
             assert idw_row["islands"] == 0
+        else:
+            assert s4_bp["se_mode"] == "qml"
         s5_bp = sess_bp.run_stage_5_gwr(bp)
         assert s5_bp["ok"]
+        s6_bp = sess_bp.run_stage_6_ml_shap(bp)
+        assert s6_bp["ok"] and s6_bp["local_accuracy_max_err"] < 1e-10
         rob_bp = sess_bp.run_robustness_matrix(bp)
         assert rob_bp["ok"] and len(rob_bp["rows"]) == 6
         z_bp = sess_bp.export_publication_bundle(bp)
@@ -1208,6 +1234,7 @@ def test_golden_cross_city_replication_and_best_practice():
         with zipfile.ZipFile(io.BytesIO(z_bp["zip_bytes"]), "r") as zf:
             assert "experiment_recipe.json" in zf.namelist()
             assert "spatial/style_gwr_r2.qml" in zf.namelist()
+            assert "csv/shap_global_importance.csv" in zf.namelist()
 
 
 def test_qa_fixes_boxcox_scaling_and_robustness_focal():

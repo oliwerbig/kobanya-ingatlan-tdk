@@ -4,8 +4,9 @@
 import { MapInspector } from "./components/map_inspector.js";
 import { renderStage1 } from "./components/stage1_data_osm.js";
 import { renderStage2 } from "./components/stage2_composition.js";
-import { patchStage3ResultsOnly, renderStage3 } from "./components/stage3_model_composer.js";
+import { renderStage3, patchStage3ResultsOnly } from "./components/stage3_model_composer.js";
 import { renderStage4, renderStage5 } from "./components/stage4_5_spatial_gwr.js";
+import { renderStage6 } from "./components/stage6_ml_shap.js";
 import { buildOsmBundle, pruneExpiredOSM } from "./gis/osm_idb_cache.js";
 import { fetchStreetGraphOSM, fetchTargetOSM, padBbox } from "./gis/overpass_client.js";
 import { DagClient } from "./state/dag_client.js";
@@ -44,6 +45,7 @@ const state = {
   stage3Res: null,
   stage4Res: null,
   stage5Res: null,
+  stage6Res: null,
   robustnessRes: null,
   staleStages: new Set(),
   stage5Busy: false,
@@ -72,6 +74,7 @@ let s2Seq = 0;
 let s3Seq = 0;
 let s4Seq = 0;
 let s5Seq = 0;
+let s6Seq = 0;
 
 function showToast(message, level = "info", durationMs = 5200) {
   const stack = document.getElementById("toastStack");
@@ -169,6 +172,7 @@ function resetAnalysisResults() {
   state.stage3Res = null;
   state.stage4Res = null;
   state.stage5Res = null;
+  state.stage6Res = null;
   state.robustnessRes = null;
   state.staleStages.clear();
   state.stage3AdKey = "";
@@ -210,11 +214,12 @@ const actions = {
 
   markStageStale(fromStage) {
     const k = Number(fromStage);
-    if (k === 1) [1, 2, 3, 4, 5].forEach((s) => state.staleStages.add(s));
+    if (k === 1) [1, 2, 3, 4, 5, 6].forEach((s) => state.staleStages.add(s));
     else if (k === 2) state.staleStages.add(2);
-    else if (k === 3) [2, 3, 4, 5].forEach((s) => state.staleStages.add(s));
+    else if (k === 3) [2, 3, 4, 5, 6].forEach((s) => state.staleStages.add(s));
     else if (k === 4) state.staleStages.add(4);
     else if (k === 5) state.staleStages.add(5);
+    else if (k === 6) state.staleStages.add(6);
     this.updateStageTabsDom();
   },
 
@@ -222,7 +227,7 @@ const actions = {
     const st = Number(k);
     if (st === 1) {
       resetAnalysisResults();
-      [1, 2, 3, 4, 5].forEach((s) => state.staleStages.add(s));
+      [1, 2, 3, 4, 5, 6].forEach((s) => state.staleStages.add(s));
     } else if (st === 2) {
       state.stage2Res = null;
       state.robustnessRes = null;
@@ -232,14 +237,18 @@ const actions = {
       state.stage3Res = null;
       state.stage4Res = null;
       state.stage5Res = null;
+      state.stage6Res = null;
       state.robustnessRes = null;
-      [2, 3, 4, 5].forEach((s) => state.staleStages.add(s));
+      [2, 3, 4, 5, 6].forEach((s) => state.staleStages.add(s));
     } else if (st === 4) {
       state.stage4Res = null;
       state.staleStages.add(4);
     } else if (st === 5) {
       state.stage5Res = null;
       state.staleStages.add(5);
+    } else if (st === 6) {
+      state.stage6Res = null;
+      state.staleStages.add(6);
     }
     renderGuardStrip();
     restyleMap();
@@ -255,7 +264,8 @@ const actions = {
         (s === 2 && state.stage2Res?.ok) ||
         (s === 3 && state.stage3Res?.ok) ||
         (s === 4 && state.stage4Res?.ok) ||
-        (s === 5 && state.stage5Res?.ok);
+        (s === 5 && state.stage5Res?.ok) ||
+        (s === 6 && state.stage6Res?.ok);
       btn.classList.toggle("done", Boolean(isDone));
       const staleEl = btn.querySelector(".stale-badge");
       if (staleEl) {
@@ -303,6 +313,7 @@ const actions = {
     else if (state.activeStage === 3) renderStage3(pane, ctx);
     else if (state.activeStage === 4) renderStage4(pane, ctx);
     else if (state.activeStage === 5) renderStage5(pane, ctx);
+    else if (state.activeStage === 6) renderStage6(pane, ctx);
   },
 
   focusObservation(obsIdx) {
@@ -313,7 +324,7 @@ const actions = {
 
   async onDatasetParsed(fileName, parsed, colProfile, guesses, { skipSync = false, hasPendingRecipe = false } = {}) {
     datasetSeq++;
-    s1Seq++; s2Seq++; s3Seq++; s4Seq++; s5Seq++;
+    s1Seq++; s2Seq++; s3Seq++; s4Seq++; s5Seq++; s6Seq++;
     const hadPrevDataset = Boolean(state.columns);
     state.fileName = fileName;
     state.workspaceFileName = "";
@@ -380,7 +391,7 @@ const actions = {
       return;
     }
     const mySeq = ++datasetSeq;
-    s1Seq++; s2Seq++; s3Seq++; s4Seq++; s5Seq++;
+    s1Seq++; s2Seq++; s3Seq++; s4Seq++; s5Seq++; s6Seq++;
     resetAnalysisResults();
 
     try {
@@ -827,9 +838,10 @@ const actions = {
       state.stage3Res = res;
       state.stage4Res = null;
       state.stage5Res = null;
+      state.stage6Res = null;
       state.staleStages.delete(3);
       if (!patchResultsOnly) {
-        [4, 5].forEach((s) => state.staleStages.add(s));
+        [4, 5, 6].forEach((s) => state.staleStages.add(s));
       }
       if (!res.ok) {
         setLog(`3. Fázis figyelmeztetés: ${res.reason || "Ismeretlen hiba"}`);
@@ -974,21 +986,50 @@ const actions = {
     }
   },
 
+  async runStage6() {
+    if (!state.datasetInfo) return false;
+    const mySeq = ++s6Seq;
+    try {
+      await dag.waitUntilReady();
+      if (mySeq !== s6Seq) return false;
+      setLog("6. Fázis: Pure-NumPy GBRT & Egzakt Lundberg TreeSHAP...");
+      const res = await dag.call("run_stage_6", { recipe: state.recipe, run_id: dag.nextRunId() });
+      if (mySeq !== s6Seq) return false;
+      state.stage6Res = res;
+      state.staleStages.delete(6);
+      if (res.ok) {
+        const g = res.grouped_importance || {};
+        setLog(`6. Fázis kész (Seed=${res.random_seed}, Fizikai=${g.physical_pct}%, Vasút=${g.rail_pct}%, Δ_SHAP=${Number(res.local_accuracy_max_err).toExponential(1)}).`);
+      } else {
+        setLog(`Stage 6 figyelmeztetés: ${res.reason || "Nem futtatható"}`);
+        showToast(res.reason || "6. Fázis nem futtatható.", "warn");
+      }
+      this.render();
+      return Boolean(res.ok);
+    } catch (err) {
+      if (err.name === "CancelledError" || mySeq !== s6Seq) return false;
+      setLog(`Stage 6 hiba: ${err.message}`);
+      showToast(`Stage 6 hiba: ${err.message}`, "error");
+      return false;
+    }
+  },
+
   async runFullPipeline() {
     if (!state.datasetInfo || state.pipelineRunning) return;
     state.pipelineRunning = true;
     const btnRunAll = document.getElementById("btnRunAll");
     if (btnRunAll) btnRunAll.disabled = true;
     try {
-      setLog("WASM motor ellenőrzése és 5-fázisú pipeline indítása...");
+      setLog("WASM motor ellenőrzése és 6-fázisú pipeline indítása...");
       await dag.waitUntilReady();
       if (!(await this.runStage1())) return;
       if (!(await this.runStage2())) return;
       if (!(await this.runStage3())) return;
       if (!(await this.runStage4())) return;
       if (!(await this.runStage5())) return;
-      setLog("Teljes 5-fázisú térökonometriai pipeline befejezve.");
-      showToast("Teljes 5-fázisú pipeline sikeresen lefutott.", "pass");
+      if (!(await this.runStage6())) return;
+      setLog("Teljes 6-fázisú térökonometriai & TreeSHAP pipeline befejezve.");
+      showToast("Teljes 6-fázisú pipeline sikeresen lefutott.", "pass");
     } catch (err) {
       setLog(`Pipeline megszakadt: ${err.message}`);
       showToast(`Pipeline megszakadt: ${err.message}`, "error");
@@ -1628,7 +1669,7 @@ async function autoLoadStudyFromUrl() {
     const recipeFile = new File([recipeText], recipeName, { type: "application/json" });
     await actions.handleIncomingFiles([csvFile, recipeFile]);
     const title = state.recipe?.recipe_meta?.title || study;
-    showToast(`${title} betöltve — indítsd a „▶ Teljes Pipeline Futtatása (1–5)” gombbal.`, "info", 6500);
+    showToast(`${title} betöltve — indítsd a „▶ Teljes Pipeline Futtatása (1–6)” gombbal.`, "info", 6500);
   } catch (err) {
     setLog(`Automatikus minta-betöltési hiba (${study}): ${err.message}`);
     showToast(`Automatikus minta-betöltés sikertelen: ${err.message}`, "error");

@@ -453,5 +453,16 @@ test("Round-4: Antimeridian, Postpass abutment connectors, sanitizeRecipe harden
     assert.equal(sanR.spatial_engine.gwr.prevalence_min_pct, rawR.spatial_engine.gwr.prevalence_min_pct);
     assert.equal(sanR.spatial_targets.find((t) => t.id === "allomas").distance_modes, "network_dijkstra");
   }
+
+  // 7. sanitizeRecipe preserves & clamps Stage 6 ml_shap config and seal metadata
+  const mlSan = sanitizeRecipe({
+    recipe_meta: { title: "Sealed", seal_version: "v1.0-sealed" },
+    ml_shap: { focal_model_id: "m3_log", n_estimators: 9999, max_depth: 99, random_seed: 42 },
+  }, createDefaultRecipe());
+  assert.equal(mlSan.recipe_meta.seal_version, "v1.0-sealed");
+  assert.equal(mlSan.ml_shap.focal_model_id, "m3_log");
+  assert.equal(mlSan.ml_shap.n_estimators, 500);
+  assert.equal(mlSan.ml_shap.max_depth, 6);
+  assert.equal(mlSan.ml_shap.random_seed, 42);
 });
 

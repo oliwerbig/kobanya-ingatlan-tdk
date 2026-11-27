@@ -21,6 +21,7 @@ scratch/
 !/README.md
 !/index.html
 !/update_dashboard_geospec.py
+!/verify_source_of_truth.py
 !/recipes/
 !/recipes/**
 !/Számítások.ipynb
