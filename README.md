@@ -24,7 +24,9 @@ Ez a repository a kutatás reprodukálható számítási motorját és az intera
 
 | Fájl | Típus | Leírás |
 | :--- | :--- | :--- |
-| **[`index.html`](index.html)** | Webes Dashboard | Az önálló, egyetlen állományból futó interaktív GitHub Pages kutatási felület. |
+| **[`index.html`](index.html)** | Webes Dashboard | Az önálló, egyetlen állományból futó interaktív GitHub Pages kutatási felület (szinkronizálva a **2026. nov. 26. GeoSpec Best-Practice** számkészlethez, közvetlen recept-letöltéssel és 1-kattintásos GeoSpec indítással). |
+| **[`update_dashboard_geospec.py`](update_dashboard_geospec.py)** | Generátor szkript | Automatikusan futtatja a `GeoSpecSession` pipeline-t mindkét városra, előállítja az 1-fájlos `.geospec.json` munkamenet-csomagokat és frissíti az `index.html` mutatóit és ábráit. |
+| **[`recipes/`](recipes/)** | Adat & Receptek | Nyilvános GeoSpec Best-Practice és nov. 1-jei replikációs receptek (`_recipe.json`), teljes 1-fájlos projektek (`.geospec.json`), valamint tisztított CSV adatbázisok (`?study=kobanya` / `?study=leopoldstadt` automatikus betöltéssel). |
 | **[`Számítások.ipynb`](Számítások.ipynb)** | Jupyter Notebook | **Master ökonometriai és ML számítási motor:** 68 cella, M1–M4 OLS modellek (HC3 SE), robusztussági diagnosztika (VIF, BP, White, RESET, Jarque-Bera), térökonometria (Moran-I, SAR, SEM, LeSage & Pace 46,6% spillover), GWR és XGBoost/CatBoost SHAP TreeExplainer. |
 | **[`Vizualizacio.ipynb`](Vizualizacio.ipynb)** | Jupyter Notebook | **Master térinformatikai és vizualizációs motor:** 25 cella, a 24 db Plotly ábra és a webes dashboard generálása. |
 | **[`platform/`](platform/index.html)** | Tudományos Web Platform | **`GeoSpec` – Általános célú, böngészőben futó (Pyodide NumPy+SciPy WASM) parametrikus térökonometriai és OSM kutatói játszótér** tetszőleges vizsgálati területre (CSV/GeoJSON feltöltéssel, szerkeszthető modellekkel, 6 módszertani őrszemmel, CSR Dijkstra routinggal, SAR/SEM/SDM + Krinsky–Robb és Szelektív-Ridge GWR becsléssel). |

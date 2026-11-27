@@ -1,0 +1,482 @@
+{
+  "schema_version": "1.0.0",
+  "recipe_meta": {
+    "title": "TDK 2026 — Bécs II. Leopoldstadt (Tudományos Best-Practice)",
+    "created_utc": "2026-11-26T12:30:00Z"
+  },
+  "dataset_schema": {
+    "row_id_col": "listing_id",
+    "lat_col": "wgs84_lat",
+    "lon_col": "wgs84_long",
+    "y_spec": {
+      "mode": "column",
+      "num_col": "fajlagos_ar",
+      "den_col": "",
+      "transform": "log",
+      "boxcox_lambda": null,
+      "log1p_shift": 1.0
+    },
+    "cluster_spec": {
+      "mode": "coordinate_radius",
+      "col": "cim_teljes",
+      "regex": "\\s+\\d+.*$",
+      "radius_m": 15.0
+    },
+    "selection_spec": {
+      "enabled": true,
+      "excluded_flag_col": "",
+      "first_stage_covariates": [
+        "alapterulet_nm",
+        "szobak_szama",
+        "d_lift"
+      ],
+      "exclusion_restriction_cols": []
+    },
+    "spatial_proxy_cols": [
+      "dist_cbd_m"
+    ]
+  },
+  "spatial_targets": [
+    {
+      "id": "vagany",
+      "name": "Vasúti vágány távolság (Euklideszi, CSV)",
+      "source": "csv_column",
+      "csv_col": "dist_vagany_m",
+      "excluded_osm_ids": [],
+      "geometry_handling": "line_segment",
+      "distance_modes": "euclidean"
+    },
+    {
+      "id": "allomas",
+      "name": "Vasútállomás távolság (gyalogos hálózati, CSV)",
+      "source": "csv_column",
+      "csv_col": "dist_vasutallomas_hm",
+      "excluded_osm_ids": [],
+      "geometry_handling": "point",
+      "distance_modes": "network_dijkstra",
+      "routing_profile": "walk"
+    },
+    {
+      "id": "fout",
+      "name": "Főútvonal távolság (Euklideszi, CSV)",
+      "source": "csv_column",
+      "csv_col": "dist_fout_m",
+      "excluded_osm_ids": [],
+      "geometry_handling": "line_segment",
+      "distance_modes": "euclidean"
+    }
+  ],
+  "models": [
+    {
+      "id": "m1_base",
+      "name": "M1: Fizikai alapmodell (ln(m²), tiszta kovariánsok)",
+      "active": true,
+      "covariates": [
+        {
+          "col": "alapterulet_nm",
+          "type": "numeric",
+          "transform": "log"
+        },
+        {
+          "col": "szobak_szama",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_felujitando",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_felujitott",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_lift",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_kulteri_kapcsolat",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "kulteri_alapterulet_nm",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_foldszint",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_zaroszint",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_epult_2015_utan",
+          "type": "numeric",
+          "transform": "raw"
+        }
+      ],
+      "spatial_terms": [],
+      "interactions": []
+    },
+    {
+      "id": "m2_rings",
+      "name": "M2: Diszkrét távolsági sávok (hálózati állomással)",
+      "active": true,
+      "covariates": [
+        {
+          "col": "alapterulet_nm",
+          "type": "numeric",
+          "transform": "log"
+        },
+        {
+          "col": "szobak_szama",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_felujitando",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_felujitott",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_lift",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_kulteri_kapcsolat",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "kulteri_alapterulet_nm",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_foldszint",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_zaroszint",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_epult_2015_utan",
+          "type": "numeric",
+          "transform": "raw"
+        }
+      ],
+      "spatial_terms": [
+        {
+          "target_id": "vagany",
+          "metric": "eucl",
+          "transform": "rings",
+          "breakpoints_m": [
+            150.0,
+            300.0,
+            500.0
+          ]
+        },
+        {
+          "target_id": "allomas",
+          "metric": "net",
+          "transform": "rings",
+          "breakpoints_m": [
+            750.0,
+            1125.0
+          ]
+        },
+        {
+          "target_id": "fout",
+          "metric": "eucl",
+          "transform": "rings",
+          "breakpoints_m": [
+            150.0
+          ]
+        }
+      ],
+      "interactions": []
+    },
+    {
+      "id": "m3_log",
+      "name": "M3: Folytonos log-távolság (hálózati állomással)",
+      "active": true,
+      "covariates": [
+        {
+          "col": "alapterulet_nm",
+          "type": "numeric",
+          "transform": "log"
+        },
+        {
+          "col": "szobak_szama",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_felujitando",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_felujitott",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_lift",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_kulteri_kapcsolat",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "kulteri_alapterulet_nm",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_foldszint",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_zaroszint",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_epult_2015_utan",
+          "type": "numeric",
+          "transform": "raw"
+        }
+      ],
+      "spatial_terms": [
+        {
+          "target_id": "vagany",
+          "metric": "eucl",
+          "transform": "ln_d",
+          "floor_m": 1.0
+        },
+        {
+          "target_id": "allomas",
+          "metric": "net",
+          "transform": "ln_d",
+          "floor_m": 1.0
+        },
+        {
+          "target_id": "fout",
+          "metric": "eucl",
+          "transform": "ln_d",
+          "floor_m": 1.0
+        }
+      ],
+      "interactions": []
+    },
+    {
+      "id": "m4_ad",
+      "name": "M4: Hármas cenzorált (Andersson–Day, 300/150/1125m)",
+      "active": true,
+      "covariates": [
+        {
+          "col": "alapterulet_nm",
+          "type": "numeric",
+          "transform": "log"
+        },
+        {
+          "col": "szobak_szama",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_felujitando",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_felujitott",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_lift",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_kulteri_kapcsolat",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "kulteri_alapterulet_nm",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_foldszint",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_zaroszint",
+          "type": "numeric",
+          "transform": "raw"
+        },
+        {
+          "col": "d_epult_2015_utan",
+          "type": "numeric",
+          "transform": "raw"
+        }
+      ],
+      "spatial_terms": [
+        {
+          "target_id": "vagany",
+          "metric": "eucl",
+          "transform": "andersson_day",
+          "floor_m": 1.0,
+          "cutoff_mode": "fixed",
+          "cutoff_m": 300.0,
+          "cutoff_range_m": [
+            150.0,
+            600.0,
+            25.0
+          ]
+        },
+        {
+          "target_id": "fout",
+          "metric": "eucl",
+          "transform": "andersson_day",
+          "floor_m": 1.0,
+          "cutoff_mode": "fixed",
+          "cutoff_m": 150.0,
+          "cutoff_range_m": [
+            100.0,
+            400.0,
+            25.0
+          ]
+        },
+        {
+          "target_id": "allomas",
+          "metric": "net",
+          "transform": "andersson_day",
+          "floor_m": 1.0,
+          "cutoff_mode": "fixed",
+          "cutoff_m": 1125.0,
+          "cutoff_range_m": [
+            750.0,
+            1800.0,
+            50.0
+          ]
+        }
+      ],
+      "interactions": []
+    }
+  ],
+  "composition_chain": {
+    "enabled": true,
+    "focal_term_ref": "vagany::andersson_day",
+    "blocks": [
+      {
+        "name": "Méret & Szobák",
+        "terms": [
+          "alapterulet_nm",
+          "szobak_szama"
+        ]
+      },
+      {
+        "name": "Műszaki állapot",
+        "terms": [
+          "d_felujitott",
+          "d_felujitando"
+        ]
+      },
+      {
+        "name": "Lift",
+        "terms": [
+          "d_lift"
+        ]
+      },
+      {
+        "name": "Szint, Kültér & Újépítés",
+        "terms": [
+          "d_kulteri_kapcsolat",
+          "kulteri_alapterulet_nm",
+          "d_foldszint",
+          "d_zaroszint",
+          "d_epult_2015_utan"
+        ]
+      }
+    ],
+    "compute_gelbach_ovb": true
+  },
+  "spatial_engine": {
+    "active_model_id": "m4_ad",
+    "se_mode": "qml",
+    "weights": [
+      {
+        "id": "idw_2500",
+        "type": "idw",
+        "power": 1.0,
+        "cutoff_mode": "fixed",
+        "cutoff_m": 2500.0
+      },
+      {
+        "id": "knn5_dedup",
+        "type": "knn",
+        "k": 5,
+        "dedup_colocated": true
+      },
+      {
+        "id": "knn8_dedup",
+        "type": "knn",
+        "k": 8,
+        "dedup_colocated": true
+      }
+    ],
+    "models": [
+      "SAR",
+      "SEM",
+      "SDM"
+    ],
+    "krinsky_robb_draws": 1000,
+    "lisa_fdr": true,
+    "gwr": {
+      "enabled": true,
+      "mode": "gwr",
+      "focal_model_id": "m3_log",
+      "kernel": "adaptive_bisquare",
+      "jitter_m": 1.0,
+      "b_min_floor": 130,
+      "kappa_thresh": 1000.0,
+      "prevalence_min_pct": 0.1
+    }
+  },
+  "guards_cfg": {
+    "common_sample_lock": true,
+    "sparse_min_cell": 5,
+    "hc3_leverage_warn": 0.85,
+    "attenuation_warn_pct": 50.0,
+    "heckman_min_excluded": 10,
+    "heckman_min_analytic": 30
+  },
+  "default_cov_type": "cluster"
+}

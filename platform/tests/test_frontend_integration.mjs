@@ -22,7 +22,7 @@ function walkJsFiles(dir, out = []) {
 
 test("sw.js PWA shell manifest, cache policy & asset existence on disk", () => {
   const swSrc = fs.readFileSync(path.join(PLATFORM_DIR, "sw.js"), "utf8");
-  assert.match(swSrc, /const CACHE_NAME = "geospec-wasm-v10"/);
+  assert.match(swSrc, /const CACHE_NAME = "geospec-wasm-v12"/);
   assert.match(swSrc, /event\.waitUntil\([\s\S]*?self\.skipWaiting\(\)/);
   assert.match(swSrc, /resp\.type\s*!==\s*"opaque"/);
   assert.match(swSrc, /ALLOWED_CDN_PREFIXES/);
@@ -259,8 +259,13 @@ test("Visual QA regressions: hidden banner, 4D est, i18n verdicts, toast/mobile 
   setLang("hu");
   assert.equal(translateVerdict("Starting Pyodide..."), "Pyodide indítása...");
 
-  // 5. Escape handler & updateBootIndicator called on language switch + inspector refresh after Stages 3-5
+  // 5. Escape handler, ?study= URL autoloader & updateBootIndicator called on language switch + inspector refresh
   assert.match(appSrc, /e\.key\s*===\s*"Escape"/);
+  assert.match(appSrc, /ALLOWED_STUDIES\s*=\s*new Set\(\["kobanya",\s*"leopoldstadt"\]\)/);
+  assert.match(appSrc, /autoLoadStudyFromUrl/);
+  assert.match(appSrc, /\.\.\/recipes\/\$\{csvName\}/);
+  assert.match(appSrc, /\.\.\/recipes\/\$\{recipeName\}/);
+  assert.doesNotMatch(appSrc, /\.\.\/geospec_input\//);
   assert.match(appSrc, /btnLangToggle[\s\S]*?updateBootIndicator/);
   assert.match(appSrc, /refreshSelectedInspector\(\)/);
 });

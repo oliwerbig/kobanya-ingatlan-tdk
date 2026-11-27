@@ -1,7 +1,7 @@
 /* GeoSpec Service Worker — caches Pyodide WASM + pinned CDN assets cleanly (never opaque),
  * and full same-origin app shell + py_engine (network-first with timeout & offline/5xx fallback).
  */
-const CACHE_NAME = "geospec-wasm-v10";
+const CACHE_NAME = "geospec-wasm-v12";
 const FETCH_TIMEOUT_MS = 10000;
 
 const CORE_SHELL_ASSETS = [

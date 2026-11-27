@@ -20,6 +20,9 @@ scratch/
 !/.nojekyll
 !/README.md
 !/index.html
+!/update_dashboard_geospec.py
+!/recipes/
+!/recipes/**
 !/Számítások.ipynb
 !/Vizualizacio.ipynb
 !/platform/

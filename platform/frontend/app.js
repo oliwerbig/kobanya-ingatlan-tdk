@@ -1604,6 +1604,37 @@ function applyTheme(isDark) {
   mapInspector.setTheme(Boolean(isDark));
 }
 
+const ALLOWED_STUDIES = new Set(["kobanya", "leopoldstadt"]);
+
+async function autoLoadStudyFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const study = String(params.get("study") || "").trim().toLowerCase();
+  if (!ALLOWED_STUDIES.has(study)) return;
+  const profileRaw = String(params.get("profile") || "best").trim().toLowerCase();
+  const recipeSuffix = profileRaw === "replication" ? "paper_replication_recipe.json" : "recipe.json";
+  const csvName = `${study}_dataset.csv`;
+  const recipeName = `${study}_${recipeSuffix}`;
+  try {
+    setLog(`Kutatási minta automatikus betöltése (${study})...`);
+    const [csvRes, recRes] = await Promise.all([
+      fetch(`../recipes/${csvName}`, { cache: "no-store" }),
+      fetch(`../recipes/${recipeName}`, { cache: "no-store" }),
+    ]);
+    if (!csvRes.ok || !recRes.ok) {
+      throw new Error(`HTTP hiba (CSV: ${csvRes.status}, Recept: ${recRes.status})`);
+    }
+    const [csvText, recipeText] = await Promise.all([csvRes.text(), recRes.text()]);
+    const csvFile = new File([csvText], csvName, { type: "text/csv" });
+    const recipeFile = new File([recipeText], recipeName, { type: "application/json" });
+    await actions.handleIncomingFiles([csvFile, recipeFile]);
+    const title = state.recipe?.recipe_meta?.title || study;
+    showToast(`${title} betöltve — indítsd a „▶ Teljes Pipeline Futtatása (1–5)” gombbal.`, "info", 6500);
+  } catch (err) {
+    setLog(`Automatikus minta-betöltési hiba (${study}): ${err.message}`);
+    showToast(`Automatikus minta-betöltés sikertelen: ${err.message}`, "error");
+  }
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("./sw.js").catch(() => {});
@@ -1625,7 +1656,10 @@ window.addEventListener("DOMContentLoaded", () => {
   mapInspector.init();
   mapInspector.setTheme(initialDark);
   mapInspector.renderPointInspector(null, null);
-  dag.init().catch((err) => updateBootIndicator("error", err.message));
+  dag
+    .init()
+    .then(() => autoLoadStudyFromUrl())
+    .catch((err) => updateBootIndicator("error", err.message));
 
   document.getElementById("btnRestartWorker")?.addEventListener("click", async () => {
     try {
