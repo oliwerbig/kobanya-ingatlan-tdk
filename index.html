@@ -193,52 +193,84 @@
         </a>
         <div class="relative inline-block text-left" id="recipe-dropdown-wrap">
           <button type="button" id="recipe-menu-btn" aria-haspopup="true" aria-expanded="false" aria-controls="recipe-dropdown-menu" class="inline-flex items-center gap-1.5 text-xs bg-orange-600 hover:bg-orange-500 text-white px-2.5 sm:px-3 py-1.5 rounded-lg font-semibold transition shadow-sm cursor-pointer">
-            <span>Recept letöltése</span>
-            <span class="text-[10px] text-orange-100 font-mono">GeoSpec ▾</span>
+            <span>Adatok &amp; Reprodukció</span>
+            <span class="text-[10px] text-orange-100 font-mono">v1.0 ▾</span>
           </button>
-          <div id="recipe-dropdown-menu" hidden role="menu" class="hidden fixed sm:absolute left-4 right-4 sm:left-auto sm:right-0 mt-2 sm:w-80 rounded-xl bg-white shadow-xl border border-slate-200 py-2 z-[60] text-xs text-slate-700">
-            <div class="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">1 kattintásos reprodukció (GeoSpec)</div>
-            <a role="menuitem" href="./platform/index.html?study=kobanya" class="flex items-center justify-between px-3 py-2 hover:bg-teal-50 text-teal-800 font-semibold">
-              <span>▶ Kőbánya megnyitása GeoSpec-ben</span><span class="font-mono text-[10px]">N=269 ↗</span>
+          <div id="recipe-dropdown-menu" hidden role="menu" class="hidden fixed sm:absolute left-4 right-4 sm:left-auto sm:right-0 mt-2 sm:w-96 rounded-xl bg-white shadow-xl border border-slate-200 py-2 z-[60] text-xs text-slate-700 max-h-[80vh] overflow-y-auto">
+            <div class="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-teal-700">Böngészőben futtatható (ajánlott · 1 kattintás)</div>
+            <a role="menuitem" href="./platform/index.html?study=kobanya" class="block px-3 py-2 hover:bg-teal-50">
+              <div class="flex items-center justify-between text-teal-800 font-semibold">
+                <span>▶ Kőbánya megnyitása GeoSpec-ben</span><span class="font-mono text-[10px]">N=269 ↗</span>
+              </div>
+              <div class="text-[11px] text-slate-500 font-normal mt-0.5">Adat + végleges v1.0 beállítás automatikusan betöltve</div>
             </a>
-            <a role="menuitem" href="./platform/index.html?study=leopoldstadt" class="flex items-center justify-between px-3 py-2 hover:bg-teal-50 text-teal-800 font-semibold">
-              <span>▶ Bécs megnyitása GeoSpec-ben</span><span class="font-mono text-[10px]">N=378 ↗</span>
-            </a>
-            <div class="my-1 border-t border-slate-100"></div>
-            <div class="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">Best-Practice receptek (_recipe.json)</div>
-            <a role="menuitem" href="./recipes/kobanya_recipe.json" download="kobanya_recipe.json" class="flex items-center justify-between px-3 py-1.5 hover:bg-slate-50">
-              <span>↓ Kőbánya Best-Practice recept</span><span class="font-mono text-[10px] text-slate-400">.json</span>
-            </a>
-            <a role="menuitem" href="./recipes/leopoldstadt_recipe.json" download="leopoldstadt_recipe.json" class="flex items-center justify-between px-3 py-1.5 hover:bg-slate-50">
-              <span>↓ Bécs Leopoldstadt Best-Practice recept</span><span class="font-mono text-[10px] text-slate-400">.json</span>
+            <a role="menuitem" href="./platform/index.html?study=leopoldstadt" class="block px-3 py-2 hover:bg-teal-50">
+              <div class="flex items-center justify-between text-teal-800 font-semibold">
+                <span>▶ Bécs Leopoldstadt megnyitása GeoSpec-ben</span><span class="font-mono text-[10px]">N=378 ↗</span>
+              </div>
+              <div class="text-[11px] text-slate-500 font-normal mt-0.5">Adat + végleges v1.0 beállítás automatikusan betöltve</div>
             </a>
             <div class="my-1 border-t border-slate-100"></div>
-            <div class="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">Teljes 1-fájlos projektek (.geospec.json)</div>
-            <a role="menuitem" href="./recipes/kobanya_best_practice.geospec.json" download="kobanya_best_practice.geospec.json" class="flex items-center justify-between px-3 py-1.5 hover:bg-slate-50">
-              <span>↓ Kőbánya projekt (adat + recept)</span><span class="font-mono text-[10px] text-slate-400">.geospec.json</span>
+            <div class="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">Offline letöltés (1 fájlban minden)</div>
+            <a role="menuitem" href="./recipes/kobanya_best_practice.geospec.json" download="kobanya_best_practice.geospec.json" class="block px-3 py-1.5 hover:bg-slate-50">
+              <div class="flex items-center justify-between font-medium text-slate-800">
+                <span>↓ Kőbánya teljes csomag</span><span class="font-mono text-[10px] text-slate-400">.geospec.json</span>
+              </div>
+              <div class="text-[11px] text-slate-500">Adat + beállítás együtt — visszahúzható a GeoSpec-be</div>
             </a>
-            <a role="menuitem" href="./recipes/leopoldstadt_best_practice.geospec.json" download="leopoldstadt_best_practice.geospec.json" class="flex items-center justify-between px-3 py-1.5 hover:bg-slate-50">
-              <span>↓ Bécs projekt (adat + recept)</span><span class="font-mono text-[10px] text-slate-400">.geospec.json</span>
+            <a role="menuitem" href="./recipes/leopoldstadt_best_practice.geospec.json" download="leopoldstadt_best_practice.geospec.json" class="block px-3 py-1.5 hover:bg-slate-50">
+              <div class="flex items-center justify-between font-medium text-slate-800">
+                <span>↓ Bécs teljes csomag</span><span class="font-mono text-[10px] text-slate-400">.geospec.json</span>
+              </div>
+              <div class="text-[11px] text-slate-500">Adat + beállítás együtt — visszahúzható a GeoSpec-be</div>
             </a>
-            <div class="my-1 border-t border-slate-100"></div>
-            <div class="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">Adattáblák (.csv) &amp; Nov. 1 replikáció</div>
-            <a role="menuitem" href="./recipes/kobanya_dataset.csv" download="kobanya_dataset.csv" class="flex items-center justify-between px-3 py-1.5 hover:bg-slate-50">
-              <span>↓ Kőbánya nyers adatbázis</span><span class="font-mono text-[10px] text-slate-400">.csv</span>
+            <a role="menuitem" href="./recipes/canonical_truth.json" download="canonical_truth.json" class="block px-3 py-1.5 hover:bg-emerald-50">
+              <div class="flex items-center justify-between font-semibold text-emerald-800">
+                <span>🔒 Lepecsételt eredmények</span><span class="font-mono text-[10px]">v1.0-sealed</span>
+              </div>
+              <div class="text-[11px] text-slate-500">Minden végleges szám és SHA-256 ellenőrző kód</div>
             </a>
-            <a role="menuitem" href="./recipes/leopoldstadt_dataset.csv" download="leopoldstadt_dataset.csv" class="flex items-center justify-between px-3 py-1.5 hover:bg-slate-50">
-              <span>↓ Bécs nyers adatbázis</span><span class="font-mono text-[10px] text-slate-400">.csv</span>
-            </a>
-            <a role="menuitem" href="./recipes/kobanya_paper_replication_recipe.json" download="kobanya_paper_replication_recipe.json" class="flex items-center justify-between px-3 py-1.5 hover:bg-slate-50 text-slate-500">
-              <span>↓ Kőbánya nov. 1 dolgozat replikáció</span><span class="font-mono text-[10px]">.json</span>
-            </a>
-            <a role="menuitem" href="./recipes/leopoldstadt_paper_replication_recipe.json" download="leopoldstadt_paper_replication_recipe.json" class="flex items-center justify-between px-3 py-1.5 hover:bg-slate-50 text-slate-500">
-              <span>↓ Bécs nov. 1 dolgozat replikáció</span><span class="font-mono text-[10px]">.json</span>
-            </a>
-            <div class="my-1 border-t border-slate-100"></div>
-            <div class="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-emerald-700">Lepecsételt Igazságforrás (v1.0-sealed)</div>
-            <a role="menuitem" href="./recipes/canonical_truth.json" download="canonical_truth.json" class="flex items-center justify-between px-3 py-1.5 hover:bg-emerald-50 text-emerald-800 font-semibold">
-              <span>🔒 Kanonikus Eredmények + SHA-256</span><span class="font-mono text-[10px]">.json</span>
-            </a>
+            <details class="border-t border-slate-100 mt-1 pt-1">
+              <summary class="px-3 py-1.5 text-[11px] font-semibold text-slate-500 hover:text-slate-700 cursor-pointer select-none">▸ Haladó: nyers CSV, külön receptek, nov. 1. archívum</summary>
+              <div class="pb-1">
+                <a role="menuitem" href="./recipes/kobanya_dataset.csv" download="kobanya_dataset.csv" class="block px-3 py-1.5 hover:bg-slate-50">
+                  <div class="flex items-center justify-between text-slate-700 font-medium">
+                    <span>↓ Kőbánya nyers adattábla</span><span class="font-mono text-[10px] text-slate-400">.csv</span>
+                  </div>
+                  <div class="text-[10.5px] text-slate-400">Csak táblázat Excelhez / Pythonhoz</div>
+                </a>
+                <a role="menuitem" href="./recipes/leopoldstadt_dataset.csv" download="leopoldstadt_dataset.csv" class="block px-3 py-1.5 hover:bg-slate-50">
+                  <div class="flex items-center justify-between text-slate-700 font-medium">
+                    <span>↓ Bécs nyers adattábla</span><span class="font-mono text-[10px] text-slate-400">.csv</span>
+                  </div>
+                  <div class="text-[10.5px] text-slate-400">Csak táblázat Excelhez / Pythonhoz</div>
+                </a>
+                <a role="menuitem" href="./recipes/kobanya_recipe.json" download="kobanya_recipe.json" class="block px-3 py-1.5 hover:bg-slate-50">
+                  <div class="flex items-center justify-between text-slate-700 font-medium">
+                    <span>↓ Kőbánya külön recept</span><span class="font-mono text-[10px] text-slate-400">.json</span>
+                  </div>
+                  <div class="text-[10.5px] text-slate-400">Csak modellbeállítás adat nélkül</div>
+                </a>
+                <a role="menuitem" href="./recipes/leopoldstadt_recipe.json" download="leopoldstadt_recipe.json" class="block px-3 py-1.5 hover:bg-slate-50">
+                  <div class="flex items-center justify-between text-slate-700 font-medium">
+                    <span>↓ Bécs külön recept</span><span class="font-mono text-[10px] text-slate-400">.json</span>
+                  </div>
+                  <div class="text-[10.5px] text-slate-400">Csak modellbeállítás adat nélkül</div>
+                </a>
+                <a role="menuitem" href="./recipes/kobanya_paper_replication_recipe.json" download="kobanya_paper_replication_recipe.json" class="block px-3 py-1.5 hover:bg-slate-50">
+                  <div class="flex items-center justify-between text-slate-500">
+                    <span>↓ Kőbánya nov. 1. replikáció</span><span class="font-mono text-[10px]">.json</span>
+                  </div>
+                  <div class="text-[10.5px] text-slate-400">Archívum a novemberi leadott verzióhoz</div>
+                </a>
+                <a role="menuitem" href="./recipes/leopoldstadt_paper_replication_recipe.json" download="leopoldstadt_paper_replication_recipe.json" class="block px-3 py-1.5 hover:bg-slate-50">
+                  <div class="flex items-center justify-between text-slate-500">
+                    <span>↓ Bécs nov. 1. replikáció</span><span class="font-mono text-[10px]">.json</span>
+                  </div>
+                  <div class="text-[10.5px] text-slate-400">Archívum a novemberi leadott verzióhoz</div>
+                </a>
+              </div>
+            </details>
           </div>
         </div>
         <a href="https://github.com/oliwerbig/kobanya-ingatlan-tdk/blob/main/Sz%C3%A1m%C3%ADt%C3%A1sok.ipynb" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1.5 text-xs bg-slate-900 hover:bg-slate-800 text-white px-2.5 sm:px-3 py-1.5 rounded-lg font-medium transition shadow-sm">
@@ -291,7 +323,7 @@
         </div>
         <div class="bg-slate-800/40 rounded-lg py-2 px-2">
           <div class="text-[11px] text-slate-400">Kőbánya Nyers vs. M4</div>
-          <div class="text-sm sm:text-base font-bold text-emerald-400">-21,1% <span class="text-xs font-normal text-slate-400">/ -4.7% (NS)</span></div>
+          <div class="text-sm sm:text-base font-bold text-emerald-400">-21,1% <span class="text-xs font-normal text-slate-400">/ -4,7% (NS)</span></div>
         </div>
         <div class="bg-slate-800/40 rounded-lg py-2 px-2">
           <div class="text-[11px] text-slate-400">2015+ Újépítés (Bp)</div>
@@ -309,12 +341,10 @@
 
       <div class="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800/90 text-[11px]">
         <div class="flex flex-wrap items-center gap-1.5">
-          <span class="text-slate-400 font-semibold uppercase tracking-wider mr-1">GeoSpec v1.0-sealed:</span>
-          <a href="./platform/index.html?study=kobanya" class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-teal-700 hover:bg-teal-600 text-white font-semibold transition">▶ Kőbánya GeoSpec-ben ↗</a>
-          <a href="./platform/index.html?study=leopoldstadt" class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-teal-700 hover:bg-teal-600 text-white font-semibold transition">▶ Bécs GeoSpec-ben ↗</a>
-          <a href="./recipes/kobanya_recipe.json" download="kobanya_recipe.json" class="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-mono transition">↓ kobanya_recipe.json</a>
-          <a href="./recipes/leopoldstadt_recipe.json" download="leopoldstadt_recipe.json" class="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-mono transition">↓ leopoldstadt_recipe.json</a>
-          <a href="./recipes/canonical_truth.json" download="canonical_truth.json" class="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-emerald-900/60 hover:bg-emerald-800 text-emerald-100 border border-emerald-700 font-mono transition">🔒 canonical_truth.json</a>
+          <span class="text-slate-400 font-semibold uppercase tracking-wider mr-1">Interaktív kutatói reprodukció:</span>
+          <a href="./platform/index.html?study=kobanya" class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-teal-700 hover:bg-teal-600 text-white font-semibold transition">▶ Kőbánya megnyitása GeoSpec-ben ↗</a>
+          <a href="./platform/index.html?study=leopoldstadt" class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-teal-700 hover:bg-teal-600 text-white font-semibold transition">▶ Bécs megnyitása GeoSpec-ben ↗</a>
+          <a href="./recipes/canonical_truth.json" download="canonical_truth.json" class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-emerald-900/60 hover:bg-emerald-800 text-emerald-100 border border-emerald-700 font-mono transition">🔒 Lepecsételt eredmények (v1.0-sealed)</a>
         </div>
         <span class="text-slate-400">Kínálati árak (ingatlan.com / willhaben.at) · M1–M4 + épületszintű klaszterezés (Guard #2: n&lt;5 kiszűrve) · Silent Rail 2. fázis (BME × UTCN)</span>
       </div>
